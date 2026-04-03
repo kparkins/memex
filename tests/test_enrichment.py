@@ -25,9 +25,9 @@ from neo4j import AsyncDriver
 from memex.domain.models import Item, ItemKind, Project, Revision, Space, Tag
 from memex.llm.enrichment import (
     EnrichmentOutput,
-    _strip_markdown_fence,
     extract_enrichments,
 )
+from memex.llm.utils import strip_markdown_fence
 from memex.orchestration.enrichment import (
     _build_enriched_search_text,
     _sanitize_enrichment,
@@ -111,7 +111,7 @@ def _mock_completion(text: str) -> MagicMock:
     return response
 
 
-# -- Unit tests: _strip_markdown_fence ------------------------------------
+# -- Unit tests: strip_markdown_fence ------------------------------------
 
 
 class TestStripMarkdownFence:
@@ -120,18 +120,18 @@ class TestStripMarkdownFence:
     def test_no_fence(self) -> None:
         """Plain JSON passes through unchanged."""
         raw = '{"summary": "test"}'
-        assert _strip_markdown_fence(raw) == raw
+        assert strip_markdown_fence(raw) == raw
 
     def test_json_fence(self) -> None:
         """Code-fenced JSON is unwrapped."""
         raw = '```json\n{"summary": "test"}\n```'
-        result = _strip_markdown_fence(raw)
+        result = strip_markdown_fence(raw)
         assert result == '{"summary": "test"}'
 
     def test_bare_fence(self) -> None:
         """Bare triple-backtick fence is unwrapped."""
         raw = '```\n{"key": "val"}\n```'
-        result = _strip_markdown_fence(raw)
+        result = strip_markdown_fence(raw)
         assert result == '{"key": "val"}'
 
 
@@ -154,7 +154,7 @@ class TestExtractEnrichments:
         )
         resp = _mock_completion(json_text)
         with patch(
-            "memex.llm.enrichment.litellm.acompletion",
+            "memex.llm.client.litellm.acompletion",
             return_value=resp,
         ):
             result = await extract_enrichments("test content")
@@ -172,7 +172,7 @@ class TestExtractEnrichments:
         json_text = _mock_enrichment_json(embedding_text_override=None)
         resp = _mock_completion(json_text)
         with patch(
-            "memex.llm.enrichment.litellm.acompletion",
+            "memex.llm.client.litellm.acompletion",
             return_value=resp,
         ):
             result = await extract_enrichments("content")
@@ -184,7 +184,7 @@ class TestExtractEnrichments:
         json_text = "```json\n" + _mock_enrichment_json() + "\n```"
         resp = _mock_completion(json_text)
         with patch(
-            "memex.llm.enrichment.litellm.acompletion",
+            "memex.llm.client.litellm.acompletion",
             return_value=resp,
         ):
             result = await extract_enrichments("content")
@@ -195,7 +195,7 @@ class TestExtractEnrichments:
         """Custom model is forwarded to litellm."""
         resp = _mock_completion(_mock_enrichment_json())
         with patch(
-            "memex.llm.enrichment.litellm.acompletion",
+            "memex.llm.client.litellm.acompletion",
             return_value=resp,
         ) as mock_llm:
             await extract_enrichments("content", model="gpt-4o")
@@ -206,7 +206,7 @@ class TestExtractEnrichments:
     async def test_raises_runtime_error_on_failure(self) -> None:
         """LLM failure is wrapped in RuntimeError."""
         with patch(
-            "memex.llm.enrichment.litellm.acompletion",
+            "memex.llm.client.litellm.acompletion",
             side_effect=ValueError("provider down"),
         ):
             with pytest.raises(RuntimeError, match="Enrichment extraction"):
@@ -216,7 +216,7 @@ class TestExtractEnrichments:
         """Invalid JSON from LLM raises RuntimeError."""
         resp = _mock_completion("not valid json {{{")
         with patch(
-            "memex.llm.enrichment.litellm.acompletion",
+            "memex.llm.client.litellm.acompletion",
             return_value=resp,
         ):
             with pytest.raises(RuntimeError, match="Enrichment extraction"):
@@ -371,7 +371,7 @@ class TestEnrichRevision:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 return_value=_mock_completion(json_resp),
             ),
             patch(
@@ -422,7 +422,7 @@ class TestEnrichRevision:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 return_value=_mock_completion(json_resp),
             ),
             patch(
@@ -455,7 +455,7 @@ class TestEnrichRevision:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 return_value=_mock_completion(json_resp),
             ),
             patch(
@@ -486,7 +486,7 @@ class TestEnrichRevision:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 return_value=_mock_completion(json_resp),
             ),
             patch(
@@ -512,7 +512,7 @@ class TestEnrichRevision:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 return_value=_mock_completion(json_resp),
             ),
             patch(
@@ -544,7 +544,7 @@ class TestEnrichmentFailureResilience:
         rev = enrichment_env["revision"]
 
         with patch(
-            "memex.llm.enrichment.litellm.acompletion",
+            "memex.llm.client.litellm.acompletion",
             side_effect=ValueError("provider unavailable"),
         ):
             result = await enrich_revision(driver, rev.id)
@@ -572,7 +572,7 @@ class TestEnrichmentFailureResilience:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 return_value=_mock_completion(json_resp),
             ),
             patch(
@@ -609,7 +609,7 @@ class TestEnrichmentFailureResilience:
         rev = enrichment_env["revision"]
 
         with patch(
-            "memex.llm.enrichment.litellm.acompletion",
+            "memex.llm.client.litellm.acompletion",
             side_effect=ValueError("LLM down"),
         ):
             await enrich_revision(driver, rev.id)
@@ -639,7 +639,7 @@ class TestAsyncNonBlocking:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 return_value=_mock_completion(json_resp),
             ),
             patch(
@@ -669,7 +669,7 @@ class TestAsyncNonBlocking:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 side_effect=_slow_completion,
             ),
             patch(
@@ -712,7 +712,7 @@ class TestEnrichmentPIIRedaction:
 
         with (
             patch(
-                "memex.llm.enrichment.litellm.acompletion",
+                "memex.llm.client.litellm.acompletion",
                 return_value=_mock_completion(json_resp),
             ),
             patch(

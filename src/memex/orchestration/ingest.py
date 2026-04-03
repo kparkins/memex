@@ -4,6 +4,10 @@ Implements FR-9 and FR-13: a single invocation that resolves/creates
 the space, writes the item and revision, attaches artifacts, records
 edges and bundle membership, applies initial tags, buffers the
 working-memory turn, and returns immediate recall context.
+
+``IngestService`` is the primary class with constructor-injected
+dependencies.  The module-level ``memory_ingest`` function is a
+backward-compatible convenience wrapper.
 """
 
 from __future__ import annotations
@@ -134,6 +138,182 @@ class IngestResult(BaseModel):
     recall_context: list[HybridResult]
 
 
+class IngestService:
+    """Orchestrates atomic memory ingest with injected dependencies.
+
+    Implements the canonical ingest per FR-9/FR-13: privacy hooks,
+    space resolution, atomic graph write, event publication,
+    working-memory buffering, and recall retrieval.
+
+    Args:
+        store: Neo4j store for graph writes and reads.
+        driver: Neo4j driver for hybrid retrieval queries.
+        working_memory: Redis session buffer (``None`` to skip).
+        event_feed: Consolidation event feed (``None`` to skip).
+    """
+
+    def __init__(
+        self,
+        store: Neo4jStore,
+        driver: AsyncDriver,
+        *,
+        working_memory: RedisWorkingMemory | None = None,
+        event_feed: ConsolidationEventFeed | None = None,
+    ) -> None:
+        self._store = store
+        self._driver = driver
+        self._working_memory = working_memory
+        self._event_feed = event_feed
+
+    async def ingest(
+        self,
+        params: IngestParams,
+        *,
+        privacy: PrivacySettings | None = None,
+        retrieval: RetrievalSettings | None = None,
+    ) -> IngestResult:
+        """Execute the atomic memory ingest operation.
+
+        Args:
+            params: Ingest parameters.
+            privacy: Privacy hook settings.
+            retrieval: Retrieval tuning for recall context.
+
+        Returns:
+            IngestResult with all created objects and recall context.
+
+        Raises:
+            CredentialViolationError: If content contains credential
+                patterns and rejection is enabled.
+        """
+        privacy = privacy or PrivacySettings()
+        retrieval = retrieval or RetrievalSettings()
+
+        sanitized_content = apply_privacy_hooks(
+            params.content,
+            redact_pii_enabled=privacy.pii_redaction_enabled,
+            reject_credentials_enabled=privacy.credential_rejection_enabled,
+        )
+        sanitized_search = (
+            apply_privacy_hooks(
+                params.search_text,
+                redact_pii_enabled=privacy.pii_redaction_enabled,
+                reject_credentials_enabled=privacy.credential_rejection_enabled,
+            )
+            if params.search_text is not None
+            else sanitized_content
+        )
+
+        space = await self._store.resolve_space(
+            project_id=params.project_id,
+            space_name=params.space_name,
+            parent_space_id=params.parent_space_id,
+        )
+
+        item = Item(
+            space_id=space.id,
+            name=params.item_name,
+            kind=ItemKind(params.item_kind),
+        )
+        revision = Revision(
+            item_id=item.id,
+            revision_number=1,
+            content=sanitized_content,
+            search_text=sanitized_search,
+            embedding=params.embedding,
+        )
+        tags = [
+            Tag(item_id=item.id, name=name, revision_id=revision.id)
+            for name in params.tag_names
+        ]
+        artifacts = [
+            Artifact(
+                revision_id=revision.id,
+                name=spec.name,
+                location=spec.location,
+                media_type=spec.media_type,
+                size_bytes=spec.size_bytes,
+                **({"metadata": spec.metadata} if spec.metadata is not None else {}),
+            )
+            for spec in params.artifacts
+        ]
+        edges = [
+            Edge(
+                source_revision_id=revision.id,
+                target_revision_id=spec.target_revision_id,
+                edge_type=EdgeType(spec.edge_type),
+                confidence=spec.confidence,
+                reason=spec.reason,
+                context=spec.context,
+            )
+            for spec in params.edges
+        ]
+
+        tag_assignments, bundle_edge = await self._store.ingest_memory_unit(
+            item=item,
+            revision=revision,
+            tags=tags,
+            artifacts=artifacts,
+            edges=edges,
+            bundle_item_id=params.bundle_item_id,
+        )
+        if bundle_edge is not None:
+            edges = [*edges, bundle_edge]
+
+        if self._event_feed is not None:
+            try:
+                await publish_after_ingest(
+                    self._event_feed,
+                    params.project_id,
+                    revision,
+                    edges,
+                )
+            except Exception:
+                logger.warning(
+                    "Dream State event publication failed; "
+                    "ingest succeeded but events were not published",
+                )
+
+        if params.session_id is not None and self._working_memory is not None:
+            await self._working_memory.add_message(
+                project_id=params.project_id,
+                session_id=params.session_id,
+                role=params.message_role,
+                content=sanitized_content,
+            )
+
+        recall_context: list[HybridResult] = []
+        try:
+            recall_context = await hybrid_search(
+                self._driver,
+                query=sanitized_search,
+                query_embedding=(list(params.embedding) if params.embedding else None),
+                memory_limit=retrieval.memory_limit,
+                context_top_k=retrieval.context_top_k,
+                type_weights={
+                    MatchSource.ITEM: retrieval.weight_item,
+                    MatchSource.REVISION: retrieval.weight_revision,
+                    MatchSource.ARTIFACT: retrieval.weight_artifact,
+                },
+                database=self._store._database,
+            )
+        except Exception:
+            logger.warning(
+                "Recall context retrieval failed; returning empty context",
+            )
+
+        return IngestResult(
+            space=space,
+            item=item,
+            revision=revision,
+            tags=tags,
+            tag_assignments=tag_assignments,
+            artifacts=artifacts,
+            edges=edges,
+            recall_context=recall_context,
+        )
+
+
 async def memory_ingest(
     neo4j_driver: AsyncDriver,
     redis_client: Redis | None,
@@ -144,17 +324,10 @@ async def memory_ingest(
     event_feed: ConsolidationEventFeed | None = None,
     database: str = "neo4j",
 ) -> IngestResult:
-    """Execute the atomic memory ingest operation.
+    """Backward-compatible convenience wrapper around ``IngestService``.
 
-    Performs the canonical ingest in a single invocation:
-
-    1. Apply PII redaction and credential rejection.
-    2. Resolve or create the target space.
-    3. Create item, revision, tags, artifacts, edges, and bundle
-       membership atomically in one Neo4j transaction.
-    4. Publish Dream State events (only after successful commit).
-    5. Buffer the working-memory turn in Redis.
-    6. Return immediate recall context via hybrid retrieval.
+    Constructs the service with injected dependencies from the raw
+    driver and client objects, then delegates to ``IngestService.ingest``.
 
     Args:
         neo4j_driver: Neo4j async driver instance.
@@ -174,133 +347,12 @@ async def memory_ingest(
         CredentialViolationError: If content contains credential
             patterns and rejection is enabled.
     """
-    privacy = privacy or PrivacySettings()
-    retrieval = retrieval or RetrievalSettings()
     store = Neo4jStore(neo4j_driver, database=database)
-
-    # 1. Privacy hooks -- run before any persistence
-    sanitized_content = apply_privacy_hooks(
-        params.content,
-        redact_pii_enabled=privacy.pii_redaction_enabled,
-        reject_credentials_enabled=privacy.credential_rejection_enabled,
+    wm = RedisWorkingMemory(redis_client) if redis_client is not None else None
+    service = IngestService(
+        store,
+        neo4j_driver,
+        working_memory=wm,
+        event_feed=event_feed,
     )
-    sanitized_search = (
-        apply_privacy_hooks(
-            params.search_text,
-            redact_pii_enabled=privacy.pii_redaction_enabled,
-            reject_credentials_enabled=privacy.credential_rejection_enabled,
-        )
-        if params.search_text is not None
-        else sanitized_content
-    )
-
-    # 2. Resolve or create space
-    space = await store.resolve_space(
-        project_id=params.project_id,
-        space_name=params.space_name,
-        parent_space_id=params.parent_space_id,
-    )
-
-    # 3. Build domain objects with sanitized content
-    item = Item(
-        space_id=space.id,
-        name=params.item_name,
-        kind=ItemKind(params.item_kind),
-    )
-    revision = Revision(
-        item_id=item.id,
-        revision_number=1,
-        content=sanitized_content,
-        search_text=sanitized_search,
-        embedding=params.embedding,
-    )
-    tags = [
-        Tag(item_id=item.id, name=name, revision_id=revision.id)
-        for name in params.tag_names
-    ]
-    artifacts = [
-        Artifact(
-            revision_id=revision.id,
-            name=spec.name,
-            location=spec.location,
-            media_type=spec.media_type,
-            size_bytes=spec.size_bytes,
-            **({"metadata": spec.metadata} if spec.metadata is not None else {}),
-        )
-        for spec in params.artifacts
-    ]
-    edges = [
-        Edge(
-            source_revision_id=revision.id,
-            target_revision_id=spec.target_revision_id,
-            edge_type=EdgeType(spec.edge_type),
-            confidence=spec.confidence,
-            reason=spec.reason,
-            context=spec.context,
-        )
-        for spec in params.edges
-    ]
-
-    # 4. Atomic graph write
-    tag_assignments, bundle_edge = await store.ingest_memory_unit(
-        item=item,
-        revision=revision,
-        tags=tags,
-        artifacts=artifacts,
-        edges=edges,
-        bundle_item_id=params.bundle_item_id,
-    )
-    if bundle_edge is not None:
-        edges = [*edges, bundle_edge]
-
-    # 5. Publish Dream State events (post-commit only)
-    if event_feed is not None:
-        try:
-            await publish_after_ingest(event_feed, params.project_id, revision, edges)
-        except Exception:
-            logger.warning(
-                "Dream State event publication failed; "
-                "ingest succeeded but events were not published",
-            )
-
-    # 6. Buffer working-memory turn
-    if params.session_id is not None and redis_client is not None:
-        wm = RedisWorkingMemory(redis_client)
-        await wm.add_message(
-            project_id=params.project_id,
-            session_id=params.session_id,
-            role=params.message_role,
-            content=sanitized_content,
-        )
-
-    # 7. Recall context via hybrid retrieval
-    recall_context: list[HybridResult] = []
-    try:
-        recall_context = await hybrid_search(
-            neo4j_driver,
-            query=sanitized_search,
-            query_embedding=(list(params.embedding) if params.embedding else None),
-            memory_limit=retrieval.memory_limit,
-            context_top_k=retrieval.context_top_k,
-            type_weights={
-                MatchSource.ITEM: retrieval.weight_item,
-                MatchSource.REVISION: retrieval.weight_revision,
-                MatchSource.ARTIFACT: retrieval.weight_artifact,
-            },
-            database=database,
-        )
-    except Exception:
-        logger.warning(
-            "Recall context retrieval failed; returning empty context",
-        )
-
-    return IngestResult(
-        space=space,
-        item=item,
-        revision=revision,
-        tags=tags,
-        tag_assignments=tag_assignments,
-        artifacts=artifacts,
-        edges=edges,
-        recall_context=recall_context,
-    )
+    return await service.ingest(params, privacy=privacy, retrieval=retrieval)

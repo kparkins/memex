@@ -297,7 +297,7 @@ class TestEventCollectionSinceCursor:
         _, rev = await _create_item_with_revision(env.store, space)
         await publish_revision_created(env.feed, env.project.id, rev)
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch = await collector.collect(env.project.id)
 
         assert len(batch.events) == 1
@@ -310,7 +310,7 @@ class TestEventCollectionSinceCursor:
         _, rev1 = await _create_item_with_revision(env.store, space)
         await publish_revision_created(env.feed, env.project.id, rev1)
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch1 = await collector.collect(env.project.id)
         await collector.commit_cursor(env.project.id, batch1.cursor)
 
@@ -345,13 +345,13 @@ class TestEventCollectionSinceCursor:
             await env.store.create_item_with_revision(item, rev, tags=[tag])
             await publish_revision_created(env.feed, env.project.id, rev)
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch = await collector.collect(env.project.id, count=3)
         assert len(batch.events) == 3
 
     async def test_collect_empty_stream(self, env):
         """Collecting from empty stream returns empty batch."""
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch = await collector.collect(env.project.id)
         assert len(batch.events) == 0
         assert len(batch.revisions) == 0
@@ -363,7 +363,7 @@ class TestEventCollectionSinceCursor:
         item, rev = await _create_item_with_revision(env.store, space)
         await publish_revision_created(env.feed, env.project.id, rev)
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch = await collector.collect(env.project.id)
 
         assert rev.id in batch.revisions
@@ -413,7 +413,7 @@ class TestBundleContextInspection:
             event_feed=env.feed,
         )
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch = await collector.collect(env.project.id)
 
         rev_id = result.revision.id
@@ -426,7 +426,7 @@ class TestBundleContextInspection:
         item, rev = await _create_item_with_revision(env.store, space)
         await publish_revision_created(env.feed, env.project.id, rev)
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch = await collector.collect(env.project.id)
 
         assert rev.id in batch.revisions
@@ -458,7 +458,7 @@ class TestCursorResume:
             await publish_revision_created(env.feed, env.project.id, rev)
             revisions.append(rev)
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
 
         # Process first batch of 2
         batch1 = await collector.collect(env.project.id, count=2)
@@ -466,7 +466,7 @@ class TestCursorResume:
         await collector.commit_cursor(env.project.id, batch1.cursor)
 
         # Simulate restart -- new collector reads from persisted cursor
-        collector2 = DreamStateCollector(env.driver, env.redis)
+        collector2 = DreamStateCollector(env.store, env.feed, env.cursor)
         batch2 = await collector2.collect(env.project.id)
         assert len(batch2.events) == 1
         assert batch2.events[0].data["revision_id"] == revisions[2].id
@@ -477,7 +477,7 @@ class TestCursorResume:
         item, rev = await _create_item_with_revision(env.store, space)
         await publish_revision_created(env.feed, env.project.id, rev)
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch1 = await collector.collect(env.project.id)
         await collector.commit_cursor(env.project.id, batch1.cursor)
 
@@ -497,7 +497,7 @@ class TestCursorResume:
         item, rev = await _create_item_with_revision(env.store, space)
         await publish_revision_created(env.feed, env.project.id, rev)
 
-        collector = DreamStateCollector(env.driver, env.redis)
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
         batch1 = await collector.collect(env.project.id)
         assert len(batch1.events) == 1
 

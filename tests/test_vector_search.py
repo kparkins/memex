@@ -53,7 +53,7 @@ class TestGenerateEmbedding:
         fake_response.data = [{"embedding": [0.1, 0.2, 0.3]}]
 
         with patch(
-            "memex.retrieval.vector.litellm.aembedding",
+            "memex.llm.client.litellm.aembedding",
             return_value=fake_response,
         ) as mock_embed:
             result = await generate_embedding("test text")
@@ -71,7 +71,7 @@ class TestGenerateEmbedding:
         fake_response.data = [{"embedding": [0.5]}]
 
         with patch(
-            "memex.retrieval.vector.litellm.aembedding",
+            "memex.llm.client.litellm.aembedding",
             return_value=fake_response,
         ) as mock_embed:
             result = await generate_embedding(
@@ -88,7 +88,7 @@ class TestGenerateEmbedding:
     async def test_raises_runtime_error_on_failure(self) -> None:
         """Provider failure is wrapped in RuntimeError."""
         with patch(
-            "memex.retrieval.vector.litellm.aembedding",
+            "memex.llm.client.litellm.aembedding",
             side_effect=ValueError("provider down"),
         ):
             with pytest.raises(RuntimeError, match="Embedding generation failed"):

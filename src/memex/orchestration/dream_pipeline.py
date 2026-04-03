@@ -15,6 +15,7 @@ import orjson
 from pydantic import BaseModel, Field
 
 from memex.config import DreamStateSettings
+from memex.llm.client import LLMClient
 from memex.llm.dream_assessment import (
     DreamAction,
     DreamActionType,
@@ -174,6 +175,8 @@ class DreamStatePipeline:
         executor: Dream State action executor.
         store: Neo4j store for item lookups and report persistence.
         settings: Dream State configuration (batch size, thresholds).
+        llm_client: Injectable LLM client for assessment. ``None``
+            falls back to ``LiteLLMClient`` inside ``assess_batch``.
     """
 
     def __init__(
@@ -183,11 +186,13 @@ class DreamStatePipeline:
         store: Neo4jStore,
         *,
         settings: DreamStateSettings | None = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
         self._collector = collector
         self._executor = executor
         self._store = store
         self._settings = settings or DreamStateSettings()
+        self._llm_client = llm_client
 
     async def run(
         self,
@@ -278,7 +283,11 @@ class DreamStatePipeline:
 
         item_kinds = await _resolve_item_kinds(self._store, batch.revisions)
         summaries = _to_revision_summaries(batch.revisions, item_kinds)
-        return await assess_batch(summaries, model=model or "gpt-4o-mini")
+        return await assess_batch(
+            summaries,
+            model=model or "gpt-4o-mini",
+            llm_client=self._llm_client,
+        )
 
     def serialize_report(self, report: DreamAuditReport) -> bytes:
         """Serialize an audit report to JSON bytes.

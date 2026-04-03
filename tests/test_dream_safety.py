@@ -33,7 +33,12 @@ from memex.orchestration.dream_pipeline import (
     compute_deprecation_ratio,
 )
 from memex.stores import Neo4jStore, ensure_schema
-from memex.stores.redis_store import ConsolidationEvent, ConsolidationEventType
+from memex.stores.redis_store import (
+    ConsolidationEvent,
+    ConsolidationEventFeed,
+    ConsolidationEventType,
+    DreamStateCursor,
+)
 
 # -- Fixtures ----------------------------------------------------------------
 
@@ -55,7 +60,9 @@ async def env(neo4j_driver, redis_client):
     await store.create_project(project)
     space = await store.resolve_space(project.id, "facts")
 
-    collector = DreamStateCollector(neo4j_driver, redis_client)
+    feed = ConsolidationEventFeed(redis_client)
+    cursor = DreamStateCursor(redis_client)
+    collector = DreamStateCollector(store, feed, cursor)
     executor = DreamStateExecutor(store)
     pipeline = DreamStatePipeline(
         collector, executor, store, settings=DreamStateSettings()

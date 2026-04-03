@@ -656,3 +656,59 @@
 - `uv run ruff format --check src/ tests/` -- 52 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 28 source files
 - `uv run pytest tests/ -v` -- 521 passed (26 new trigger tests + 495 existing)
+
+## T24: Refactor code to SOLID principles and Dependency Inversion (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+
+### Dependency Inversion: LLM and Embedding Protocols
+- Created `src/memex/llm/client.py` with protocol + adapter pattern:
+  - `LLMClient` (Protocol, runtime_checkable): Abstract interface for LLM completion calls
+  - `EmbeddingClient` (Protocol, runtime_checkable): Abstract interface for embedding generation
+  - `LiteLLMClient`: Adapter implementing `LLMClient` via `litellm.acompletion`
+  - `LiteLLMEmbeddingClient`: Adapter implementing `EmbeddingClient` via `litellm.aembedding`
+- Created `src/memex/llm/utils.py` with shared `strip_markdown_fence` utility (deduplicated from `llm/enrichment.py` and `llm/dream_assessment.py`)
+
+### Dependency Injection in LLM Modules
+- Refactored `src/memex/llm/enrichment.py`: `extract_enrichments` now accepts optional `llm_client: LLMClient` parameter; defaults to `LiteLLMClient` when None; uses shared `strip_markdown_fence`
+- Refactored `src/memex/llm/dream_assessment.py`: `assess_batch` now accepts optional `llm_client: LLMClient` parameter; defaults to `LiteLLMClient` when None; uses shared `strip_markdown_fence`
+- Refactored `src/memex/retrieval/vector.py`: `generate_embedding` now accepts optional `embedding_client: EmbeddingClient` parameter; defaults to `LiteLLMEmbeddingClient` when None; removed direct `litellm` import
+
+### Orchestration: Constructor Injection (DIP, SRP)
+- Refactored `src/memex/orchestration/ingest.py`:
+  - New `IngestService` class with constructor-injected `Neo4jStore`, `AsyncDriver`, `RedisWorkingMemory`, `ConsolidationEventFeed`
+  - `ingest()` method replaces the logic previously in `memory_ingest()` function
+  - Kept `memory_ingest()` as a backward-compatible thin wrapper that constructs IngestService internally
+- Refactored `src/memex/orchestration/enrichment.py`:
+  - New `EnrichmentService` class with constructor-injected `Neo4jStore`, `LLMClient`, `EmbeddingClient`
+  - `enrich()` method replaces the logic previously in `enrich_revision()` function
+  - Kept `enrich_revision()` and `schedule_enrichment()` as backward-compatible wrappers
+- Refactored `src/memex/orchestration/dream_collector.py`:
+  - `DreamStateCollector` now accepts `(store: Neo4jStore, feed: ConsolidationEventFeed, cursor: DreamStateCursor)` directly instead of raw `(neo4j_driver, redis_client)`
+  - Eliminates internal construction of stores from raw drivers
+- Refactored `src/memex/orchestration/dream_pipeline.py`:
+  - `DreamStatePipeline` now accepts optional `llm_client: LLMClient` for injectable LLM assessment
+  - `_assess` passes the LLM client to `assess_batch`
+
+### Test Updates
+- Updated `tests/test_dream_state_events.py`: All 11 `DreamStateCollector` calls now use `(store, feed, cursor)` signature
+- Updated `tests/test_dream_safety.py`: `env` fixture creates `ConsolidationEventFeed` and `DreamStateCursor`, passes them to collector
+- Updated `tests/test_enrichment.py`: `_strip_markdown_fence` import changed to `strip_markdown_fence` from `memex.llm.utils`; LLM mock targets updated to `memex.llm.client.litellm.acompletion`
+- Updated `tests/test_dream_executor.py`: `_strip_markdown_fence` import and LLM mock targets updated
+- Updated `tests/test_vector_search.py`: Embedding mock target updated to `memex.llm.client.litellm.aembedding`
+- Updated all `__init__.py` re-exports for new types
+
+### Design Patterns Applied
+- **Strategy Pattern**: LLMClient/EmbeddingClient protocols enable swapping implementations
+- **Adapter Pattern**: LiteLLMClient/LiteLLMEmbeddingClient wrap litellm SDK
+- **Dependency Injection**: All orchestration services accept dependencies via constructors
+- **Interface Segregation**: Consumers depend on focused protocol interfaces, not monolithic classes
+- **DRY**: `strip_markdown_fence` deduplicated into shared utility module
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 54 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 30 source files
+- `uv run pytest tests/ -v` -- 521 passed (all existing tests pass with refactored code)

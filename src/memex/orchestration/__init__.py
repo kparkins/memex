@@ -26,6 +26,7 @@ from memex.orchestration.dream_triggers import (
 )
 from memex.orchestration.enrichment import (
     EnrichmentResult,
+    EnrichmentService,
     enrich_revision,
     schedule_enrichment,
 )
@@ -40,6 +41,7 @@ from memex.orchestration.ingest import (
     EdgeSpec,
     IngestParams,
     IngestResult,
+    IngestService,
     memory_ingest,
 )
 from memex.orchestration.privacy import (
@@ -62,11 +64,16 @@ __all__ = [
     "DreamStateTrigger",
     "EdgeSpec",
     "EnrichmentResult",
+    "EnrichmentService",
     "ExecutionReport",
     "ExplicitTrigger",
     "IdleTrigger",
     "IngestParams",
     "IngestResult",
+    "IngestService",
+    "ScheduledTrigger",
+    "ThresholdTrigger",
+    "TriggerMode",
     "apply_circuit_breaker",
     "apply_privacy_hooks",
     "compute_deprecation_ratio",
@@ -78,8 +85,5 @@ __all__ = [
     "publish_revision_deprecated",
     "redact_pii",
     "reject_credentials",
-    "ScheduledTrigger",
-    "ThresholdTrigger",
-    "TriggerMode",
     "schedule_enrichment",
 ]

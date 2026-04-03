@@ -9,11 +9,12 @@ from __future__ import annotations
 import logging
 from enum import StrEnum
 
-import litellm
 import orjson
 from pydantic import BaseModel, Field
 
 from memex.domain.edges import EdgeType
+from memex.llm.client import LiteLLMClient, LLMClient
+from memex.llm.utils import strip_markdown_fence
 
 logger = logging.getLogger(__name__)
 
@@ -165,27 +166,6 @@ def _build_context(revisions: list[RevisionSummary]) -> str:
     return orjson.dumps(entries, option=orjson.OPT_INDENT_2).decode()
 
 
-def _strip_markdown_fence(raw: str) -> str:
-    """Remove markdown code fences from LLM output.
-
-    Args:
-        raw: Raw LLM response text.
-
-    Returns:
-        Text with markdown fences stripped.
-    """
-    stripped = raw.strip()
-    if not stripped.startswith("```"):
-        return stripped
-    first_newline = stripped.find("\n")
-    if first_newline == -1:
-        return stripped[3:]
-    body = stripped[first_newline + 1 :]
-    if body.rstrip().endswith("```"):
-        body = body.rstrip()[:-3].rstrip()
-    return body
-
-
 def _parse_actions(raw: str) -> list[DreamAction]:
     """Parse LLM JSON response into validated DreamAction list.
 
@@ -198,7 +178,7 @@ def _parse_actions(raw: str) -> list[DreamAction]:
     Returns:
         List of successfully parsed DreamActions.
     """
-    cleaned = _strip_markdown_fence(raw)
+    cleaned = strip_markdown_fence(raw)
     data = orjson.loads(cleaned)
     actions: list[DreamAction] = []
     for item in data:
@@ -213,12 +193,15 @@ async def assess_batch(
     revisions: list[RevisionSummary],
     *,
     model: str = "gpt-4o-mini",
+    llm_client: LLMClient | None = None,
 ) -> list[DreamAction]:
     """Request structured LLM assessment for a batch of revisions.
 
     Args:
         revisions: Revision summaries to assess.
-        model: LLM model identifier for litellm.
+        model: LLM model identifier.
+        llm_client: Injectable LLM client. Falls back to
+            ``LiteLLMClient`` when ``None``.
 
     Returns:
         List of recommended DreamActions.
@@ -229,18 +212,18 @@ async def assess_batch(
     if not revisions:
         return []
 
+    client = llm_client or LiteLLMClient()
     context = _build_context(revisions)
     prompt = _ASSESSMENT_PROMPT.format(
         edge_types=", ".join(et.value for et in _DREAM_EDGE_TYPES),
         context=context,
     )
     try:
-        response = await litellm.acompletion(
-            model=model,
+        raw = await client.complete(
             messages=[{"role": "user", "content": prompt}],
+            model=model,
             temperature=0.3,
         )
-        raw: str = response.choices[0].message.content.strip()
         return _parse_actions(raw)
     except Exception as exc:
         raise RuntimeError(f"Dream State assessment failed: {exc}") from exc

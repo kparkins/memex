@@ -20,9 +20,9 @@ from memex.llm.dream_assessment import (
     RevisionSummary,
     _build_context,
     _parse_actions,
-    _strip_markdown_fence,
     assess_batch,
 )
+from memex.llm.utils import strip_markdown_fence
 from memex.orchestration.dream_executor import DreamStateExecutor
 from memex.stores import Neo4jStore, ensure_schema
 
@@ -129,21 +129,21 @@ class TestBuildContext:
 
 
 class TestStripMarkdownFence:
-    """_strip_markdown_fence removes code fences from LLM output."""
+    """strip_markdown_fence removes code fences from LLM output."""
 
     def test_no_fence(self):
         """Plain JSON passes through unchanged."""
-        assert _strip_markdown_fence("[]") == "[]"
+        assert strip_markdown_fence("[]") == "[]"
 
     def test_json_fence(self):
         """Markdown JSON fence is removed."""
         raw = '```json\n[{"action_type": "deprecate_item"}]\n```'
-        assert '"deprecate_item"' in _strip_markdown_fence(raw)
+        assert '"deprecate_item"' in strip_markdown_fence(raw)
 
     def test_bare_fence(self):
         """Bare triple-backtick fence is removed."""
         raw = "```\n[]\n```"
-        assert _strip_markdown_fence(raw) == "[]"
+        assert strip_markdown_fence(raw) == "[]"
 
 
 class TestParseActions:
@@ -247,7 +247,7 @@ class TestAssessBatch:
         mock_resp = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=llm_response))]
         )
-        with patch("memex.llm.dream_assessment.litellm") as mock_llm:
+        with patch("memex.llm.client.litellm") as mock_llm:
             mock_llm.acompletion = AsyncMock(return_value=mock_resp)
             revisions = [
                 RevisionSummary(
@@ -275,7 +275,7 @@ class TestAssessBatch:
         mock_resp = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
         )
-        with patch("memex.llm.dream_assessment.litellm") as mock_llm:
+        with patch("memex.llm.client.litellm") as mock_llm:
             mock_llm.acompletion = AsyncMock(return_value=mock_resp)
             await assess_batch(
                 [
@@ -294,7 +294,7 @@ class TestAssessBatch:
     @pytest.mark.asyncio
     async def test_llm_failure_raises_runtime_error(self):
         """LLM call failure raises RuntimeError."""
-        with patch("memex.llm.dream_assessment.litellm") as mock_llm:
+        with patch("memex.llm.client.litellm") as mock_llm:
             mock_llm.acompletion = AsyncMock(side_effect=ConnectionError("timeout"))
             with pytest.raises(RuntimeError, match="assessment failed"):
                 await assess_batch(
@@ -314,7 +314,7 @@ class TestAssessBatch:
         mock_resp = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="not valid json"))]
         )
-        with patch("memex.llm.dream_assessment.litellm") as mock_llm:
+        with patch("memex.llm.client.litellm") as mock_llm:
             mock_llm.acompletion = AsyncMock(return_value=mock_resp)
             with pytest.raises(RuntimeError, match="assessment failed"):
                 await assess_batch(

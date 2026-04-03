@@ -5,6 +5,10 @@ extracting FR-8 metadata, applying privacy hooks, generating
 embeddings, and persisting results back to Neo4j. If enrichment
 fails at any step, the stored revision remains valid and
 fulltext-searchable (FR-9).
+
+``EnrichmentService`` is the primary class with constructor-injected
+dependencies.  Module-level functions provide backward-compatible
+convenience wrappers.
 """
 
 from __future__ import annotations
@@ -16,6 +20,12 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from memex.config import EmbeddingSettings, EnrichmentSettings, PrivacySettings
+from memex.llm.client import (
+    EmbeddingClient,
+    LiteLLMClient,
+    LiteLLMEmbeddingClient,
+    LLMClient,
+)
 from memex.llm.enrichment import EnrichmentOutput, extract_enrichments
 from memex.orchestration.privacy import apply_privacy_hooks
 from memex.retrieval.vector import generate_embedding
@@ -52,10 +62,6 @@ def _build_enriched_search_text(
     enrichment: EnrichmentOutput,
 ) -> str:
     """Build enriched search text combining original and enrichments.
-
-    Appends summary, topics, keywords, facts, events, and
-    implications to the original search_text so that fulltext
-    queries match enrichment-derived terms.
 
     Args:
         original: Original search_text from the revision.
@@ -123,6 +129,124 @@ def _sanitize_enrichment(
     )
 
 
+class EnrichmentService:
+    """Orchestrates revision enrichment with injected dependencies.
+
+    Pipeline: fetch revision, extract via LLM, sanitize, build
+    enriched search text, generate embedding, persist to store.
+
+    Args:
+        store: Neo4j store for revision reads and writes.
+        llm_client: LLM client for enrichment extraction.
+        embedding_client: Embedding client for vector generation.
+    """
+
+    def __init__(
+        self,
+        store: Neo4jStore,
+        *,
+        llm_client: LLMClient | None = None,
+        embedding_client: EmbeddingClient | None = None,
+    ) -> None:
+        self._store = store
+        self._llm_client = llm_client or LiteLLMClient()
+        self._embedding_client = embedding_client or LiteLLMEmbeddingClient()
+
+    async def enrich(
+        self,
+        revision_id: str,
+        *,
+        enrichment_settings: EnrichmentSettings | None = None,
+        embedding_settings: EmbeddingSettings | None = None,
+        privacy_settings: PrivacySettings | None = None,
+    ) -> EnrichmentResult:
+        """Run the full enrichment pipeline for a single revision.
+
+        Args:
+            revision_id: ID of the revision to enrich.
+            enrichment_settings: LLM model settings.
+            embedding_settings: Embedding provider settings.
+            privacy_settings: Privacy hook settings.
+
+        Returns:
+            EnrichmentResult indicating success or failure.
+        """
+        enrich_cfg = enrichment_settings or EnrichmentSettings()
+        embed_cfg = embedding_settings or EmbeddingSettings()
+        privacy_cfg = privacy_settings or PrivacySettings()
+
+        revision = await self._store.get_revision(revision_id)
+        if revision is None:
+            return EnrichmentResult(
+                revision_id=revision_id,
+                success=False,
+                error=f"Revision {revision_id} not found",
+            )
+
+        try:
+            enrichment = await extract_enrichments(
+                revision.content,
+                model=enrich_cfg.model,
+                llm_client=self._llm_client,
+            )
+
+            sanitized = _sanitize_enrichment(
+                enrichment,
+                redact_pii=privacy_cfg.pii_redaction_enabled,
+                reject_creds=privacy_cfg.credential_rejection_enabled,
+            )
+
+            enriched_search_text = _build_enriched_search_text(
+                revision.search_text,
+                sanitized,
+            )
+            enriched_search_text = apply_privacy_hooks(
+                enriched_search_text,
+                redact_pii_enabled=privacy_cfg.pii_redaction_enabled,
+                reject_credentials_enabled=privacy_cfg.credential_rejection_enabled,
+            )
+
+            embed_text = (
+                sanitized.embedding_text_override
+                if sanitized.embedding_text_override is not None
+                else enriched_search_text
+            )
+            embedding = await generate_embedding(
+                embed_text,
+                model=embed_cfg.model,
+                dimensions=embed_cfg.dimensions,
+                embedding_client=self._embedding_client,
+            )
+
+            await self._store.update_revision_enrichment(
+                revision_id,
+                summary=sanitized.summary,
+                topics=list(sanitized.topics),
+                keywords=list(sanitized.keywords),
+                facts=list(sanitized.facts),
+                events=list(sanitized.events),
+                implications=list(sanitized.implications),
+                embedding_text_override=sanitized.embedding_text_override,
+                embedding=embedding,
+                search_text=enriched_search_text,
+            )
+
+            return EnrichmentResult(
+                revision_id=revision_id,
+                enrichment=sanitized,
+                embedding_generated=True,
+                search_text_updated=True,
+            )
+
+        except Exception as e:
+            logger.error("Enrichment pipeline failed for %s: %s", revision_id, e)
+            return EnrichmentResult(
+                revision_id=revision_id,
+                success=False,
+                error=str(e),
+            )
+
+
 async def enrich_revision(
     neo4j_driver: AsyncDriver,
     revision_id: str,
@@ -132,19 +256,7 @@ async def enrich_revision(
     privacy_settings: PrivacySettings | None = None,
     database: str = "neo4j",
 ) -> EnrichmentResult:
-    """Run the full enrichment pipeline for a single revision.
-
-    Pipeline steps:
-
-    1. Fetch the revision from Neo4j.
-    2. Extract enrichment metadata via LLM.
-    3. Apply PII redaction and credential rejection to outputs.
-    4. Build enriched search text for fulltext indexing.
-    5. Generate embedding (using override text if available).
-    6. Persist all enrichment fields back to Neo4j.
-
-    If any step fails, the stored revision remains valid and
-    fulltext-searchable.
+    """Backward-compatible wrapper around ``EnrichmentService``.
 
     Args:
         neo4j_driver: Neo4j async driver.
@@ -157,85 +269,14 @@ async def enrich_revision(
     Returns:
         EnrichmentResult indicating success or failure.
     """
-    enrich_cfg = enrichment_settings or EnrichmentSettings()
-    embed_cfg = embedding_settings or EmbeddingSettings()
-    privacy_cfg = privacy_settings or PrivacySettings()
     store = Neo4jStore(neo4j_driver, database=database)
-
-    # 1. Fetch revision
-    revision = await store.get_revision(revision_id)
-    if revision is None:
-        return EnrichmentResult(
-            revision_id=revision_id,
-            success=False,
-            error=f"Revision {revision_id} not found",
-        )
-
-    try:
-        # 2. Extract enrichment via LLM
-        enrichment = await extract_enrichments(
-            revision.content,
-            model=enrich_cfg.model,
-        )
-
-        # 3. Apply privacy hooks to enrichment outputs
-        sanitized = _sanitize_enrichment(
-            enrichment,
-            redact_pii=privacy_cfg.pii_redaction_enabled,
-            reject_creds=privacy_cfg.credential_rejection_enabled,
-        )
-
-        # 4. Build enriched search text
-        enriched_search_text = _build_enriched_search_text(
-            revision.search_text,
-            sanitized,
-        )
-        enriched_search_text = apply_privacy_hooks(
-            enriched_search_text,
-            redact_pii_enabled=privacy_cfg.pii_redaction_enabled,
-            reject_credentials_enabled=privacy_cfg.credential_rejection_enabled,
-        )
-
-        # 5. Generate embedding
-        embed_text = (
-            sanitized.embedding_text_override
-            if sanitized.embedding_text_override is not None
-            else enriched_search_text
-        )
-        embedding = await generate_embedding(
-            embed_text,
-            model=embed_cfg.model,
-            dimensions=embed_cfg.dimensions,
-        )
-
-        # 6. Persist to Neo4j
-        await store.update_revision_enrichment(
-            revision_id,
-            summary=sanitized.summary,
-            topics=list(sanitized.topics),
-            keywords=list(sanitized.keywords),
-            facts=list(sanitized.facts),
-            events=list(sanitized.events),
-            implications=list(sanitized.implications),
-            embedding_text_override=sanitized.embedding_text_override,
-            embedding=embedding,
-            search_text=enriched_search_text,
-        )
-
-        return EnrichmentResult(
-            revision_id=revision_id,
-            enrichment=sanitized,
-            embedding_generated=True,
-            search_text_updated=True,
-        )
-
-    except Exception as e:
-        logger.error("Enrichment pipeline failed for %s: %s", revision_id, e)
-        return EnrichmentResult(
-            revision_id=revision_id,
-            success=False,
-            error=str(e),
-        )
+    service = EnrichmentService(store)
+    return await service.enrich(
+        revision_id,
+        enrichment_settings=enrichment_settings,
+        embedding_settings=embedding_settings,
+        privacy_settings=privacy_settings,
+    )
 
 
 def schedule_enrichment(
@@ -248,10 +289,6 @@ def schedule_enrichment(
     database: str = "neo4j",
 ) -> asyncio.Task[EnrichmentResult]:
     """Schedule async enrichment as a fire-and-forget task.
-
-    Creates an asyncio task that runs the enrichment pipeline
-    without blocking the caller. The returned task can be awaited
-    if the caller needs the result.
 
     Args:
         neo4j_driver: Neo4j async driver.

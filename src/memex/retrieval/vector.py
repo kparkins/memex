@@ -3,18 +3,18 @@
 Provides beta-calibrated cosine similarity search against the
 ``revision_embedding`` vector index created by
 :func:`memex.stores.neo4j_schema.ensure_schema`, with configurable
-embedding generation via litellm.
+embedding generation via an injectable ``EmbeddingClient``.
 """
 
 from __future__ import annotations
 
 import logging
 
-import litellm
 from neo4j import AsyncDriver
 from pydantic import BaseModel
 
 from memex.domain.models import ItemKind, Revision
+from memex.llm.client import EmbeddingClient, LiteLLMEmbeddingClient
 from memex.stores.neo4j_schema import NodeLabel, RelType
 
 logger = logging.getLogger(__name__)
@@ -45,13 +45,16 @@ async def generate_embedding(
     *,
     model: str = "text-embedding-3-small",
     dimensions: int = 1536,
+    embedding_client: EmbeddingClient | None = None,
 ) -> list[float]:
-    """Generate an embedding vector for the given text via litellm.
+    """Generate an embedding vector for the given text.
 
     Args:
         text: Input text to embed.
         model: Embedding model identifier (pluggable via litellm).
         dimensions: Target embedding dimensionality.
+        embedding_client: Injectable embedding client. Falls back to
+            ``LiteLLMEmbeddingClient`` when ``None``.
 
     Returns:
         Embedding vector as a list of floats.
@@ -59,16 +62,8 @@ async def generate_embedding(
     Raises:
         RuntimeError: If the embedding provider returns an error.
     """
-    try:
-        response = await litellm.aembedding(
-            model=model,
-            input=[text],
-            dimensions=dimensions,
-        )
-        return response.data[0]["embedding"]  # type: ignore[no-any-return]
-    except Exception as e:
-        logger.error("Embedding generation failed: %s", e)
-        raise RuntimeError(f"Embedding generation failed: {e}") from e
+    client = embedding_client or LiteLLMEmbeddingClient()
+    return await client.embed(text, model=model, dimensions=dimensions)
 
 
 async def vector_search(

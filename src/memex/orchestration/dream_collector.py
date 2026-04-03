@@ -8,8 +8,6 @@ interruption.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from pydantic import BaseModel, Field
 
 from memex.domain.models import Revision
@@ -20,10 +18,6 @@ from memex.stores.redis_store import (
     ConsolidationEventType,
     DreamStateCursor,
 )
-
-if TYPE_CHECKING:
-    from neo4j import AsyncDriver
-    from redis.asyncio import Redis
 
 
 class CollectedRevision(BaseModel, frozen=True):
@@ -66,22 +60,23 @@ class DreamStateCollector:
     (revision + bundle lookup) to produce a batch of events
     enriched with revision data for the assessment stage.
 
+    Dependencies are constructor-injected for testability.
+
     Args:
-        neo4j_driver: Neo4j async driver instance.
-        redis_client: Redis async client connection.
-        database: Neo4j database name.
+        store: Neo4j store for revision and bundle lookups.
+        feed: Consolidation event feed reader.
+        cursor: Dream State cursor for position tracking.
     """
 
     def __init__(
         self,
-        neo4j_driver: AsyncDriver,
-        redis_client: Redis,
-        *,
-        database: str = "neo4j",
+        store: Neo4jStore,
+        feed: ConsolidationEventFeed,
+        cursor: DreamStateCursor,
     ) -> None:
-        self._store = Neo4jStore(neo4j_driver, database=database)
-        self._feed = ConsolidationEventFeed(redis_client)
-        self._cursor = DreamStateCursor(redis_client)
+        self._store = store
+        self._feed = feed
+        self._cursor = cursor
 
     async def collect(
         self,
@@ -91,15 +86,9 @@ class DreamStateCollector:
     ) -> DreamStateEventBatch:
         """Load cursor, collect events, and fetch affected revisions.
 
-        Reads events from the consolidation feed since the persisted
-        cursor, extracts revision IDs from event payloads, fetches
-        each revision from Neo4j, and looks up bundle memberships
-        for context.
-
         Args:
             project_id: Project whose events to collect.
             count: Maximum number of events to fetch from the stream.
-                ``None`` fetches all available events.
 
         Returns:
             Batch containing events, revision data, and cursor

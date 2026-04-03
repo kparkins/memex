@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import logging
 
-import litellm
 import orjson
 from pydantic import BaseModel, Field
+
+from memex.llm.client import LiteLLMClient, LLMClient
+from memex.llm.utils import strip_markdown_fence
 
 logger = logging.getLogger(__name__)
 
@@ -60,39 +62,19 @@ Content:
 {content}"""
 
 
-def _strip_markdown_fence(raw: str) -> str:
-    """Remove markdown code fences from LLM response if present.
-
-    Args:
-        raw: Raw LLM response text.
-
-    Returns:
-        Text with markdown fences stripped.
-    """
-    stripped = raw.strip()
-    if not stripped.startswith("```"):
-        return stripped
-    # Remove opening fence line
-    first_newline = stripped.find("\n")
-    if first_newline == -1:
-        return stripped[3:]
-    body = stripped[first_newline + 1 :]
-    # Remove closing fence
-    if body.rstrip().endswith("```"):
-        body = body.rstrip()[:-3].rstrip()
-    return body
-
-
 async def extract_enrichments(
     content: str,
     *,
     model: str = "gpt-4o-mini",
+    llm_client: LLMClient | None = None,
 ) -> EnrichmentOutput:
     """Extract FR-8 enrichment metadata from content via LLM.
 
     Args:
         content: Revision content to extract from.
         model: LLM model identifier.
+        llm_client: Injectable LLM client. Falls back to
+            ``LiteLLMClient`` when ``None``.
 
     Returns:
         EnrichmentOutput with all extracted metadata.
@@ -100,19 +82,19 @@ async def extract_enrichments(
     Raises:
         RuntimeError: If the LLM call or response parsing fails.
     """
+    client = llm_client or LiteLLMClient()
     try:
-        response = await litellm.acompletion(
-            model=model,
+        raw = await client.complete(
             messages=[
                 {
                     "role": "user",
                     "content": _EXTRACTION_PROMPT.format(content=content),
                 },
             ],
+            model=model,
             temperature=0.3,
         )
-        raw: str = response.choices[0].message.content.strip()
-        cleaned = _strip_markdown_fence(raw)
+        cleaned = strip_markdown_fence(raw)
         data = orjson.loads(cleaned)
         return EnrichmentOutput(
             summary=data.get("summary", ""),
