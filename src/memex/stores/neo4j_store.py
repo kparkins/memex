@@ -11,12 +11,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 import orjson
-from neo4j import AsyncDriver, AsyncManagedTransaction
+from neo4j import AsyncDriver, AsyncManagedTransaction, ResultSummary
 from pydantic import BaseModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
 from memex.stores.neo4j_schema import NodeLabel, RelType
+from memex.stores.protocols import StorePersistenceError
 
 # -- Serialization helpers ------------------------------------------------
 
@@ -54,13 +55,22 @@ _EDGE_PROPS_EXCLUDE: set[str] = {
     "edge_type",
 }
 
+_ROOT_SENTINEL = "__ROOT__"
+
 
 # -- Transaction helper ---------------------------------------------------
 
 
-async def _run(tx: AsyncManagedTransaction, /, query: str, **params: Any) -> None:
-    """Execute a write query within a managed transaction."""
-    await (await tx.run(query, **params)).consume()
+async def _run(
+    tx: AsyncManagedTransaction, /, query: str, **params: Any
+) -> ResultSummary:
+    """Execute a write query and return the result summary.
+
+    Returns:
+        The ``ResultSummary`` whose ``counters`` attribute indicates
+        how many nodes/relationships were created, deleted, or updated.
+    """
+    return await (await tx.run(query, **params)).consume()
 
 
 # -- Store class ----------------------------------------------------------
@@ -114,6 +124,25 @@ class Neo4jStore:
         data["metadata"] = _decode_meta(data.get("metadata", ""))
         return Project.model_validate(data)
 
+    async def get_project_by_name(self, name: str) -> Project | None:
+        """Retrieve a Project by its human-readable name.
+
+        Args:
+            name: Project name to look up.
+
+        Returns:
+            Project if found, None otherwise.
+        """
+        query = f"MATCH (p:{NodeLabel.PROJECT} {{name: $name}}) RETURN p LIMIT 1"
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, name=name)
+            rec = await result.single()
+            if rec is None:
+                return None
+            data = dict(rec["p"])
+            data["metadata"] = _decode_meta(data.get("metadata", ""))
+            return Project.model_validate(data)
+
     # -- Space ------------------------------------------------------------
 
     async def create_space(self, space: Space) -> Space:
@@ -127,16 +156,20 @@ class Neo4jStore:
         """
 
         async def _work(tx: AsyncManagedTransaction) -> None:
-            await _run(
+            parent_key = space.parent_space_id or _ROOT_SENTINEL
+            summary = await _run(
                 tx,
                 f"MATCH (p:{NodeLabel.PROJECT} {{id: $pid}}) "
                 f"CREATE (:{NodeLabel.SPACE} $props)"
                 f"-[:{RelType.IN_PROJECT}]->(p)",
                 pid=space.project_id,
-                props=space.model_dump(mode="json", exclude_none=True),
+                props=space.model_dump(mode="json", exclude_none=True)
+                | {"_parent_key": parent_key},
             )
+            if summary.counters.nodes_created == 0:
+                raise StorePersistenceError(f"Project {space.project_id} not found")
             if space.parent_space_id is not None:
-                await _run(
+                summary = await _run(
                     tx,
                     f"MATCH (c:{NodeLabel.SPACE} {{id: $cid}}), "
                     f"(p:{NodeLabel.SPACE} {{id: $pid}}) "
@@ -144,6 +177,10 @@ class Neo4jStore:
                     cid=space.id,
                     pid=space.parent_space_id,
                 )
+                if summary.counters.relationships_created == 0:
+                    raise StorePersistenceError(
+                        f"Parent space {space.parent_space_id} not found"
+                    )
 
         async with self._driver.session(database=self._database) as session:
             await session.execute_write(_work)
@@ -161,18 +198,17 @@ class Neo4jStore:
         node = await self._get_node(NodeLabel.SPACE, space_id)
         return Space.model_validate(dict(node)) if node else None
 
-    async def resolve_space(
+    async def find_space(
         self,
         project_id: str,
         space_name: str,
         parent_space_id: str | None = None,
-    ) -> Space:
-        """Find an existing space by name or create a new one.
+    ) -> Space | None:
+        """Find an existing space by name without creating.
 
         Matches a space with the given name within the project. If
         ``parent_space_id`` is ``None``, only root spaces (no
-        ``CHILD_OF`` edge) are matched. Creates a new space when no
-        match is found.
+        ``CHILD_OF`` edge) are matched.
 
         Args:
             project_id: Project the space belongs to.
@@ -180,7 +216,7 @@ class Neo4jStore:
             parent_space_id: Parent space for nested hierarchy.
 
         Returns:
-            Resolved or newly created Space.
+            Space if found, None otherwise.
         """
         if parent_space_id is not None:
             query = (
@@ -209,15 +245,79 @@ class Neo4jStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, **params)
             rec = await result.single()
-            if rec is not None:
-                return Space.model_validate(dict(rec["s"]))
+            if rec is None:
+                return None
+            return Space.model_validate(dict(rec["s"]))
 
-        space = Space(
+    async def resolve_space(
+        self,
+        project_id: str,
+        space_name: str,
+        parent_space_id: str | None = None,
+    ) -> Space:
+        """Find an existing space by name or create a new one atomically.
+
+        Uses ``MERGE`` on ``(name, project_id, _parent_key)`` within a
+        single write transaction to eliminate the TOCTOU race that
+        existed in the previous find-then-create pattern.
+
+        Args:
+            project_id: Project the space belongs to.
+            space_name: Name to resolve.
+            parent_space_id: Parent space for nested hierarchy.
+
+        Returns:
+            Resolved or newly created Space.
+
+        Raises:
+            StorePersistenceError: If the project does not exist.
+        """
+        parent_key = parent_space_id or _ROOT_SENTINEL
+        new_space = Space(
             project_id=project_id,
             name=space_name,
             parent_space_id=parent_space_id,
         )
-        return await self.create_space(space)
+
+        async def _work(tx: AsyncManagedTransaction) -> Space:
+            on_create_props: dict[str, object] = {
+                "id": new_space.id,
+                "created_at": new_space.created_at.isoformat(),
+            }
+            if parent_space_id is not None:
+                on_create_props["parent_space_id"] = parent_space_id
+
+            result = await tx.run(
+                f"MATCH (p:{NodeLabel.PROJECT} {{id: $pid}}) "
+                f"MERGE (s:{NodeLabel.SPACE} "
+                f"{{name: $name, project_id: $pid, "
+                f"_parent_key: $pkey}})"
+                f"-[:{RelType.IN_PROJECT}]->(p) "
+                f"ON CREATE SET s += $props "
+                f"RETURN s",
+                pid=project_id,
+                name=space_name,
+                pkey=parent_key,
+                props=on_create_props,
+            )
+            rec = await result.single()
+            if rec is None:
+                raise StorePersistenceError(f"Project {project_id} not found")
+            space = Space.model_validate(dict(rec["s"]))
+
+            if parent_space_id is not None:
+                await _run(
+                    tx,
+                    f"MATCH (c:{NodeLabel.SPACE} {{id: $cid}}), "
+                    f"(ps:{NodeLabel.SPACE} {{id: $psid}}) "
+                    f"MERGE (c)-[:{RelType.CHILD_OF}]->(ps)",
+                    cid=space.id,
+                    psid=parent_space_id,
+                )
+            return space
+
+        async with self._driver.session(database=self._database) as session:
+            return await session.execute_write(_work)
 
     # -- Item + Revision + Tags (atomic) ----------------------------------
 
@@ -244,7 +344,7 @@ class Neo4jStore:
         async def _work(
             tx: AsyncManagedTransaction,
         ) -> list[TagAssignment]:
-            await _run(
+            summary = await _run(
                 tx,
                 f"MATCH (s:{NodeLabel.SPACE} {{id: $sid}}) "
                 f"CREATE (:{NodeLabel.ITEM} $props)"
@@ -252,6 +352,8 @@ class Neo4jStore:
                 sid=item.space_id,
                 props=item.model_dump(mode="json", exclude_none=True),
             )
+            if summary.counters.nodes_created == 0:
+                raise StorePersistenceError(f"Space {item.space_id} not found")
             await _run(
                 tx,
                 f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}) "
@@ -329,7 +431,7 @@ class Neo4jStore:
             tx: AsyncManagedTransaction,
         ) -> tuple[list[TagAssignment], Edge | None]:
             # Item + IN_SPACE
-            await _run(
+            summary = await _run(
                 tx,
                 f"MATCH (s:{NodeLabel.SPACE} {{id: $sid}}) "
                 f"CREATE (:{NodeLabel.ITEM} $props)"
@@ -337,6 +439,8 @@ class Neo4jStore:
                 sid=item.space_id,
                 props=item.model_dump(mode="json", exclude_none=True),
             )
+            if summary.counters.nodes_created == 0:
+                raise StorePersistenceError(f"Space {item.space_id} not found")
             # Revision + REVISION_OF
             await _run(
                 tx,
@@ -380,12 +484,12 @@ class Neo4jStore:
                     f"-[:{RelType.ATTACHED_TO}]->(r)",
                     rid=artifact.revision_id,
                     props=artifact.model_dump(mode="json", exclude_none=True)
-                | {"metadata": _encode_meta(artifact.metadata)},
+                    | {"metadata": _encode_meta(artifact.metadata)},
                 )
             # Domain edges
             for edge in edges:
                 rel_type = _EDGE_TYPE_TO_REL[edge.edge_type]
-                await _run(
+                edge_summary = await _run(
                     tx,
                     f"MATCH (src:{NodeLabel.REVISION} {{id: $src_id}}), "
                     f"(tgt:{NodeLabel.REVISION} {{id: $tgt_id}}) "
@@ -398,6 +502,12 @@ class Neo4jStore:
                         exclude=_EDGE_PROPS_EXCLUDE,
                     ),
                 )
+                if edge_summary.counters.relationships_created == 0:
+                    raise StorePersistenceError(
+                        f"Source revision {edge.source_revision_id} or "
+                        f"target revision {edge.target_revision_id} "
+                        f"not found"
+                    )
             # Bundle membership
             bundle_edge: Edge | None = None
             if bundle_item_id is not None:
@@ -446,16 +556,25 @@ class Neo4jStore:
 
         Returns:
             The persisted Revision instance.
+
+        Raises:
+            StorePersistenceError: If the referenced item does not exist.
         """
-        async with self._driver.session(database=self._database) as session:
-            await session.execute_write(
-                _run,
+
+        async def _work(tx: AsyncManagedTransaction) -> None:
+            summary = await _run(
+                tx,
                 f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}) "
                 f"CREATE (:{NodeLabel.REVISION} $props)"
                 f"-[:{RelType.REVISION_OF}]->(i)",
                 iid=revision.item_id,
                 props=revision.model_dump(mode="json", exclude_none=True),
             )
+            if summary.counters.nodes_created == 0:
+                raise StorePersistenceError(f"Item {revision.item_id} not found")
+
+        async with self._driver.session(database=self._database) as session:
+            await session.execute_write(_work)
         return revision
 
     # -- Tag operations ---------------------------------------------------
@@ -468,15 +587,20 @@ class Neo4jStore:
 
         Returns:
             The TagAssignment recording this initial assignment.
+
+        Raises:
+            StorePersistenceError: If the referenced item or revision
+                does not exist.
         """
         ta = TagAssignment(
             tag_id=tag.id,
             item_id=tag.item_id,
             revision_id=tag.revision_id,
         )
-        async with self._driver.session(database=self._database) as session:
-            await session.execute_write(
-                _run,
+
+        async def _work(tx: AsyncManagedTransaction) -> None:
+            summary = await _run(
+                tx,
                 f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}), "
                 f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
                 f"CREATE (t:{NodeLabel.TAG} $tp)"
@@ -490,6 +614,13 @@ class Neo4jStore:
                 tp=tag.model_dump(mode="json", exclude_none=True),
                 tap=ta.model_dump(mode="json", exclude_none=True),
             )
+            if summary.counters.nodes_created == 0:
+                raise StorePersistenceError(
+                    f"Item {tag.item_id} or Revision {tag.revision_id} not found"
+                )
+
+        async with self._driver.session(database=self._database) as session:
+            await session.execute_write(_work)
         return ta
 
     async def move_tag(self, tag_id: str, new_revision_id: str) -> TagAssignment:
@@ -576,10 +707,15 @@ class Neo4jStore:
 
         Returns:
             The persisted Artifact instance.
+
+        Raises:
+            StorePersistenceError: If the referenced revision does not
+                exist.
         """
-        async with self._driver.session(database=self._database) as session:
-            await session.execute_write(
-                _run,
+
+        async def _work(tx: AsyncManagedTransaction) -> None:
+            summary = await _run(
+                tx,
                 f"MATCH (r:{NodeLabel.REVISION} {{id: $rid}}) "
                 f"CREATE (:{NodeLabel.ARTIFACT} $props)"
                 f"-[:{RelType.ATTACHED_TO}]->(r)",
@@ -587,6 +723,13 @@ class Neo4jStore:
                 props=artifact.model_dump(mode="json", exclude_none=True)
                 | {"metadata": _encode_meta(artifact.metadata)},
             )
+            if summary.counters.nodes_created == 0:
+                raise StorePersistenceError(
+                    f"Revision {artifact.revision_id} not found"
+                )
+
+        async with self._driver.session(database=self._database) as session:
+            await session.execute_write(_work)
         return artifact
 
     # -- Read operations --------------------------------------------------
@@ -643,6 +786,66 @@ class Neo4jStore:
         data["metadata"] = _decode_meta(data.get("metadata", ""))
         return Artifact.model_validate(data)
 
+    async def get_item_by_name(
+        self,
+        space_id: str,
+        name: str,
+        kind: str,
+        *,
+        include_deprecated: bool = False,
+    ) -> Item | None:
+        """Retrieve an Item by name and kind within a space.
+
+        Args:
+            space_id: ID of the containing space.
+            name: Item name (must match exactly).
+            kind: Item kind string (e.g. ``"fact"``, ``"conversation"``).
+            include_deprecated: If True, match deprecated items too.
+
+        Returns:
+            Item if found, None otherwise.
+        """
+        deprecated_filter = "" if include_deprecated else " AND i.deprecated = false"
+        query = (
+            f"MATCH (i:{NodeLabel.ITEM} {{space_id: $sid, name: $name, "
+            f"kind: $kind}}) WHERE true{deprecated_filter} RETURN i LIMIT 1"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, sid=space_id, name=name, kind=kind)
+            rec = await result.single()
+            if rec is None:
+                return None
+            return Item.model_validate(dict(rec["i"]))
+
+    async def get_artifact_by_name(
+        self,
+        revision_id: str,
+        name: str,
+    ) -> Artifact | None:
+        """Retrieve an Artifact attached to a revision by name.
+
+        Args:
+            revision_id: ID of the owning revision.
+            name: Artifact name (must match exactly).
+
+        Returns:
+            Artifact if found, None otherwise.
+        """
+        query = (
+            f"MATCH (a:{NodeLabel.ARTIFACT} {{name: $name}})"
+            f"-[:{RelType.ATTACHED_TO}]->"
+            f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+            f"RETURN a LIMIT 1"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, name=name, rid=revision_id)
+            rec = await result.single()
+            if rec is None:
+                return None
+            data = dict(rec["a"])
+            data["metadata"] = _decode_meta(data.get("metadata", ""))
+            return Artifact.model_validate(data)
+
     async def get_tag_assignments(self, tag_id: str) -> list[TagAssignment]:
         """Retrieve all TagAssignment history for a tag.
 
@@ -659,7 +862,35 @@ class Neo4jStore:
                 f"RETURN ta ORDER BY ta.assigned_at",
                 tid=tag_id,
             )
-            return [TagAssignment.model_validate(dict(rec["ta"])) async for rec in result]
+            return [
+                TagAssignment.model_validate(dict(rec["ta"])) async for rec in result
+            ]
+
+    async def get_revision_by_number(
+        self,
+        item_id: str,
+        revision_number: int,
+    ) -> Revision | None:
+        """Retrieve a single revision by item and revision number.
+
+        Args:
+            item_id: ID of the owning item.
+            revision_number: The specific revision number to retrieve.
+
+        Returns:
+            Revision if found, None otherwise.
+        """
+        query = (
+            f"MATCH (r:{NodeLabel.REVISION} "
+            f"{{item_id: $iid, revision_number: $rnum}}) "
+            f"RETURN r LIMIT 1"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, iid=item_id, rnum=revision_number)
+            rec = await result.single()
+            if rec is None:
+                return None
+            return Revision.model_validate(dict(rec["r"]))
 
     async def get_revisions_for_item(self, item_id: str) -> list[Revision]:
         """Retrieve all revisions for an item.
@@ -1121,11 +1352,16 @@ class Neo4jStore:
 
         Returns:
             The persisted Edge instance.
+
+        Raises:
+            StorePersistenceError: If either the source or target
+                revision does not exist.
         """
         rel_type = _EDGE_TYPE_TO_REL[edge.edge_type]
-        async with self._driver.session(database=self._database) as session:
-            await session.execute_write(
-                _run,
+
+        async def _work(tx: AsyncManagedTransaction) -> None:
+            summary = await _run(
+                tx,
                 f"MATCH (src:{NodeLabel.REVISION} {{id: $src_id}}), "
                 f"(tgt:{NodeLabel.REVISION} {{id: $tgt_id}}) "
                 f"CREATE (src)-[:{rel_type} $props]->(tgt)",
@@ -1137,6 +1373,15 @@ class Neo4jStore:
                     exclude=_EDGE_PROPS_EXCLUDE,
                 ),
             )
+            if summary.counters.relationships_created == 0:
+                raise StorePersistenceError(
+                    f"Source revision {edge.source_revision_id} or "
+                    f"target revision {edge.target_revision_id} "
+                    f"not found"
+                )
+
+        async with self._driver.session(database=self._database) as session:
+            await session.execute_write(_work)
         return edge
 
     async def get_edge(self, edge_id: str) -> Edge | None:
@@ -1392,7 +1637,9 @@ class Neo4jStore:
         )
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, rid=revision_id)
-            return [Revision.model_validate(dict(rec["impacted"])) async for rec in result]
+            return [
+                Revision.model_validate(dict(rec["impacted"])) async for rec in result
+            ]
 
     # -- Enrichment update ------------------------------------------------
 

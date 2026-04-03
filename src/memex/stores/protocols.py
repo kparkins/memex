@@ -17,6 +17,16 @@ from pydantic import BaseModel
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
 
+
+class StorePersistenceError(Exception):
+    """Raised when a write fails to persist expected graph changes.
+
+    Indicates that a write query executed without error but did not
+    create the expected nodes or relationships, typically because a
+    referenced entity (project, space, item, revision) does not exist.
+    """
+
+
 # -- Protocol segments -------------------------------------------------------
 
 

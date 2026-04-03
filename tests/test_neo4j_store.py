@@ -463,3 +463,201 @@ class TestAttachArtifact:
         assert got.media_type is None
         assert got.size_bytes is None
         assert got.metadata == {}
+
+
+# -- R1: Silent lost writes ------------------------------------------------
+
+
+class TestSilentLostWrites:
+    """R1: Write methods raise StorePersistenceError when referenced
+    entities do not exist instead of silently producing no changes."""
+
+    async def test_create_space_invalid_project(self, store: Neo4jStore) -> None:
+        """Creating a space under a nonexistent project must raise."""
+        from memex.stores.protocols import StorePersistenceError
+
+        space = Space(project_id="nonexistent-project", name="orphan")
+        with pytest.raises(StorePersistenceError):
+            await store.create_space(space)
+
+    async def test_create_item_invalid_space(self, store: Neo4jStore) -> None:
+        """Creating an item in a nonexistent space must raise."""
+        from memex.stores.protocols import StorePersistenceError
+
+        item = Item(space_id="nonexistent-space", name="orphan", kind=ItemKind.FACT)
+        rev = Revision(
+            item_id=item.id,
+            revision_number=1,
+            content="c",
+            search_text="c",
+        )
+        with pytest.raises(StorePersistenceError):
+            await store.create_item_with_revision(item, rev)
+
+    async def test_create_revision_invalid_item(self, store: Neo4jStore) -> None:
+        """Creating a revision on a nonexistent item must raise."""
+        from memex.stores.protocols import StorePersistenceError
+
+        rev = Revision(
+            item_id="nonexistent-item",
+            revision_number=1,
+            content="c",
+            search_text="c",
+        )
+        with pytest.raises(StorePersistenceError):
+            await store.create_revision(rev)
+
+    async def test_create_edge_invalid_revisions(self, store: Neo4jStore) -> None:
+        """Creating an edge between nonexistent revisions must raise."""
+        from memex.domain import Edge, EdgeType
+        from memex.stores.protocols import StorePersistenceError
+
+        edge = Edge(
+            source_revision_id="nonexistent-src",
+            target_revision_id="nonexistent-tgt",
+            edge_type=EdgeType.REFERENCES,
+        )
+        with pytest.raises(StorePersistenceError):
+            await store.create_edge(edge)
+
+    async def test_attach_artifact_invalid_revision(self, store: Neo4jStore) -> None:
+        """Attaching an artifact to a nonexistent revision must raise."""
+        from memex.stores.protocols import StorePersistenceError
+
+        artifact = Artifact(
+            revision_id="nonexistent-rev",
+            name="ghost.txt",
+            location="/dev/null",
+        )
+        with pytest.raises(StorePersistenceError):
+            await store.attach_artifact(artifact)
+
+    async def test_create_tag_invalid_revision(self, store: Neo4jStore) -> None:
+        """Creating a tag pointing to a nonexistent revision must raise."""
+        from memex.stores.protocols import StorePersistenceError
+
+        tag = Tag(
+            item_id="nonexistent-item",
+            name="active",
+            revision_id="nonexistent-rev",
+        )
+        with pytest.raises(StorePersistenceError):
+            await store.create_tag(tag)
+
+
+# -- R2: Tag pointer safety ------------------------------------------------
+
+
+class TestTagPointerSafety:
+    """Known gap tracked by PRD R2: tag pointer operations can leave
+    dangling tags when the target revision does not exist."""
+
+    @pytest.mark.xfail(
+        reason="PRD R2: move_tag to nonexistent revision leaves dangling pointer",
+        strict=True,
+    )
+    async def test_move_tag_nonexistent_revision_raises(
+        self,
+        store: Neo4jStore,
+        project_and_space: tuple[Project, Space],
+    ) -> None:
+        """move_tag must raise and preserve old pointer when target missing."""
+        from memex.stores.protocols import StorePersistenceError
+
+        _, space = project_and_space
+        item = Item(space_id=space.id, name="tag-safe", kind=ItemKind.FACT)
+        rev = Revision(
+            item_id=item.id,
+            revision_number=1,
+            content="original",
+            search_text="original",
+        )
+        tag = Tag(item_id=item.id, name="active", revision_id=rev.id)
+        await store.create_item_with_revision(item, rev, [tag])
+
+        with pytest.raises(StorePersistenceError):
+            await store.move_tag(tag.id, "nonexistent-revision")
+
+        # Old pointer must still be intact
+        resolved = await store.resolve_revision_by_tag(item.id, "active")
+        assert resolved is not None
+        assert resolved.id == rev.id
+
+    @pytest.mark.xfail(
+        reason="PRD R2: rollback_tag to nonexistent revision leaves dangling pointer",
+        strict=True,
+    )
+    async def test_rollback_tag_nonexistent_revision_raises(
+        self,
+        store: Neo4jStore,
+        project_and_space: tuple[Project, Space],
+    ) -> None:
+        """rollback_tag must raise and preserve pointer when target missing."""
+        from memex.stores.protocols import StorePersistenceError
+
+        _, space = project_and_space
+        item = Item(space_id=space.id, name="rb-safe", kind=ItemKind.FACT)
+        rev = Revision(
+            item_id=item.id,
+            revision_number=1,
+            content="v1",
+            search_text="v1",
+        )
+        tag = Tag(item_id=item.id, name="active", revision_id=rev.id)
+        await store.create_item_with_revision(item, rev, [tag])
+
+        rev2 = Revision(
+            item_id=item.id,
+            revision_number=2,
+            content="v2",
+            search_text="v2",
+        )
+        await store.revise_item(item.id, rev2)
+
+        with pytest.raises(StorePersistenceError):
+            await store.rollback_tag(tag.id, "nonexistent-revision")
+
+        # Pointer must still point to rev2 (from the revise)
+        resolved = await store.resolve_revision_by_tag(item.id, "active")
+        assert resolved is not None
+        assert resolved.id != rev.id  # Should be rev2, not rev1
+
+    @pytest.mark.xfail(
+        reason="PRD R2: revise_item preserves old pointer if new revision link fails",
+        strict=True,
+    )
+    async def test_revise_item_preserves_pointer_on_failure(
+        self,
+        store: Neo4jStore,
+        project_and_space: tuple[Project, Space],
+    ) -> None:
+        """revise_item must preserve the active tag if tag move fails."""
+        from memex.stores.protocols import StorePersistenceError
+
+        _, space = project_and_space
+        item = Item(space_id=space.id, name="rev-safe", kind=ItemKind.FACT)
+        rev = Revision(
+            item_id=item.id,
+            revision_number=1,
+            content="v1",
+            search_text="v1",
+        )
+        tag = Tag(item_id=item.id, name="active", revision_id=rev.id)
+        await store.create_item_with_revision(item, rev, [tag])
+
+        # Create a revision with a bad item_id so the tag move target
+        # cannot be validated
+        bad_rev = Revision(
+            item_id="nonexistent-item",
+            revision_number=2,
+            content="v2",
+            search_text="v2",
+        )
+
+        with pytest.raises((StorePersistenceError, Exception)):
+            await store.revise_item(item.id, bad_rev)
+
+        # Original pointer must be preserved
+        resolved = await store.resolve_revision_by_tag(item.id, "active")
+        assert resolved is not None
+        assert resolved.id == rev.id

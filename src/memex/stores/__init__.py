@@ -12,6 +12,7 @@ from memex.stores.protocols import (
     NameLookupStore,
     RevisionStore,
     SpaceResolver,
+    StorePersistenceError,
     TagStore,
     TemporalResolver,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "RelType",
     "RevisionStore",
     "SpaceResolver",
+    "StorePersistenceError",
     "TagStore",
     "TemporalResolver",
     "WorkingMemoryMessage",

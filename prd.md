@@ -927,6 +927,105 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Update examples/sample_usage.py to demonstrate the Memex facade alongside the direct API"
     ],
     "passes": true
+  },
+
+  {
+    "id": "R1",
+    "category": "bugfix",
+    "description": "Fix silent lost writes in Neo4j store",
+    "steps": [
+      "Add StorePersistenceError exception class to stores/protocols.py",
+      "Change _run helper in neo4j_store.py to return neo4j.ResultSummary alongside records",
+      "After each write query in create_space, create_item_with_revision, ingest_memory_unit, create_edge, create_revision, attach_artifact, and create_tag: check summary.counters (nodes_created or relationships_created) and raise StorePersistenceError when expected count is zero",
+      "Fix TOCTOU race in resolve_space: replace find-then-create pattern with MERGE on (name, project_id, parent_space_id)",
+      "Add a space-identity constraint/index strategy that preserves nested-space semantics; do not use (name, project_id) alone because that forbids same-named children under different parents",
+      "Add tests: create_space with invalid project_id, create_item_with_revision with invalid space_id, create_revision with invalid item_id, create_tag with invalid revision_id, create_edge with invalid revision IDs, and attach_artifact with invalid revision_id all raise StorePersistenceError",
+      "Verify all existing tests pass unchanged"
+    ],
+    "passes": true
+  },
+
+  {
+    "id": "R2",
+    "category": "bugfix",
+    "description": "Fix tag pointer dangling risk and extract duplicated tag logic",
+    "steps": [
+      "Extract _move_tag_pointer(tx, tag_id, new_revision_id, item_id, timestamp) helper in neo4j_store.py that verifies new revision exists before deleting old POINTS_TO, raises StorePersistenceError if revision not found",
+      "Replace duplicated tag-move blocks in move_tag (lines 572-609), revise_item (lines 960-993), and rollback_tag (lines 1058-1091) with calls to _move_tag_pointer",
+      "Extract _create_tag_with_assignment(tx, tag, revision_id, item_id) helper",
+      "Replace duplicated tag-creation blocks in create_tag, create_item_with_revision (lines 318-332), and ingest_memory_unit (lines 397-419) with calls to _create_tag_with_assignment",
+      "Add tests: move_tag to nonexistent revision raises StorePersistenceError and leaves old pointer intact, revise_item preserves the old pointer if the new revision link fails, and rollback_tag preserves the old pointer when the target revision validation fails",
+      "Verify all existing tag tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "R3",
+    "category": "bugfix",
+    "description": "Fix security issues: credential leak, privacy gap in revise, password default",
+    "steps": [
+      "In privacy.py: add descriptive name field to each credential pattern, change CredentialViolationError message to report pattern name (e.g. 'AWS access key pattern') instead of matched text",
+      "In IngestService.revise() in ingest.py: apply privacy hooks to both params.content and params.search_text before graph persistence, matching how ingest() does it",
+      "In config.py: remove default value from Neo4jSettings.password so it is a required field, or add a startup warning if the default dev password is in use",
+      "Add test: credential rejection error message contains no credential text",
+      "Add tests: revise() with PII content produces redacted output, revise() with custom search_text sanitizes that field too, and revise() rejects credentials before store.revise_item is called",
+      "Verify all existing privacy and ingest tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "R4",
+    "category": "bugfix",
+    "description": "Fix event publication bugs and harden post-commit failure handling",
+    "steps": [
+      "In MemexToolService.create_edge (tools.py): resolve project_id from source revision's item's space instead of hardcoded empty string",
+      "In MemexToolService.deprecate_item (tools.py): log warning when falling back to empty project_id on space lookup failure",
+      "In MemexToolService.create_edge and MemexToolService.deprecate_item: isolate Redis publication failures so the graph mutation still returns success after commit",
+      "In DreamStatePipeline.run() (dream_pipeline.py): replace the current save-audit-then-commit-cursor ordering with a consistent idempotent strategy so partial failure does not cause duplicate action execution or lost auditability",
+      "In ingest.py: add exc_info=True to logger.warning calls at event publication and recall context failure handlers",
+      "Add tests: create_edge event is published under the owning project stream, create_edge survives event publication failure after the edge is persisted, and deprecate_item survives event publication failure after the item is persisted",
+      "Verify all existing Dream State and ingest tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "R5",
+    "category": "bugfix",
+    "description": "Fix retrieval layer type weights and tighten boundary validation",
+    "steps": [
+      "In hybrid.py _fuse_and_limit: determine match_source from the retrieval branch that produced each candidate instead of hardcoding MatchSource.REVISION; read weight from weights.get(source, 0.9) per candidate",
+      "Keep cleanup tasks such as removing dead constants or centralizing index-name constants separate from this bugfix task unless they are required to land the scoring fix cleanly",
+      "Add enum validation on both MCP-facing and orchestration-facing models for item_kind and edge_type",
+      "Add Pydantic field_validator on ResolveAsOfInput.timestamp and ResolveTagAtTimeInput.timestamp for datetime parsing",
+      "Add Field(ge=1, le=100) bounds on RecallToolInput.memory_limit and context_top_k and mirror the same bounds on core retrieval request models where direct library callers can bypass MCP",
+      "Add Pydantic model_validator on GetEdgesInput requiring at least one filter field",
+      "Replace hardcoded type weights 1.0/0.9/0.8 in tools.py with DEFAULT_TYPE_WEIGHTS import",
+      "Add tests: invalid item_kind rejected at model validation level, empty GetEdgesInput is rejected, recall bounds are enforced, and type weights affect scoring when match sources differ",
+      "Verify all existing retrieval tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "R6",
+    "category": "bugfix",
+    "description": "Fix magic numbers, N+1 queries, parameter bloat, and minor issues",
+    "steps": [
+      "In config.py: add a DreamStateSettings.model field, then in dream_pipeline.py replace the magic string 'gpt-4o-mini' with self._settings.model",
+      "Add get_revisions_batch(revision_ids: list[str]) method to MemoryStore protocol and Neo4jStore using single Cypher WHERE r.id IN $ids; use in dream_collector.py _fetch_revisions with asyncio.gather for bundle memberships",
+      "Add get_items_batch(item_ids: list[str]) method similarly; use in dream_pipeline.py _resolve_item_kinds",
+      "If Dream State still fans out one bundle-membership query per revision after revision batching, add a follow-up batch lookup for bundle context as well",
+      "Define MAX_TRAVERSAL_DEPTH = 20 constant in neo4j_store.py and use in get_dependencies and analyze_impact",
+      "Promote _new_id and _utcnow from models.py to public new_id and utcnow in a new domain/utils.py module; update imports in edges.py and models.py",
+      "Rename local _run function inside update_revision_enrichment to _run_update to avoid shadowing module-level _run",
+      "Create EnrichmentUpdate dataclass and change update_revision_enrichment protocol and implementation to accept it instead of 9 keyword arguments",
+      "Add tests: Dream State collector batch-fetches revisions in one query, Dream State item-kind resolution batch-fetches items, and the configured Dream State model is forwarded into assessment calls by default",
+      "Verify all existing tests pass unchanged"
+    ],
+    "passes": false
   }
 ]
 ```

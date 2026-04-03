@@ -74,6 +74,20 @@ _CONSTRAINTS: tuple[str, ...] = tuple(
     for label in NodeLabel
 )
 
+_NAME_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX project_name IF NOT EXISTS FOR (n:Project) ON (n.name)",
+    "CREATE INDEX space_name_project IF NOT EXISTS "
+    "FOR (n:Space) ON (n.name, n.project_id)",
+    "CREATE INDEX item_space_name_kind IF NOT EXISTS "
+    "FOR (n:Item) ON (n.space_id, n.name, n.kind)",
+    "CREATE INDEX artifact_name_revision IF NOT EXISTS "
+    "FOR (n:Artifact) ON (n.name, n.revision_id)",
+    "CREATE INDEX revision_item_number IF NOT EXISTS "
+    "FOR (n:Revision) ON (n.item_id, n.revision_number)",
+    "CREATE INDEX space_identity IF NOT EXISTS "
+    "FOR (n:Space) ON (n.name, n.project_id, n._parent_key)",
+)
+
 _FULLTEXT_INDEX = (
     "CREATE FULLTEXT INDEX revision_search_text IF NOT EXISTS "
     "FOR (n:Revision) ON EACH [n.search_text]"
@@ -108,7 +122,7 @@ async def ensure_schema(
             vector index (default 1536 per FR-7).
     """
     vector_stmt = _VECTOR_INDEX_TEMPLATE.format(dimensions=embedding_dimensions)
-    statements = (*_CONSTRAINTS, _FULLTEXT_INDEX, vector_stmt)
+    statements = (*_CONSTRAINTS, *_NAME_INDEXES, _FULLTEXT_INDEX, vector_stmt)
     async with driver.session(database=database) as session:
         for stmt in statements:
             result = await session.run(stmt)

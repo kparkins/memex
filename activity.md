@@ -1124,3 +1124,43 @@
 - `uv run mypy src/memex/client.py src/memex/__init__.py` -- Success: no issues found in 2 source files
 - `uv run pytest tests/test_client.py -v` -- 16 passed
 - `uv run pytest tests/ -v` -- 747 passed, 5 pre-existing failures unchanged (temporal timing, enrichment embedding)
+
+## R1: Fix silent lost writes in Neo4j store (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Added `StorePersistenceError` exception class to `src/memex/stores/protocols.py`:
+  - Custom exception for write operations that execute without error but produce no graph changes
+- Updated `src/memex/stores/__init__.py` to export `StorePersistenceError`
+- Extended `src/memex/stores/neo4j_schema.py`:
+  - Added `space_identity` composite index on `(name, project_id, _parent_key)` for MERGE-based space resolution
+- Major changes to `src/memex/stores/neo4j_store.py`:
+  - Imported `ResultSummary` from neo4j driver for write verification
+  - Added `_ROOT_SENTINEL` constant for root space identity in MERGE patterns
+  - Changed `_run` helper return type from `None` to `ResultSummary` (backward-compatible: existing callers ignore the return)
+  - `create_space`: Checks `summary.counters.nodes_created == 0` after Item+IN_PROJECT write, raises `StorePersistenceError` if project not found; also checks CHILD_OF creation for parent space; sets `_parent_key` on Space nodes
+  - `create_item_with_revision`: Checks first write (Item+IN_SPACE) for `nodes_created == 0`, raises if space not found
+  - `ingest_memory_unit`: Checks Item+IN_SPACE write and each domain edge creation for missing references
+  - `create_revision`: Refactored from `session.execute_write(_run, ...)` to `_work` pattern; checks `nodes_created == 0`, raises if item not found
+  - `create_tag`: Refactored to `_work` pattern; checks `nodes_created == 0`, raises if item or revision not found
+  - `create_edge`: Refactored to `_work` pattern; checks `relationships_created == 0`, raises if source or target revision not found
+  - `attach_artifact`: Refactored to `_work` pattern; checks `nodes_created == 0`, raises if revision not found
+  - `resolve_space`: Replaced find-then-create TOCTOU pattern with atomic `MERGE` on `(name, project_id, _parent_key)` within a single write transaction; uses `_ROOT_SENTINEL` for root spaces to handle null parent_space_id in MERGE; raises `StorePersistenceError` if project not found; uses `MERGE` for CHILD_OF edge on nested spaces
+- Updated `tests/test_neo4j_store.py`:
+  - Removed `@pytest.mark.xfail(strict=True)` markers from all 6 `TestSilentLostWrites` tests (they now pass with the fix)
+  - Updated class docstring to reflect fixed status
+- Created `tests/test_persistence_errors.py` with 6 integration tests in `TestStorePersistenceError`:
+  - `test_create_space_invalid_project_id`: Verifies `StorePersistenceError` on nonexistent project
+  - `test_create_item_with_revision_invalid_space_id`: Verifies error on nonexistent space
+  - `test_create_revision_invalid_item_id`: Verifies error on nonexistent item
+  - `test_create_tag_invalid_revision_id`: Creates valid item, verifies error on nonexistent revision
+  - `test_create_edge_invalid_revision_ids`: Verifies error on nonexistent source/target revisions
+  - `test_attach_artifact_invalid_revision_id`: Verifies error on nonexistent revision
+
+**Verification**:
+- `uv run ruff check` on changed files -- All checks passed
+- `uv run ruff format --check` on changed files -- All files already formatted
+- `uv run mypy src/` -- Success: no issues found in 41 source files
+- `uv run pytest tests/test_neo4j_store.py tests/test_persistence_errors.py -v` -- 26 passed, 3 xfailed
+- `uv run pytest tests/ -v` -- 759 passed (6 new persistence error tests + 6 previously-xfailing R1 tests now passing), 5 pre-existing failures unchanged (temporal timing, enrichment embedding)
