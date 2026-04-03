@@ -382,6 +382,93 @@ class TemporalResolver(Protocol):
 
 
 @runtime_checkable
+class NameLookupStore(Protocol):
+    """Name-based entity lookup for kref resolution and convenience paths."""
+
+    async def get_project_by_name(self, name: str) -> Project | None:
+        """Retrieve a project by human-readable name.
+
+        Args:
+            name: ``Project.name`` value to match.
+
+        Returns:
+            Project if found, None otherwise.
+        """
+        ...
+
+    async def find_space(
+        self,
+        project_id: str,
+        space_name: str,
+        parent_space_id: str | None = None,
+    ) -> Space | None:
+        """Find an existing space by name without creating one.
+
+        Args:
+            project_id: Owning project id.
+            space_name: Space name segment.
+            parent_space_id: Parent space for nested spaces, or None for root.
+
+        Returns:
+            Space if found, None otherwise.
+        """
+        ...
+
+    async def get_item_by_name(
+        self,
+        space_id: str,
+        name: str,
+        kind: str,
+        *,
+        include_deprecated: bool = False,
+    ) -> Item | None:
+        """Find an item in a space by name and kind.
+
+        Args:
+            space_id: Leaf space id.
+            name: Item name (``Item.name``).
+            kind: Item kind string (``ItemKind`` value, e.g. ``fact``).
+            include_deprecated: If True, match deprecated items too.
+
+        Returns:
+            Item if found, None otherwise.
+        """
+        ...
+
+    async def get_artifact_by_name(
+        self,
+        revision_id: str,
+        name: str,
+    ) -> Artifact | None:
+        """Find an artifact on a revision by name.
+
+        Args:
+            revision_id: Owning revision id.
+            name: Artifact name (``Artifact.name``).
+
+        Returns:
+            Artifact if found, None otherwise.
+        """
+        ...
+
+    async def get_revision_by_number(
+        self,
+        item_id: str,
+        revision_number: int,
+    ) -> Revision | None:
+        """Find a single revision by item and revision number.
+
+        Args:
+            item_id: Item id.
+            revision_number: The specific revision number to retrieve.
+
+        Returns:
+            Revision if found, None otherwise.
+        """
+        ...
+
+
+@runtime_checkable
 class AuditStore(Protocol):
     """Dream State audit report persistence."""
 
@@ -435,14 +522,15 @@ class MemoryStore(
     EdgeStore,
     TemporalResolver,
     AuditStore,
+    NameLookupStore,
     Protocol,
 ):
     """Full graph-backed memory persistence protocol.
 
     Composes all focused protocol segments via multiple inheritance.
     Covers CRUD, query, temporal-resolution, enrichment-update,
-    and audit-report operations consumed by orchestration services
-    and MCP tool handlers.
+    name-lookup, and audit-report operations consumed by orchestration
+    services and MCP tool handlers.
     """
 
     # -- Provenance and impact analysis -----------------------------------
@@ -503,119 +591,17 @@ class MemoryStore(
 
 
 @runtime_checkable
-class KrefResolvableStore(Protocol):
+class KrefResolvableStore(
+    NameLookupStore,
+    RevisionStore,
+    TemporalResolver,
+    Protocol,
+):
     """Persistence surface required to resolve ``kref://`` URIs to graph nodes.
 
-    Implementations (e.g. ``Neo4jStore``) expose name-based lookup and tag
-    resolution so :func:`memex.domain.kref_resolution.resolve_kref` does not
-    depend on a concrete driver.
+    Composes ``NameLookupStore`` (name-based entity lookups),
+    ``RevisionStore`` (revision CRUD), and ``TemporalResolver``
+    (tag/time resolution) so that
+    :func:`memex.domain.kref_resolution.resolve_kref` does not depend
+    on a concrete driver.
     """
-
-    async def get_project_by_name(self, name: str) -> Project | None:
-        """Retrieve a project by human-readable name.
-
-        Args:
-            name: ``Project.name`` value to match.
-
-        Returns:
-            Project if found, None otherwise.
-        """
-        ...
-
-    async def find_space(
-        self,
-        project_id: str,
-        space_name: str,
-        parent_space_id: str | None = None,
-    ) -> Space | None:
-        """Find an existing space by name without creating one.
-
-        Args:
-            project_id: Owning project id.
-            space_name: Space name segment.
-            parent_space_id: Parent space for nested spaces, or None for root.
-
-        Returns:
-            Space if found, None otherwise.
-        """
-        ...
-
-    async def get_item_by_name(
-        self,
-        space_id: str,
-        name: str,
-        kind: str,
-        *,
-        include_deprecated: bool = False,
-    ) -> Item | None:
-        """Find an item in a space by name and kind.
-
-        Args:
-            space_id: Leaf space id.
-            name: Item name (``Item.name``).
-            kind: Item kind string (``ItemKind`` value, e.g. ``fact``).
-            include_deprecated: If True, match deprecated items too.
-
-        Returns:
-            Item if found, None otherwise.
-        """
-        ...
-
-    async def get_revision_by_number(
-        self,
-        item_id: str,
-        revision_number: int,
-    ) -> Revision | None:
-        """Find a single revision by item and revision number.
-
-        Args:
-            item_id: Item id.
-            revision_number: The specific revision number to retrieve.
-
-        Returns:
-            Revision if found, None otherwise.
-        """
-        ...
-
-    async def get_revisions_for_item(self, item_id: str) -> list[Revision]:
-        """List all revisions for an item.
-
-        Args:
-            item_id: Item id.
-
-        Returns:
-            Revisions ordered by ``revision_number`` ascending.
-        """
-        ...
-
-    async def resolve_revision_by_tag(
-        self,
-        item_id: str,
-        tag_name: str,
-    ) -> Revision | None:
-        """Resolve the revision a named tag currently points to.
-
-        Args:
-            item_id: Item owning the tag.
-            tag_name: Tag name (e.g. ``\"active\"``).
-
-        Returns:
-            Revision if the tag exists, None otherwise.
-        """
-        ...
-
-    async def get_artifact_by_name(
-        self,
-        revision_id: str,
-        name: str,
-    ) -> Artifact | None:
-        """Find an artifact on a revision by name.
-
-        Args:
-            revision_id: Owning revision id.
-            name: Artifact name (``Artifact.name``).
-
-        Returns:
-            Artifact if found, None otherwise.
-        """
-        ...

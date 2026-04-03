@@ -960,3 +960,25 @@
 - `uv run ruff format --check src/memex/stores/protocols.py src/memex/stores/__init__.py` -- 2 files already formatted
 - `uv run mypy src/memex/stores/protocols.py src/memex/stores/__init__.py` -- Success: no issues found in 2 source files
 - `uv run pytest tests/ -v` -- 708 passed, 8 pre-existing failures unchanged (temporal timing, enrichment embedding, tool count tests)
+
+## T32: Unify MemoryStore and KrefResolvableStore via shared protocol segments (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Added `NameLookupStore` `@runtime_checkable` Protocol segment in `src/memex/stores/protocols.py` with 5 name-based lookup methods:
+  - `get_project_by_name`, `find_space`, `get_item_by_name`, `get_artifact_by_name`, `get_revision_by_number`
+- Redefined `KrefResolvableStore` as a composed Protocol inheriting `NameLookupStore`, `RevisionStore`, and `TemporalResolver`
+  - Removed all 7 duplicated method signatures from the old standalone definition
+  - All methods now inherited from the three parent segments
+- Added `NameLookupStore` to `MemoryStore` parent list (9th segment) so the full union includes all 9 focused protocol segments
+- Updated `src/memex/stores/__init__.py` to import and export `NameLookupStore`
+- `AsyncMock(spec=KrefResolvableStore)` in `test_kref_resolution.py` continues to work with the composed protocol
+- Neo4jStore satisfies all segments (including `NameLookupStore`) via structural typing without implementation changes
+- All existing imports (`MemoryStore`, `KrefResolvableStore`) continue to work unchanged
+
+**Verification**:
+- `uv run ruff check src/memex/stores/protocols.py src/memex/stores/__init__.py` -- All checks passed
+- `uv run ruff format --check src/memex/stores/protocols.py src/memex/stores/__init__.py` -- 2 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 39 source files
+- `uv run pytest tests/ -v` -- 708 passed, 8 pre-existing failures unchanged

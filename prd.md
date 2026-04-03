@@ -849,7 +849,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Verify AsyncMock(spec=KrefResolvableStore) in test_kref_resolution.py still works with the composed protocol",
       "Verify all existing tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
