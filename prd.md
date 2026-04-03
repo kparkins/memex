@@ -676,7 +676,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Index all persisted enrichment outputs for retrieval",
       "Add tests: each FR-8 metadata field is generated and persisted, enrichment completes async without blocking write, failure leaves revision intact, enrichment results indexed"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

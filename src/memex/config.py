@@ -63,6 +63,15 @@ class RetrievalSettings(BaseSettings):
     weight_artifact: float = 0.8
 
 
+class EnrichmentSettings(BaseSettings):
+    """Async revision enrichment settings."""
+
+    model_config = SettingsConfigDict(env_prefix="MEMEX_ENRICHMENT_")
+
+    model: str = "gpt-4o-mini"
+    enabled: bool = True
+
+
 class DreamStateSettings(BaseSettings):
     """Dream State consolidation settings."""
 
@@ -94,5 +103,6 @@ class MemexSettings(BaseSettings):
     artifact_storage: ArtifactStorageSettings = ArtifactStorageSettings()
     embedding: EmbeddingSettings = EmbeddingSettings()
     retrieval: RetrievalSettings = RetrievalSettings()
+    enrichment: EnrichmentSettings = EnrichmentSettings()
     dream_state: DreamStateSettings = DreamStateSettings()
     privacy: PrivacySettings = PrivacySettings()

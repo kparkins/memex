@@ -1495,6 +1495,85 @@ class Neo4jStore:
             result = await session.run(query, rid=revision_id)
             return [_to_revision(dict(rec["impacted"])) async for rec in result]
 
+    # -- Enrichment update ------------------------------------------------
+
+    async def update_revision_enrichment(
+        self,
+        revision_id: str,
+        *,
+        summary: str | None = None,
+        topics: list[str] | None = None,
+        keywords: list[str] | None = None,
+        facts: list[str] | None = None,
+        events: list[str] | None = None,
+        implications: list[str] | None = None,
+        embedding_text_override: str | None = None,
+        embedding: list[float] | None = None,
+        search_text: str | None = None,
+    ) -> Revision | None:
+        """Update enrichment fields on an existing Revision node.
+
+        Only sets fields that are provided (not None). The revision
+        node is matched by ID and updated in a single write
+        transaction.
+
+        Args:
+            revision_id: ID of the revision to update.
+            summary: Enrichment summary text.
+            topics: Extracted topic labels.
+            keywords: Extracted keywords.
+            facts: Extracted factual statements.
+            events: Structured event descriptions.
+            implications: Prospective indexing scenarios.
+            embedding_text_override: Override text for embeddings.
+            embedding: Updated embedding vector.
+            search_text: Updated search text incorporating enrichments.
+
+        Returns:
+            Updated Revision, or None if no revision with the ID exists.
+        """
+        updates: dict[str, object] = {}
+        if summary is not None:
+            updates["summary"] = summary
+        if topics is not None:
+            updates["topics"] = topics
+        if keywords is not None:
+            updates["keywords"] = keywords
+        if facts is not None:
+            updates["facts"] = facts
+        if events is not None:
+            updates["events"] = events
+        if implications is not None:
+            updates["implications"] = implications
+        if embedding_text_override is not None:
+            updates["embedding_text_override"] = embedding_text_override
+        if embedding is not None:
+            updates["embedding"] = embedding
+        if search_text is not None:
+            updates["search_text"] = search_text
+
+        if not updates:
+            return await self.get_revision(revision_id)
+
+        set_clauses = ", ".join(f"r.{k} = ${k}" for k in updates)
+        cypher = (
+            f"MATCH (r:{NodeLabel.REVISION} {{id: $revision_id}}) "
+            f"SET {set_clauses} "
+            f"RETURN r"
+        )
+        params: dict[str, Any] = {"revision_id": revision_id, **updates}
+
+        async with self._driver.session(database=self._database) as session:
+
+            async def _run(tx: AsyncManagedTransaction) -> Revision | None:
+                result = await tx.run(cypher, **params)
+                record = await result.single()
+                if record is None:
+                    return None
+                return _to_revision(dict(record["r"]))
+
+            return await session.execute_write(_run)
+
     # -- Internal ---------------------------------------------------------
 
     async def _get_node(

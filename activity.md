@@ -464,3 +464,40 @@
 - `uv run ruff format --check src/ tests/` -- 39 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 20 source files
 - `uv run pytest tests/ -v` -- 391 passed (16 new ingest tests + 375 existing)
+
+## T19: Implement async revision enrichment pipeline (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Added `EnrichmentSettings` to `src/memex/config.py` with `model` (default `gpt-4o-mini`) and `enabled` toggle, wired into `MemexSettings`
+- Created `src/memex/llm/enrichment.py` with LLM-based enrichment extraction:
+  - `EnrichmentOutput` (frozen=True): Structured model for all FR-8 metadata (summary, topics, keywords, facts, events, implications, embedding_text_override)
+  - `extract_enrichments`: Single LLM call via litellm to extract all metadata as JSON, with markdown fence stripping and orjson parsing
+  - `_strip_markdown_fence`: Removes code fences from LLM output
+- Extended `src/memex/stores/neo4j_store.py` with `update_revision_enrichment` method on `Neo4jStore`:
+  - Targeted SET of enrichment fields (summary, topics, keywords, facts, events, implications, embedding_text_override, embedding, search_text) on existing Revision nodes
+  - Only sets fields that are provided (not None), single write transaction
+- Created `src/memex/orchestration/enrichment.py` with async enrichment pipeline:
+  - `EnrichmentResult` (frozen=True): Pipeline result model with success/failure tracking
+  - `_build_enriched_search_text`: Combines original search_text with all enrichment fields for fulltext indexing
+  - `_sanitize_enrichment`: Applies PII redaction and credential rejection to all enrichment text fields
+  - `enrich_revision`: Full pipeline -- fetch revision, extract via LLM, sanitize, build enriched search text, generate embedding (using override text if available), persist to Neo4j; failures return graceful result without corrupting revision
+  - `schedule_enrichment`: Fire-and-forget asyncio.create_task wrapper for non-blocking execution after primary write
+- Updated `src/memex/llm/__init__.py` to re-export `EnrichmentOutput`, `extract_enrichments`
+- Updated `src/memex/orchestration/__init__.py` to re-export `EnrichmentResult`, `enrich_revision`, `schedule_enrichment`
+- Created `tests/test_enrichment.py` with 26 tests across 8 test classes:
+  - `TestStripMarkdownFence`: 3 tests (no fence, json fence, bare fence)
+  - `TestExtractEnrichments`: 6 unit tests (all fields, null override, markdown fence, custom model, LLM failure, invalid JSON)
+  - `TestBuildEnrichedSearchText`: 2 unit tests (all fields combined, empty enrichment)
+  - `TestSanitizeEnrichment`: 3 unit tests (PII in summary, PII in facts, clean passthrough)
+  - `TestEnrichRevision`: 5 integration tests (all FR-8 fields persisted, search_text updated, enrichment indexed for BM25 retrieval, embedding uses override, embedding uses search_text without override)
+  - `TestEnrichmentFailureResilience`: 4 integration tests (LLM failure leaves revision intact, embedding failure leaves revision intact, nonexistent revision, revision still fulltext-searchable after failure)
+  - `TestAsyncNonBlocking`: 2 integration tests (schedule returns task immediately, enrichment does not block caller)
+  - `TestEnrichmentPIIRedaction`: 1 integration test (PII in enrichment output redacted before persistence)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 42 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 22 source files
+- `uv run pytest tests/ -v` -- 417 passed (26 new enrichment tests + 391 existing)
