@@ -14,9 +14,11 @@ from types import SimpleNamespace
 
 import orjson
 import pytest
+from pydantic import ValidationError
 
 from memex.domain import Edge, EdgeType, Item, ItemKind, Revision, Space, Tag
 from memex.mcp.tools import (
+    CreateEdgeInput,
     DependenciesInput,
     GetEdgesInput,
     GetRevisionsInput,
@@ -203,6 +205,59 @@ class TestGetEdges:
         edge_data = result["edges"][0]
         assert "timestamp" in edge_data
         assert edge_data["context"] == "test context"
+
+
+class TestGetEdgesInputValidation:
+    """Known validation gaps for edge query inputs."""
+
+    def test_requires_at_least_one_filter(self) -> None:
+        """Edge queries should require at least one narrowing filter."""
+        with pytest.raises(ValidationError):
+            GetEdgesInput()
+
+
+class TestInputEnumValidation:
+    """Known validation gaps for enum-typed MCP inputs (PRD R5)."""
+
+    def test_invalid_item_kind_rejected(self) -> None:
+        """Invalid item_kind should fail Pydantic validation."""
+        from memex.mcp.tools import IngestToolInput
+
+        with pytest.raises(ValidationError):
+            IngestToolInput(
+                project_id="p",
+                space_name="s",
+                item_name="i",
+                item_kind="not_a_real_kind",
+                content="c",
+            )
+
+    def test_invalid_edge_type_rejected(self) -> None:
+        """Invalid edge_type should fail Pydantic validation."""
+        with pytest.raises(ValidationError):
+            CreateEdgeInput(
+                source_revision_id="a",
+                target_revision_id="b",
+                edge_type="not_a_real_edge",
+            )
+
+
+class TestRecallBoundsValidation:
+    """Known validation gaps for recall parameter bounds (PRD R5)."""
+
+    def test_memory_limit_upper_bound(self) -> None:
+        """memory_limit above 100 should fail validation."""
+        from memex.mcp.tools import RecallToolInput
+
+        with pytest.raises(ValidationError):
+            RecallToolInput(query="test", memory_limit=999999)
+
+    def test_context_top_k_upper_bound(self) -> None:
+        """context_top_k above 100 should fail validation."""
+        from memex.mcp.tools import RecallToolInput
+
+        with pytest.raises(ValidationError):
+            RecallToolInput(query="test", context_top_k=999999)
 
 
 # -- Graph navigation: list_items -----------------------------------------
@@ -818,7 +873,7 @@ class TestGraphToolSerialization:
 
     async def test_edges_output_is_json(self, env):
         """Edge query result serializes to valid JSON."""
-        inp = GetEdgesInput()
+        inp = GetEdgesInput(source_revision_id="missing-id")
         result = await env.service.get_edges(inp)
 
         serialized = orjson.dumps(result)

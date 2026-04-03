@@ -1006,7 +1006,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Add tests: invalid item_kind rejected at model validation level, empty GetEdgesInput is rejected, recall bounds are enforced, and type weights affect scoring when match sources differ",
       "Verify all existing retrieval tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

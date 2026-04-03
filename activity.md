@@ -1260,3 +1260,43 @@
 - `uv run mypy src/` -- Success: no issues found in 41 source files
 - `uv run pytest tests/test_mcp_mutation_tools.py tests/test_dream_safety.py tests/test_dream_state_events.py tests/test_ingest.py tests/test_revise.py -v` -- 175 passed, 2 xfailed (R6 future)
 - `uv run pytest tests/ -v` -- 789 passed (3 previously-xfailing R4 tests now passing), 8 xfailed (R5/R6 future), 5 pre-existing failures unchanged (temporal timing, enrichment embedding)
+
+## R5: Fix retrieval layer type weights and tighten boundary validation (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Fixed `HybridSearch._fuse_and_limit` in `src/memex/retrieval/hybrid.py`:
+  - Each candidate now carries a `match_source` field (set during `_execute_and_collect`)
+  - Weight lookup uses per-candidate `match_source` instead of hardcoded `MatchSource.REVISION`
+  - `w = weights.get(source, 0.9)` reads weight per candidate, not once for the whole batch
+- Added `field_validator` for enum validation on MCP input models in `src/memex/mcp/tools.py`:
+  - `IngestToolInput.item_kind`: validates against `ItemKind` enum
+  - `CreateEdgeInput.edge_type`: validates against `EdgeType` enum
+- Added `field_validator` for datetime parsing on temporal input models:
+  - `ResolveAsOfInput.timestamp`: validates via `datetime.fromisoformat`
+  - `ResolveTagAtTimeInput.timestamp`: validates via `datetime.fromisoformat`
+- Added `Field(ge=1, le=100)` bounds on recall parameters:
+  - `RecallToolInput.memory_limit` and `RecallToolInput.context_top_k`
+  - `SearchRequest.limit` and `SearchRequest.memory_limit` in `src/memex/retrieval/models.py` (mirrors MCP bounds for direct library callers)
+- Added `model_validator` on `GetEdgesInput` requiring at least one filter field
+- Replaced hardcoded type weights `{ITEM: 1.0, REVISION: 0.9, ARTIFACT: 0.8}` in `MemexToolService.recall` with `dict(DEFAULT_TYPE_WEIGHTS)` import
+- Removed `MatchSource` from tools.py imports (no longer directly referenced after replacing hardcoded weights)
+- Removed 6 `@pytest.mark.xfail(strict=True)` markers from previously-failing R5 tests:
+  - `tests/test_mcp_graph_tools.py`: 5 tests (empty GetEdgesInput, invalid item_kind, invalid edge_type, memory_limit bound, context_top_k bound)
+  - `tests/test_hybrid_search.py`: 1 test (`test_different_source_weights_change_scores` rewritten to verify per-candidate weight lookup)
+- Added `CreateEdgeInput` to imports in `tests/test_mcp_graph_tools.py`
+- Created `tests/test_r5_validation.py` with 24 tests across 7 test classes:
+  - `TestItemKindValidation`: 2 tests (valid kinds accepted, invalid rejected)
+  - `TestEdgeTypeValidation`: 2 tests (valid types accepted, invalid rejected)
+  - `TestTimestampValidation`: 4 tests (valid/invalid for both ResolveAsOfInput and ResolveTagAtTimeInput)
+  - `TestRecallBounds`: 9 tests (too high/low for memory_limit and context_top_k, defaults, boundary values, SearchRequest bounds)
+  - `TestGetEdgesInputFilter`: 5 tests (empty rejected, single/edge_type/confidence/multiple filters accepted)
+  - `TestDefaultTypeWeights`: 2 tests (constant values, SearchRequest defaults)
+
+**Verification**:
+- `uv run ruff check` on changed files -- All checks passed
+- `uv run ruff format --check` on changed files -- All files already formatted
+- `uv run mypy src/` -- Success: no issues found in 41 source files
+- `uv run pytest tests/test_r5_validation.py -v` -- 24 passed
+- `uv run pytest tests/ -v` -- 819 passed (24 new R5 tests + 6 previously-xfailing R5 tests now passing), 2 xfailed (R6 future), 5 pre-existing failures unchanged (temporal timing, enrichment embedding)

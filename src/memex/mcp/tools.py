@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, get_type_hints
 
 import orjson
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_core import PydanticUndefined
 
 from memex.domain import Edge, EdgeType, Item, ItemKind, Revision, TagAssignment
@@ -39,7 +39,11 @@ from memex.orchestration.ingest import (
     IngestService,
     ReviseParams,
 )
-from memex.retrieval.models import MatchSource, SearchRequest, SearchResult
+from memex.retrieval.models import (
+    DEFAULT_TYPE_WEIGHTS,
+    SearchRequest,
+    SearchResult,
+)
 from memex.retrieval.strategy import SearchStrategy
 from memex.stores.protocols import KrefResolvableStore, MemoryStore
 from memex.stores.redis_store import (
@@ -99,6 +103,13 @@ class IngestToolInput(BaseModel):
     session_id: str | None = None
     message_role: str = "user"
 
+    @field_validator("item_kind")
+    @classmethod
+    def _validate_item_kind(cls, v: str) -> str:
+        """Reject item_kind values not in the ItemKind enum."""
+        ItemKind(v)
+        return v
+
 
 class RecallToolInput(BaseModel):
     """Input schema for the ``memex_recall`` / ``memory_recall`` tool.
@@ -117,8 +128,8 @@ class RecallToolInput(BaseModel):
     query: str
     project_id: str | None = None
     query_embedding: list[float] | None = None
-    memory_limit: int = 3
-    context_top_k: int = 7
+    memory_limit: int = Field(default=3, ge=1, le=100)
+    context_top_k: int = Field(default=7, ge=1, le=100)
     include_deprecated: bool = False
     multi_query: bool = False
     reranking_mode: str = RERANKING_MODE_AUTO
@@ -167,6 +178,22 @@ class GetEdgesInput(BaseModel):
     edge_type: str | None = None
     min_confidence: float | None = None
     max_confidence: float | None = None
+
+    @model_validator(mode="after")
+    def _require_at_least_one_filter(self) -> GetEdgesInput:
+        """Reject queries with no filter fields set."""
+        if all(
+            v is None
+            for v in (
+                self.source_revision_id,
+                self.target_revision_id,
+                self.edge_type,
+                self.min_confidence,
+                self.max_confidence,
+            )
+        ):
+            raise ValueError("At least one filter field is required")
+        return self
 
 
 class ListItemsInput(BaseModel):
@@ -256,6 +283,13 @@ class ResolveAsOfInput(BaseModel):
     item_id: str
     timestamp: str
 
+    @field_validator("timestamp")
+    @classmethod
+    def _validate_timestamp(cls, v: str) -> str:
+        """Validate that timestamp is a parseable ISO 8601 string."""
+        datetime.fromisoformat(v)
+        return v
+
 
 class ResolveTagAtTimeInput(BaseModel):
     """Input for ``memex_resolve_tag_at_time`` / ``temporal_resolve_tag_at_time``.
@@ -267,6 +301,13 @@ class ResolveTagAtTimeInput(BaseModel):
 
     tag_id: str
     timestamp: str
+
+    @field_validator("timestamp")
+    @classmethod
+    def _validate_timestamp(cls, v: str) -> str:
+        """Validate that timestamp is a parseable ISO 8601 string."""
+        datetime.fromisoformat(v)
+        return v
 
 
 # -- Graph mutation input models -------------------------------------------
@@ -350,6 +391,13 @@ class CreateEdgeInput(BaseModel):
     confidence: float | None = None
     reason: str | None = None
     context: str | None = None
+
+    @field_validator("edge_type")
+    @classmethod
+    def _validate_edge_type(cls, v: str) -> str:
+        """Reject edge_type values not in the EdgeType enum."""
+        EdgeType(v)
+        return v
 
 
 # -- Dream State invocation input model ------------------------------------
@@ -680,11 +728,7 @@ class MemexToolService:
             limit=inp.context_top_k,
             memory_limit=inp.memory_limit,
             include_deprecated=inp.include_deprecated,
-            type_weights={
-                MatchSource.ITEM: 1.0,
-                MatchSource.REVISION: 0.9,
-                MatchSource.ARTIFACT: 0.8,
-            },
+            type_weights=dict(DEFAULT_TYPE_WEIGHTS),
         )
 
         results: Sequence[SearchResult]

@@ -61,8 +61,8 @@ class SearchRequest(BaseModel, frozen=True):
 
     query: str = ""
     query_embedding: list[float] | None = None
-    limit: int = 10
-    memory_limit: int = 3
+    limit: int = Field(default=10, ge=1, le=100)
+    memory_limit: int = Field(default=3, ge=1, le=100)
     include_deprecated: bool = False
     beta: float = 0.85
     type_weights: dict[MatchSource, float] = Field(

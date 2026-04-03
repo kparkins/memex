@@ -153,14 +153,10 @@ class HybridSearch:
         weights = request.type_weights or self._type_weights
 
         search_query = (
-            build_search_query(request.query)
-            if request.query.strip()
-            else ""
+            build_search_query(request.query) if request.query.strip() else ""
         )
         has_lexical = bool(search_query)
-        has_vector = bool(
-            request.query_embedding and len(request.query_embedding) > 0
-        )
+        has_vector = bool(request.query_embedding and len(request.query_embedding) > 0)
 
         if not has_lexical and not has_vector:
             return []
@@ -172,26 +168,31 @@ class HybridSearch:
         else:
             search_mode = SearchMode.VECTOR
 
-        dep_filter = (
-            "" if request.include_deprecated else "WHERE i.deprecated = false "
-        )
+        dep_filter = "" if request.include_deprecated else "WHERE i.deprecated = false "
         vec_top_k = (
-            request.limit * 2
-            if not request.include_deprecated
-            else request.limit
+            request.limit * 2 if not request.include_deprecated else request.limit
         )
 
         cypher, params = self._resolve_query(
-            search_mode, dep_filter, search_query,
-            request.query_embedding, vec_top_k, request.limit,
+            search_mode,
+            dep_filter,
+            search_query,
+            request.query_embedding,
+            vec_top_k,
+            request.limit,
         )
 
         candidates = await self._execute_and_collect(
-            cypher, params, request.beta,
+            cypher,
+            params,
+            request.beta,
         )
 
         return self._fuse_and_limit(
-            candidates, weights, search_mode, request.memory_limit,
+            candidates,
+            weights,
+            search_mode,
+            request.memory_limit,
         )
 
     def _resolve_query(
@@ -218,9 +219,7 @@ class HybridSearch:
         """
         if mode == SearchMode.HYBRID:
             cypher = (
-                _lexical_branch(dep_filter)
-                + " UNION ALL "
-                + _vector_branch(dep_filter)
+                _lexical_branch(dep_filter) + " UNION ALL " + _vector_branch(dep_filter)
             )
             return cypher, {
                 "q": search_query,
@@ -271,6 +270,7 @@ class HybridSearch:
                         "revision": Revision.model_validate(dict(rec["r"])),
                         "item_id": str(rec["item_id"]),
                         "item_kind": ItemKind(str(rec["item_kind"])),
+                        "match_source": MatchSource.REVISION,
                         "lexical_score": 0.0,
                         "vector_score": 0.0,
                     }
@@ -278,11 +278,13 @@ class HybridSearch:
                 entry = candidates[rev_id]
                 if source == "lexical":
                     entry["lexical_score"] = max(
-                        entry["lexical_score"], raw_score,
+                        entry["lexical_score"],
+                        raw_score,
                     )
                 else:
                     entry["vector_score"] = max(
-                        entry["vector_score"], beta * raw_score,
+                        entry["vector_score"],
+                        beta * raw_score,
                     )
 
         return candidates
@@ -305,12 +307,14 @@ class HybridSearch:
         Returns:
             Sorted, limited HybridResult list.
         """
-        w = weights.get(MatchSource.REVISION, 0.9)
-
         results: list[HybridResult] = []
         for entry in candidates.values():
+            source: MatchSource = entry["match_source"]
+            w = weights.get(source, 0.9)
             fused = compute_fused_score(
-                entry["lexical_score"], entry["vector_score"], w,
+                entry["lexical_score"],
+                entry["vector_score"],
+                w,
             )
             results.append(
                 HybridResult(
@@ -320,7 +324,7 @@ class HybridSearch:
                     score=fused,
                     lexical_score=entry["lexical_score"],
                     vector_score=entry["vector_score"],
-                    match_source=MatchSource.REVISION,
+                    match_source=source,
                     search_mode=search_mode,
                 )
             )

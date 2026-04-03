@@ -325,6 +325,34 @@ class TestTypeWeights:
         for r in results:
             assert r.match_source == MatchSource.REVISION
 
+    async def test_different_source_weights_change_scores(
+        self, hybrid_env: dict[str, Any]
+    ) -> None:
+        """Per-candidate weight lookup uses the candidate's match_source.
+
+        Dropping the REVISION weight from 0.9 to 0.1 should produce
+        lower fused scores for all REVISION-sourced results.
+        """
+        searcher: HybridSearch = hybrid_env["searcher"]
+
+        default_results = await searcher.search(
+            SearchRequest(query="machine learning"),
+        )
+        custom_weights = {
+            MatchSource.REVISION: 0.1,
+            MatchSource.ITEM: 1.0,
+            MatchSource.ARTIFACT: 1.0,
+        }
+        custom_results = await searcher.search(
+            SearchRequest(query="machine learning", type_weights=custom_weights),
+        )
+
+        assert len(default_results) >= 1
+        assert len(custom_results) >= 1
+
+        for default_r, custom_r in zip(default_results, custom_results):
+            assert custom_r.score < default_r.score
+
 
 # -- Integration tests: memory limit --------------------------------------
 
