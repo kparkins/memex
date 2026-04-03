@@ -302,3 +302,28 @@
 - `uv run ruff format --check src/ tests/` -- 27 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 14 source files
 - `uv run pytest tests/ -v` -- 245 passed (18 new consolidation feed tests + 227 existing)
+
+## T13: Implement BM25 fulltext search over revisions (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/retrieval/bm25.py` with BM25 fulltext search module:
+  - `sanitize_query`: Escapes all Lucene special characters (`+-&|!(){}[]^"~*?:\\/`) via `str.maketrans` for safe index execution
+  - `build_search_query`: Sanitizes input, lowercases Lucene reserved keywords (`AND`, `OR`, `NOT`) to prevent operator interpretation, appends `~1` fuzzy suffix to terms > 2 characters
+  - `BM25Result` (frozen=True): Result model with revision, score, item_id, item_kind
+  - `bm25_search`: Async function querying the `revision_search_text` fulltext index with deprecated-item filtering in Cypher, parameterized limit, and optional `include_deprecated` flag
+- Updated `src/memex/retrieval/__init__.py` to re-export `BM25Result`, `bm25_search`, `build_search_query`, `sanitize_query`
+- Created `tests/test_bm25_search.py` with 39 tests across 7 test classes:
+  - `TestSanitizeQuery`: 20 unit tests (each Lucene special char escaped, combined specials, whitespace stripping, empty input)
+  - `TestBuildSearchQuery`: 7 unit tests (fuzzy on long terms, no fuzzy on short terms, mixed lengths, boundary 3-char, special chars + fuzzy, empty/whitespace)
+  - `TestBM25Search`: 6 integration tests (matching revision found, score ordering, limit, result model structure, no match, empty query)
+  - `TestDeprecatedExclusion`: 2 integration tests (excluded by default, included with flag)
+  - `TestQuerySanitizationIntegration`: 2 integration tests (special chars safe, Lucene injection safe)
+  - `TestFuzzyMatching`: 2 integration tests (close match within edit distance 1, fuzzy applied only to > 2-char terms)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 29 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 15 source files
+- `uv run pytest tests/ -v` -- 284 passed (39 new BM25 search tests + 245 existing)

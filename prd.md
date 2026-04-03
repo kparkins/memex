@@ -592,7 +592,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Filter deprecated items in Cypher before returning results",
       "Add tests: basic search, query sanitization, fuzzy matching, deprecated-item exclusion"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
