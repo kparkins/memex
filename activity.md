@@ -1087,3 +1087,40 @@
 - `uv run mypy src/memex/orchestration/lookup.py` -- Success: no issues found in 1 source file
 - `uv run pytest tests/test_lookup.py -v` -- 5 passed
 - `uv run pytest tests/ -v` -- 731 passed, 5 pre-existing failures unchanged (temporal timing, enrichment embedding)
+
+## T37: Add high-level Memex facade as primary library entry point (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/client.py` with `Memex` facade class:
+  - Constructor accepts `(store, search, working_memory, event_feed)` via DI for testability
+  - `Memex.from_settings(settings)`: class method constructing Neo4jStore, HybridSearch, RedisWorkingMemory, ConsolidationEventFeed from config
+  - `Memex.from_env()`: class method reading `MemexSettings` from environment variables
+  - `ingest(params)` -> IngestResult: delegates to IngestService
+  - `recall(query, limit, memory_limit, query_embedding)` -> Sequence[SearchResult]: delegates to SearchStrategy
+  - `revise(params)` -> ReviseResult: delegates to IngestService.revise
+  - `get_item(item_id)` -> Item | None: delegates to store
+  - `get_item_by_path(project_id, space_name, item_name, item_kind)` -> Item | None: delegates to orchestration/lookup
+  - `store` property for direct store access on advanced operations
+  - `close()`: releases owned driver/redis connections (safe to call multiple times)
+  - Async context manager support (`async with Memex.from_env() as m:`)
+- Updated `src/memex/__init__.py` to export `Memex` and `MemexSettings`
+- Updated `examples/sample_usage.py` to demonstrate both the Memex facade and the direct API
+- Created `tests/test_client.py` with 16 unit tests across 9 test classes:
+  - `TestMemexIngest`: 2 tests (delegation, recall context)
+  - `TestMemexRecall`: 3 tests (returns results, parameter forwarding, empty results)
+  - `TestMemexRevise`: 1 test (delegation via service)
+  - `TestMemexGetItem`: 2 tests (found, not found)
+  - `TestMemexGetItemByPath`: 2 tests (found, space missing)
+  - `TestMemexStoreProperty`: 1 test (property exposes injected store)
+  - `TestMemexClose`: 3 tests (no-op without owned connections, releases owned, idempotent)
+  - `TestMemexContextManager`: 1 test (async with closes on exit)
+  - `TestMemexFromSettings`: 1 test (constructs with mocked driver/redis)
+
+**Verification**:
+- `uv run ruff check` on changed files -- All checks passed
+- `uv run ruff format --check` on changed files -- All files already formatted
+- `uv run mypy src/memex/client.py src/memex/__init__.py` -- Success: no issues found in 2 source files
+- `uv run pytest tests/test_client.py -v` -- 16 passed
+- `uv run pytest tests/ -v` -- 747 passed, 5 pre-existing failures unchanged (temporal timing, enrichment embedding)

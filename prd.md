@@ -926,7 +926,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Add unit tests with DI (mock store + mock search) verifying each facade method delegates correctly",
       "Update examples/sample_usage.py to demonstrate the Memex facade alongside the direct API"
     ],
-    "passes": false
+    "passes": true
   }
 ]
 ```
