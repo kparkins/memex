@@ -934,3 +934,29 @@
 - `uv run ruff format --check src/ tests/` -- 65 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 35 source files
 - `uv run pytest tests/ -v` -- 697 passed (36 new benchmark tests + 661 existing)
+
+## T31: Split MemoryStore protocol into composable protocol segments (ISP) (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Refactored `src/memex/stores/protocols.py` to define 8 focused `@runtime_checkable` Protocol classes:
+  - **SpaceResolver**: `resolve_space`, `get_space`
+  - **Ingestor**: `ingest_memory_unit`
+  - **ItemStore**: `get_item`, `get_items_for_space`, `deprecate_item`, `undeprecate_item`
+  - **RevisionStore**: `get_revision`, `get_revisions_for_item`, `revise_item`, `update_revision_enrichment`
+  - **TagStore**: `move_tag`, `rollback_tag`
+  - **EdgeStore**: `create_edge`, `get_edges`, `get_bundle_memberships`
+  - **TemporalResolver**: `get_supersession_map`, `resolve_revision_by_tag`, `resolve_revision_as_of`, `resolve_tag_at_time`
+  - **AuditStore**: `save_audit_report`, `get_audit_report`, `list_audit_reports`
+- Redefined `MemoryStore` as a composed Protocol inheriting from all 8 segments plus provenance/impact methods
+- `KrefResolvableStore` preserved unchanged for kref resolution
+- Updated `src/memex/stores/__init__.py` to export all 8 new protocol segment names
+- Neo4jStore satisfies all segments via structural typing without any implementation changes
+- All existing imports (`MemoryStore` in orchestration, `KrefResolvableStore` in kref_resolution) continue to work
+
+**Verification**:
+- `uv run ruff check src/memex/stores/protocols.py src/memex/stores/__init__.py` -- All checks passed
+- `uv run ruff format --check src/memex/stores/protocols.py src/memex/stores/__init__.py` -- 2 files already formatted
+- `uv run mypy src/memex/stores/protocols.py src/memex/stores/__init__.py` -- Success: no issues found in 2 source files
+- `uv run pytest tests/ -v` -- 708 passed, 8 pre-existing failures unchanged (temporal timing, enrichment embedding, tool count tests)

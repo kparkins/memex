@@ -1,9 +1,10 @@
-"""Store protocol for dependency inversion.
+"""Store protocols for dependency inversion (ISP-compliant).
 
-Defines ``MemoryStore``, a Protocol capturing the persistence operations
-consumed by the orchestration and MCP layers.  Concrete implementations
-(e.g. ``Neo4jStore``) satisfy this protocol via structural typing,
-enabling constructor injection without coupling to a specific backend.
+Defines focused ``@runtime_checkable`` Protocol segments for each
+persistence concern, then composes ``MemoryStore`` as their union.
+Concrete implementations (e.g. ``Neo4jStore``) satisfy these protocols
+via structural typing, enabling constructor injection without coupling
+to a specific backend.
 """
 
 from __future__ import annotations
@@ -14,19 +15,14 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
-from memex.domain.models import Artifact, Item, Revision, Space, Tag
+from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
+
+# -- Protocol segments -------------------------------------------------------
 
 
 @runtime_checkable
-class MemoryStore(Protocol):
-    """Protocol for graph-backed memory persistence.
-
-    Covers all CRUD, query, temporal-resolution, enrichment-update,
-    and audit-report operations consumed by orchestration services
-    and MCP tool handlers.
-    """
-
-    # -- Space resolution -------------------------------------------------
+class SpaceResolver(Protocol):
+    """Resolve or create spaces within a project."""
 
     async def resolve_space(
         self,
@@ -57,7 +53,10 @@ class MemoryStore(Protocol):
         """
         ...
 
-    # -- Atomic ingest ----------------------------------------------------
+
+@runtime_checkable
+class Ingestor(Protocol):
+    """Atomic memory-unit ingest."""
 
     async def ingest_memory_unit(
         self,
@@ -84,7 +83,10 @@ class MemoryStore(Protocol):
         """
         ...
 
-    # -- Item CRUD --------------------------------------------------------
+
+@runtime_checkable
+class ItemStore(Protocol):
+    """Item CRUD and deprecation."""
 
     async def get_item(self, item_id: str) -> Item | None:
         """Retrieve an Item by ID.
@@ -142,7 +144,10 @@ class MemoryStore(Protocol):
         """
         ...
 
-    # -- Revision CRUD ----------------------------------------------------
+
+@runtime_checkable
+class RevisionStore(Protocol):
+    """Revision CRUD, revision creation via revise, and enrichment updates."""
 
     async def get_revision(self, revision_id: str) -> Revision | None:
         """Retrieve a Revision by ID.
@@ -220,11 +225,12 @@ class MemoryStore(Protocol):
         """
         ...
 
-    # -- Tag operations ---------------------------------------------------
 
-    async def move_tag(
-        self, tag_id: str, new_revision_id: str
-    ) -> TagAssignment:
+@runtime_checkable
+class TagStore(Protocol):
+    """Tag pointer movement and rollback."""
+
+    async def move_tag(self, tag_id: str, new_revision_id: str) -> TagAssignment:
         """Move an existing tag to a different revision.
 
         Args:
@@ -258,7 +264,10 @@ class MemoryStore(Protocol):
         """
         ...
 
-    # -- Edge operations --------------------------------------------------
+
+@runtime_checkable
+class EdgeStore(Protocol):
+    """Typed edge creation and query."""
 
     async def create_edge(self, edge: Edge) -> Edge:
         """Create a typed edge between two revisions.
@@ -305,62 +314,10 @@ class MemoryStore(Protocol):
         """
         ...
 
-    # -- Provenance and impact analysis -----------------------------------
 
-    async def get_provenance_summary(
-        self, revision_id: str
-    ) -> list[Edge]:
-        """Collect all domain edges connected to a revision.
-
-        Args:
-            revision_id: ID of the focal revision.
-
-        Returns:
-            All domain edges where the revision is source or target.
-        """
-        ...
-
-    async def get_dependencies(
-        self,
-        revision_id: str,
-        *,
-        depth: int = 10,
-    ) -> list[Revision]:
-        """Traverse outgoing dependency edges transitively.
-
-        Args:
-            revision_id: Starting revision ID.
-            depth: Maximum traversal depth.
-
-        Returns:
-            Reachable dependency revisions.
-
-        Raises:
-            ValueError: If depth is outside valid range.
-        """
-        ...
-
-    async def analyze_impact(
-        self,
-        revision_id: str,
-        *,
-        depth: int = 10,
-    ) -> list[Revision]:
-        """Find all revisions transitively impacted by a change.
-
-        Args:
-            revision_id: ID of the changed revision.
-            depth: Maximum traversal depth.
-
-        Returns:
-            All transitively dependent revisions.
-
-        Raises:
-            ValueError: If depth is outside valid range.
-        """
-        ...
-
-    # -- Temporal resolution ----------------------------------------------
+@runtime_checkable
+class TemporalResolver(Protocol):
+    """Temporal and point-in-time resolution queries."""
 
     async def get_supersession_map(
         self, item_id: str
@@ -423,7 +380,10 @@ class MemoryStore(Protocol):
         """
         ...
 
-    # -- Audit reports ----------------------------------------------------
+
+@runtime_checkable
+class AuditStore(Protocol):
+    """Dream State audit report persistence."""
 
     async def save_audit_report(self, report: BaseModel) -> None:
         """Persist a Dream State audit report.
@@ -433,9 +393,7 @@ class MemoryStore(Protocol):
         """
         ...
 
-    async def get_audit_report(
-        self, report_id: str
-    ) -> dict[str, object] | None:
+    async def get_audit_report(self, report_id: str) -> dict[str, object] | None:
         """Retrieve a Dream State audit report by ID.
 
         Args:
@@ -460,5 +418,204 @@ class MemoryStore(Protocol):
 
         Returns:
             List of report dicts, newest first.
+        """
+        ...
+
+
+# -- Composed full-store protocol -------------------------------------------
+
+
+@runtime_checkable
+class MemoryStore(
+    SpaceResolver,
+    Ingestor,
+    ItemStore,
+    RevisionStore,
+    TagStore,
+    EdgeStore,
+    TemporalResolver,
+    AuditStore,
+    Protocol,
+):
+    """Full graph-backed memory persistence protocol.
+
+    Composes all focused protocol segments via multiple inheritance.
+    Covers CRUD, query, temporal-resolution, enrichment-update,
+    and audit-report operations consumed by orchestration services
+    and MCP tool handlers.
+    """
+
+    # -- Provenance and impact analysis -----------------------------------
+
+    async def get_provenance_summary(self, revision_id: str) -> list[Edge]:
+        """Collect all domain edges connected to a revision.
+
+        Args:
+            revision_id: ID of the focal revision.
+
+        Returns:
+            All domain edges where the revision is source or target.
+        """
+        ...
+
+    async def get_dependencies(
+        self,
+        revision_id: str,
+        *,
+        depth: int = 10,
+    ) -> list[Revision]:
+        """Traverse outgoing dependency edges transitively.
+
+        Args:
+            revision_id: Starting revision ID.
+            depth: Maximum traversal depth.
+
+        Returns:
+            Reachable dependency revisions.
+
+        Raises:
+            ValueError: If depth is outside valid range.
+        """
+        ...
+
+    async def analyze_impact(
+        self,
+        revision_id: str,
+        *,
+        depth: int = 10,
+    ) -> list[Revision]:
+        """Find all revisions transitively impacted by a change.
+
+        Args:
+            revision_id: ID of the changed revision.
+            depth: Maximum traversal depth.
+
+        Returns:
+            All transitively dependent revisions.
+
+        Raises:
+            ValueError: If depth is outside valid range.
+        """
+        ...
+
+
+# -- Kref resolution protocol -----------------------------------------------
+
+
+@runtime_checkable
+class KrefResolvableStore(Protocol):
+    """Persistence surface required to resolve ``kref://`` URIs to graph nodes.
+
+    Implementations (e.g. ``Neo4jStore``) expose name-based lookup and tag
+    resolution so :func:`memex.domain.kref_resolution.resolve_kref` does not
+    depend on a concrete driver.
+    """
+
+    async def get_project_by_name(self, name: str) -> Project | None:
+        """Retrieve a project by human-readable name.
+
+        Args:
+            name: ``Project.name`` value to match.
+
+        Returns:
+            Project if found, None otherwise.
+        """
+        ...
+
+    async def find_space(
+        self,
+        project_id: str,
+        space_name: str,
+        parent_space_id: str | None = None,
+    ) -> Space | None:
+        """Find an existing space by name without creating one.
+
+        Args:
+            project_id: Owning project id.
+            space_name: Space name segment.
+            parent_space_id: Parent space for nested spaces, or None for root.
+
+        Returns:
+            Space if found, None otherwise.
+        """
+        ...
+
+    async def get_item_by_name(
+        self,
+        space_id: str,
+        name: str,
+        kind: str,
+        *,
+        include_deprecated: bool = False,
+    ) -> Item | None:
+        """Find an item in a space by name and kind.
+
+        Args:
+            space_id: Leaf space id.
+            name: Item name (``Item.name``).
+            kind: Item kind string (``ItemKind`` value, e.g. ``fact``).
+            include_deprecated: If True, match deprecated items too.
+
+        Returns:
+            Item if found, None otherwise.
+        """
+        ...
+
+    async def get_revision_by_number(
+        self,
+        item_id: str,
+        revision_number: int,
+    ) -> Revision | None:
+        """Find a single revision by item and revision number.
+
+        Args:
+            item_id: Item id.
+            revision_number: The specific revision number to retrieve.
+
+        Returns:
+            Revision if found, None otherwise.
+        """
+        ...
+
+    async def get_revisions_for_item(self, item_id: str) -> list[Revision]:
+        """List all revisions for an item.
+
+        Args:
+            item_id: Item id.
+
+        Returns:
+            Revisions ordered by ``revision_number`` ascending.
+        """
+        ...
+
+    async def resolve_revision_by_tag(
+        self,
+        item_id: str,
+        tag_name: str,
+    ) -> Revision | None:
+        """Resolve the revision a named tag currently points to.
+
+        Args:
+            item_id: Item owning the tag.
+            tag_name: Tag name (e.g. ``\"active\"``).
+
+        Returns:
+            Revision if the tag exists, None otherwise.
+        """
+        ...
+
+    async def get_artifact_by_name(
+        self,
+        revision_id: str,
+        name: str,
+    ) -> Artifact | None:
+        """Find an artifact on a revision by name.
+
+        Args:
+            revision_id: Owning revision id.
+            name: Artifact name (``Artifact.name``).
+
+        Returns:
+            Artifact if found, None otherwise.
         """
         ...

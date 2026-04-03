@@ -820,6 +820,113 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Document intentional differences between this reference build and the paper's production system"
     ],
     "passes": true
+  },
+
+  {
+    "id": "T31",
+    "category": "refactor",
+    "description": "Split MemoryStore protocol into composable protocol segments (ISP)",
+    "steps": [
+      "Define 8 focused @runtime_checkable Protocol classes in stores/protocols.py: SpaceResolver (resolve_space, get_space), Ingestor (ingest_memory_unit), ItemStore (get_item, get_items_for_space, deprecate_item, undeprecate_item), RevisionStore (get_revision, get_revisions_for_item, revise_item, update_revision_enrichment), TagStore (move_tag, rollback_tag), EdgeStore (create_edge, get_edges, get_bundle_memberships), TemporalResolver (get_supersession_map, resolve_revision_by_tag, resolve_revision_as_of, resolve_tag_at_time), AuditStore (save_audit_report, get_audit_report, list_audit_reports)",
+      "Redefine MemoryStore as a Protocol inheriting from all 8 segments",
+      "Add all new protocol segment names to stores/__init__.py exports",
+      "Verify Neo4jStore satisfies all segments via structural typing without implementation changes",
+      "Verify all existing tests pass unchanged"
+    ],
+    "passes": true
+  },
+
+  {
+    "id": "T32",
+    "category": "refactor",
+    "description": "Unify MemoryStore and KrefResolvableStore via shared protocol segments",
+    "steps": [
+      "Add a NameLookupStore protocol segment with get_project_by_name, find_space, get_item_by_name, get_artifact_by_name, get_revision_by_number",
+      "Redefine KrefResolvableStore as a composed protocol inheriting NameLookupStore, RevisionStore, and TemporalResolver",
+      "Add NameLookupStore to MemoryStore parent list so the full union includes all 9 segments",
+      "Remove the old standalone KrefResolvableStore definition and its duplicated method signatures",
+      "Update stores/__init__.py to export NameLookupStore",
+      "Verify AsyncMock(spec=KrefResolvableStore) in test_kref_resolution.py still works with the composed protocol",
+      "Verify all existing tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "T33",
+    "category": "refactor",
+    "description": "Eliminate MCP tool alias duplication via declarative registration",
+    "steps": [
+      "Add a module-level _TOOL_ALIASES dict mapping each of the 24 primary tool names (memex_*) to their paper-taxonomy alias names",
+      "Keep only the 24 primary @mcp.tool decorated functions in create_mcp_server with full docstrings",
+      "Delete all 24 alias function definitions that duplicate the primary bodies",
+      "Register aliases by looping over _TOOL_ALIASES and calling mcp.add_tool(fn, name=alias) for each",
+      "Verify tool count remains at 48 (24 primaries + 24 aliases) in all test assertions",
+      "Verify all existing MCP tool tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "T34",
+    "category": "refactor",
+    "description": "Replace hand-written MCP tool closures with declarative tool registry",
+    "steps": [
+      "Create a _make_tool_handler factory that accepts a MemexToolService method name and an *Input model class, returns an async handler that constructs the input model from kwargs and calls the service method",
+      "Set __signature__ on the generated handler from the input model fields so FastMCP generates correct JSON schema",
+      "Define a _TOOL_DEFS list mapping (tool_name, input_model_class, service_method_name, description) for all 24 tools",
+      "Replace all 24 hand-written primary closures in create_mcp_server with a loop over _TOOL_DEFS that calls _make_tool_handler and registers both primary and alias via _TOOL_ALIASES",
+      "If FastMCP does not respect dynamic __signature__, fall back to keeping the 24 primary closures from T33 and skip this task",
+      "Verify tool count remains at 48 and all tool parameter schemas are correct",
+      "Verify all existing MCP tool tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "T35",
+    "category": "feature",
+    "description": "Add revise orchestration function to IngestService",
+    "steps": [
+      "Define ReviseParams (item_id, content, search_text, tag_name) and ReviseResult (revision, tag_assignment, item_id) models in orchestration/ingest.py",
+      "Add IngestService.revise(params: ReviseParams) -> ReviseResult that queries existing revisions, computes next revision number, builds a Revision, calls store.revise_item, and publishes events",
+      "Add memory_revise convenience wrapper matching the memory_ingest pattern (accepts raw driver + redis_client)",
+      "Update MemexToolService.revise_item to delegate to IngestService.revise instead of reimplementing the logic",
+      "Export ReviseParams, ReviseResult, and memory_revise from orchestration/__init__.py",
+      "Add unit tests for IngestService.revise directly",
+      "Verify existing revise MCP tool tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "T36",
+    "category": "feature",
+    "description": "Add convenience item lookup by project/space/name path",
+    "steps": [
+      "Create orchestration/lookup.py with a get_item_by_path function accepting (store: NameLookupStore, project_id, space_name, item_name, item_kind) that resolves the space internally and returns Item | None",
+      "Export get_item_by_path from orchestration/__init__.py",
+      "Add unit tests with a mock NameLookupStore verifying space resolution + item lookup delegation",
+      "Verify existing tests pass unchanged"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "T37",
+    "category": "feature",
+    "description": "Add high-level Memex facade as primary library entry point",
+    "steps": [
+      "Create src/memex/client.py with a Memex class that accepts (store, search, working_memory, event_feed) via DI",
+      "Add Memex.from_settings(settings: MemexSettings) class method that constructs Neo4jStore, HybridSearch, RedisWorkingMemory, and ConsolidationEventFeed from config",
+      "Add Memex.from_env() class method that reads MemexSettings from environment variables",
+      "Expose ingest(params) -> IngestResult, recall(query, limit, ...) -> Sequence[SearchResult], revise(params) -> ReviseResult, get_item(item_id) -> Item | None, get_item_by_path(project_id, space_name, item_name, item_kind) -> Item | None, and close() methods",
+      "Expose a store property for direct store access on advanced operations",
+      "Export Memex and MemexSettings from src/memex/__init__.py",
+      "Add unit tests with DI (mock store + mock search) verifying each facade method delegates correctly",
+      "Update examples/sample_usage.py to demonstrate the Memex facade alongside the direct API"
+    ],
+    "passes": false
   }
 ]
 ```

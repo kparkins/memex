@@ -2,7 +2,18 @@
 
 from memex.stores.neo4j_schema import NodeLabel, RelType, ensure_schema
 from memex.stores.neo4j_store import Neo4jStore
-from memex.stores.protocols import MemoryStore
+from memex.stores.protocols import (
+    AuditStore,
+    EdgeStore,
+    Ingestor,
+    ItemStore,
+    KrefResolvableStore,
+    MemoryStore,
+    RevisionStore,
+    SpaceResolver,
+    TagStore,
+    TemporalResolver,
+)
 from memex.stores.redis_store import (
     ConsolidationEvent,
     ConsolidationEventFeed,
@@ -14,15 +25,24 @@ from memex.stores.redis_store import (
 )
 
 __all__ = [
+    "AuditStore",
     "ConsolidationEvent",
     "ConsolidationEventFeed",
     "ConsolidationEventType",
+    "EdgeStore",
+    "Ingestor",
+    "ItemStore",
+    "KrefResolvableStore",
     "MemoryStore",
     "MessageRole",
     "Neo4jStore",
     "NodeLabel",
     "RedisWorkingMemory",
     "RelType",
+    "RevisionStore",
+    "SpaceResolver",
+    "TagStore",
+    "TemporalResolver",
     "WorkingMemoryMessage",
     "build_session_id",
     "ensure_schema",
