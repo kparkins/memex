@@ -1028,3 +1028,38 @@
 - Tool count test (test_tool_count) passes: 48 tools registered
 - include_deprecated schema test (test_get_revisions_accepts_include_deprecated) passes
 - All 120 MCP-specific tests pass across 4 test files
+
+## T35: Add revise orchestration function to IngestService (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Defined `ReviseParams` and `ReviseResult` Pydantic models in `src/memex/orchestration/ingest.py`
+  - `ReviseParams`: `item_id`, `content`, `search_text` (optional), `tag_name` (default `"active"`)
+  - `ReviseResult`: `revision`, `tag_assignment`, `item_id`
+- Added `IngestService.revise(params: ReviseParams) -> ReviseResult` method:
+  - Queries existing revisions to compute next revision number
+  - Builds an immutable `Revision` domain object
+  - Delegates to `store.revise_item` for graph mutation
+  - Publishes `revision.created` event via event feed (fail-safe)
+- Added `IngestService._resolve_project_id(item_id)` private helper for item -> space -> project lookup
+- Added `memory_revise` convenience wrapper matching the `memory_ingest` pattern (accepts raw driver + redis_client)
+- Updated `MemexToolService.revise_item` in `src/memex/mcp/tools.py` to delegate to `IngestService.revise` instead of reimplementing logic inline
+  - Removed unused imports: `uuid`, `UTC`, `publish_revision_created`
+  - Added import for `ReviseParams`
+- Updated `src/memex/orchestration/__init__.py` to export `ReviseParams`, `ReviseResult`, and `memory_revise`
+- Created `tests/test_revise.py` with 15 unit tests across 6 test classes:
+  - `TestReviseBasic`: 5 tests (revision numbering, search_text defaulting, custom tag)
+  - `TestReviseEventPublication`: 3 tests (event published, failure isolation, no-feed skip)
+  - `TestResolveProjectId`: 3 tests (success, missing item, missing space)
+  - `TestMemoryReviseWrapper`: 1 test (delegation via patched constructors)
+  - `TestReviseParamsModel`: 2 tests (defaults, custom fields)
+  - `TestReviseResultModel`: 1 test (construction)
+
+**Verification**:
+- `uv run ruff check` on changed files -- All checks passed
+- `uv run ruff format --check` on changed files -- All files already formatted
+- `uv run mypy src/` -- Success: no issues found in 39 source files
+- `uv run pytest tests/test_revise.py -v` -- 15 passed
+- `uv run pytest tests/test_mcp_mutation_tools.py::TestReviseItem -v` -- 4 passed (existing revise MCP tests unchanged)
+- `uv run pytest tests/ -v` -- 726 passed, 5 pre-existing failures unchanged (temporal timing, enrichment embedding)

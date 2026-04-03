@@ -42,7 +42,10 @@ from memex.orchestration.ingest import (
     IngestParams,
     IngestResult,
     IngestService,
+    ReviseParams,
+    ReviseResult,
     memory_ingest,
+    memory_revise,
 )
 from memex.orchestration.privacy import (
     CredentialViolationError,
@@ -71,6 +74,8 @@ __all__ = [
     "IngestParams",
     "IngestResult",
     "IngestService",
+    "ReviseParams",
+    "ReviseResult",
     "ScheduledTrigger",
     "ThresholdTrigger",
     "TriggerMode",
@@ -79,6 +84,7 @@ __all__ = [
     "compute_deprecation_ratio",
     "enrich_revision",
     "memory_ingest",
+    "memory_revise",
     "publish_after_ingest",
     "publish_edge_created",
     "publish_revision_created",

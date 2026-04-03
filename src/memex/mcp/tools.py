@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import inspect
 import logging
-import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, get_type_hints
 
 import orjson
@@ -31,7 +30,6 @@ from memex.domain.kref_resolution import (
 from memex.orchestration.dream_pipeline import DreamAuditReport, DreamStatePipeline
 from memex.orchestration.events import (
     publish_edge_created,
-    publish_revision_created,
     publish_revision_deprecated,
 )
 from memex.orchestration.ingest import (
@@ -39,6 +37,7 @@ from memex.orchestration.ingest import (
     EdgeSpec,
     IngestParams,
     IngestService,
+    ReviseParams,
 )
 from memex.retrieval.models import MatchSource, SearchRequest, SearchResult
 from memex.retrieval.strategy import SearchStrategy
@@ -1032,41 +1031,26 @@ class MemexToolService:
     async def revise_item(self, inp: ReviseItemInput) -> dict[str, Any]:
         """Create a new revision, add SUPERSEDES edge, and advance tag.
 
+        Delegates to ``IngestService.revise`` for orchestration logic.
+
         Args:
             inp: Revise input with item_id, content, and tag_name.
 
         Returns:
             Dictionary with new revision and tag assignment.
         """
-        revisions = await self._store.get_revisions_for_item(inp.item_id)
-        next_number = max((r.revision_number for r in revisions), default=0) + 1
-
-        revision = Revision(
-            id=str(uuid.uuid4()),
-            item_id=inp.item_id,
-            revision_number=next_number,
-            content=inp.content,
-            search_text=inp.search_text or inp.content,
-            created_at=datetime.now(UTC),
+        result = await self._ingest_service.revise(
+            ReviseParams(
+                item_id=inp.item_id,
+                content=inp.content,
+                search_text=inp.search_text,
+                tag_name=inp.tag_name,
+            )
         )
-
-        persisted, assignment = await self._store.revise_item(
-            inp.item_id, revision, tag_name=inp.tag_name
-        )
-
-        if self._event_feed is not None:
-            item = await self._store.get_item(inp.item_id)
-            project_id = ""
-            if item is not None:
-                space = await self._store.get_space(item.space_id)
-                if space is not None:
-                    project_id = space.project_id
-            await publish_revision_created(self._event_feed, project_id, persisted)
-
         return {
-            "revision": _serialize_revision(persisted),
-            "tag_assignment": _serialize_tag_assignment(assignment),
-            "item_id": inp.item_id,
+            "revision": _serialize_revision(result.revision),
+            "tag_assignment": _serialize_tag_assignment(result.tag_assignment),
+            "item_id": result.item_id,
         }
 
     async def rollback_tag(self, inp: RollbackTagInput) -> dict[str, Any]:

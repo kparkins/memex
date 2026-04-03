@@ -30,7 +30,10 @@ from memex.domain import (
     Tag,
     TagAssignment,
 )
-from memex.orchestration.events import publish_after_ingest
+from memex.orchestration.events import (
+    publish_after_ingest,
+    publish_revision_created,
+)
 from memex.orchestration.privacy import apply_privacy_hooks
 from memex.retrieval.models import MatchSource, SearchRequest, SearchResult
 from memex.retrieval.strategy import SearchStrategy
@@ -138,6 +141,36 @@ class IngestResult(BaseModel):
     artifacts: list[Artifact]
     edges: list[Edge]
     recall_context: Sequence[SearchResult]
+
+
+class ReviseParams(BaseModel):
+    """Input parameters for the revise orchestration operation.
+
+    Args:
+        item_id: ID of the item to create a new revision for.
+        content: Content of the new revision.
+        search_text: Override fulltext search text (defaults to content).
+        tag_name: Tag to advance to the new revision.
+    """
+
+    item_id: str
+    content: str
+    search_text: str | None = None
+    tag_name: str = "active"
+
+
+class ReviseResult(BaseModel):
+    """Result of the revise orchestration operation.
+
+    Args:
+        revision: The newly created revision.
+        tag_assignment: Tag assignment record for the advanced tag.
+        item_id: ID of the revised item.
+    """
+
+    revision: Revision
+    tag_assignment: TagAssignment
+    item_id: str
 
 
 class IngestService:
@@ -317,6 +350,66 @@ class IngestService:
             recall_context=recall_context,
         )
 
+    async def revise(self, params: ReviseParams) -> ReviseResult:
+        """Create a new revision, add SUPERSEDES edge, and advance tag.
+
+        Queries existing revisions to compute the next revision number,
+        builds an immutable ``Revision``, delegates to the store's
+        ``revise_item``, and publishes a ``revision.created`` event.
+
+        Args:
+            params: Revise parameters with item_id, content, and tag_name.
+
+        Returns:
+            ReviseResult with the new revision, tag assignment, and item_id.
+        """
+        revisions = await self._store.get_revisions_for_item(params.item_id)
+        next_number = max((r.revision_number for r in revisions), default=0) + 1
+
+        revision = Revision(
+            item_id=params.item_id,
+            revision_number=next_number,
+            content=params.content,
+            search_text=params.search_text or params.content,
+        )
+
+        persisted, assignment = await self._store.revise_item(
+            params.item_id, revision, tag_name=params.tag_name
+        )
+
+        if self._event_feed is not None:
+            try:
+                project_id = await self._resolve_project_id(params.item_id)
+                await publish_revision_created(self._event_feed, project_id, persisted)
+            except Exception:
+                logger.warning(
+                    "Dream State event publication failed after revise; "
+                    "revision succeeded but event was not published",
+                )
+
+        return ReviseResult(
+            revision=persisted,
+            tag_assignment=assignment,
+            item_id=params.item_id,
+        )
+
+    async def _resolve_project_id(self, item_id: str) -> str:
+        """Look up the project_id for an item via its parent space.
+
+        Args:
+            item_id: Item whose project to resolve.
+
+        Returns:
+            The project_id, or empty string if lookup fails.
+        """
+        item = await self._store.get_item(item_id)
+        if item is None:
+            return ""
+        space = await self._store.get_space(item.space_id)
+        if space is None:
+            return ""
+        return space.project_id
+
 
 async def memory_ingest(
     neo4j_driver: AsyncDriver,
@@ -364,3 +457,43 @@ async def memory_ingest(
         event_feed=event_feed,
     )
     return await service.ingest(params, privacy=privacy, retrieval=retrieval)
+
+
+async def memory_revise(
+    neo4j_driver: AsyncDriver,
+    redis_client: Redis | None,
+    params: ReviseParams,
+    *,
+    event_feed: ConsolidationEventFeed | None = None,
+    database: str = "neo4j",
+) -> ReviseResult:
+    """Convenience wrapper for ``IngestService.revise``.
+
+    Constructs the service with injected dependencies from the raw
+    driver and client objects, then delegates to ``IngestService.revise``.
+
+    Args:
+        neo4j_driver: Neo4j async driver instance.
+        redis_client: Redis async client, or ``None`` to skip
+            working-memory buffering.
+        params: Revise parameters.
+        event_feed: Consolidation event feed for Dream State
+            publication. ``None`` skips event publication.
+        database: Neo4j database name.
+
+    Returns:
+        ReviseResult with the new revision, tag assignment, and item_id.
+    """
+    from memex.retrieval.hybrid import HybridSearch
+    from memex.stores.neo4j_store import Neo4jStore
+
+    store = Neo4jStore(neo4j_driver, database=database)
+    search = HybridSearch(neo4j_driver, database=database)
+    wm = RedisWorkingMemory(redis_client) if redis_client is not None else None
+    service = IngestService(
+        store,
+        search,
+        working_memory=wm,
+        event_feed=event_feed,
+    )
+    return await service.revise(params)

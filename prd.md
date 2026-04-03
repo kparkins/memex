@@ -896,7 +896,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Add unit tests for IngestService.revise directly",
       "Verify existing revise MCP tool tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
