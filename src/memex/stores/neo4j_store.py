@@ -2,6 +2,7 @@
 
 Provides async create and read operations for all core domain types:
 Project, Space, Item, Revision, Tag, Artifact, and TagAssignment.
+Supports typed edge creation with metadata and filtered edge queries.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from typing import Any
 import orjson
 from neo4j import AsyncDriver, AsyncManagedTransaction
 
-from memex.domain.edges import TagAssignment
+from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
 from memex.stores.neo4j_schema import NodeLabel, RelType
 
@@ -43,6 +44,15 @@ def _decode_meta(
     if isinstance(raw, str) and raw:
         return orjson.loads(raw)  # type: ignore[no-any-return]
     return {}
+
+
+# -- Edge-type mapping -----------------------------------------------------
+
+_EDGE_TYPE_TO_REL: dict[EdgeType, RelType] = {
+    et: RelType(et.value.upper()) for et in EdgeType
+}
+
+_DOMAIN_REL_TYPES: list[str] = [rt.value for rt in _EDGE_TYPE_TO_REL.values()]
 
 
 # -- Property builders for Neo4j node creation ----------------------------
@@ -149,6 +159,26 @@ def _artifact_props(a: Artifact) -> dict[str, object]:
     )
 
 
+def _edge_rel_props(e: Edge) -> dict[str, object]:
+    """Build Neo4j relationship properties for a domain edge.
+
+    Args:
+        e: Edge domain model.
+
+    Returns:
+        Property map for the Neo4j relationship.
+    """
+    return _compact(
+        {
+            "id": e.id,
+            "timestamp": _dt(e.timestamp),
+            "confidence": e.confidence,
+            "reason": e.reason,
+            "context": e.context,
+        }
+    )
+
+
 # -- Node-to-model converters --------------------------------------------
 
 
@@ -189,6 +219,30 @@ def _to_artifact(props: dict[str, object]) -> Artifact:
 def _to_ta(props: dict[str, object]) -> TagAssignment:
     """Reconstruct a TagAssignment from Neo4j node properties."""
     return TagAssignment.model_validate(dict(props))
+
+
+def _to_edge(
+    props: dict[str, object],
+    rel_type: str,
+    src_id: str,
+    tgt_id: str,
+) -> Edge:
+    """Reconstruct an Edge from Neo4j relationship properties.
+
+    Args:
+        props: Relationship property map from ``properties(r)``.
+        rel_type: Neo4j relationship type string from ``type(r)``.
+        src_id: Source revision ID.
+        tgt_id: Target revision ID.
+
+    Returns:
+        Reconstructed Edge domain model.
+    """
+    data = dict(props)
+    data["source_revision_id"] = src_id
+    data["target_revision_id"] = tgt_id
+    data["edge_type"] = rel_type.lower()
+    return Edge.model_validate(data)
 
 
 # -- Transaction helper ---------------------------------------------------
@@ -911,6 +965,146 @@ class Neo4jStore:
             result = await session.run(query, rid=revision_id)
             rec = await result.single()
             return _to_revision(dict(rec["t"])) if rec else None
+
+    # -- Edge operations ---------------------------------------------------
+
+    async def create_edge(self, edge: Edge) -> Edge:
+        """Create a typed edge between two revisions with metadata.
+
+        Stores edge metadata (timestamp, confidence, reason, context)
+        as properties on the Neo4j relationship.
+
+        Args:
+            edge: Edge domain model specifying source, target, type,
+                and optional metadata.
+
+        Returns:
+            The persisted Edge instance.
+        """
+        rel_type = _EDGE_TYPE_TO_REL[edge.edge_type]
+        async with self._driver.session(database=self._database) as session:
+            await session.execute_write(
+                _run,
+                f"MATCH (src:{NodeLabel.REVISION} {{id: $src_id}}), "
+                f"(tgt:{NodeLabel.REVISION} {{id: $tgt_id}}) "
+                f"CREATE (src)-[:{rel_type} $props]->(tgt)",
+                src_id=edge.source_revision_id,
+                tgt_id=edge.target_revision_id,
+                props=_edge_rel_props(edge),
+            )
+        return edge
+
+    async def get_edge(self, edge_id: str) -> Edge | None:
+        """Retrieve a domain edge by its unique ID.
+
+        Searches across all domain relationship types for a
+        relationship with the matching ``id`` property.
+
+        Args:
+            edge_id: Unique edge identifier.
+
+        Returns:
+            Edge if found, None otherwise.
+        """
+        query = (
+            f"MATCH (src:{NodeLabel.REVISION})"
+            f"-[r]->"
+            f"(tgt:{NodeLabel.REVISION}) "
+            f"WHERE r.id = $eid AND type(r) IN $types "
+            f"RETURN src.id AS src_id, tgt.id AS tgt_id, "
+            f"type(r) AS rel_type, properties(r) AS props"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, eid=edge_id, types=_DOMAIN_REL_TYPES)
+            rec = await result.single()
+            if rec is None:
+                return None
+            return _to_edge(
+                dict(rec["props"]),
+                str(rec["rel_type"]),
+                str(rec["src_id"]),
+                str(rec["tgt_id"]),
+            )
+
+    async def get_edges(
+        self,
+        *,
+        source_revision_id: str | None = None,
+        target_revision_id: str | None = None,
+        edge_type: EdgeType | None = None,
+        min_confidence: float | None = None,
+        max_confidence: float | None = None,
+    ) -> list[Edge]:
+        """Query domain edges with optional metadata filters.
+
+        All parameters are optional and combined with AND logic.
+        Only edges created via ``create_edge`` (with an ``id``
+        property) are returned.
+
+        Args:
+            source_revision_id: Filter by source revision.
+            target_revision_id: Filter by target revision.
+            edge_type: Filter by edge type.
+            min_confidence: Minimum confidence (inclusive).
+            max_confidence: Maximum confidence (inclusive).
+
+        Returns:
+            Matching edges ordered by timestamp.
+        """
+        src = (
+            f"(src:{NodeLabel.REVISION} {{id: $src_id}})"
+            if source_revision_id
+            else f"(src:{NodeLabel.REVISION})"
+        )
+        tgt = (
+            f"(tgt:{NodeLabel.REVISION} {{id: $tgt_id}})"
+            if target_revision_id
+            else f"(tgt:{NodeLabel.REVISION})"
+        )
+        if edge_type is not None:
+            rel = f"[r:{_EDGE_TYPE_TO_REL[edge_type]}]"
+        else:
+            rel = "[r]"
+
+        wheres: list[str] = ["r.id IS NOT NULL"]
+        if edge_type is None:
+            wheres.append("type(r) IN $types")
+        if min_confidence is not None:
+            wheres.append("r.confidence >= $min_conf")
+        if max_confidence is not None:
+            wheres.append("r.confidence <= $max_conf")
+
+        query = (
+            f"MATCH {src}-{rel}->{tgt} "
+            f"WHERE {' AND '.join(wheres)} "
+            f"RETURN src.id AS src_id, tgt.id AS tgt_id, "
+            f"type(r) AS rel_type, properties(r) AS props "
+            f"ORDER BY r.timestamp"
+        )
+
+        params: dict[str, Any] = {}
+        if source_revision_id:
+            params["src_id"] = source_revision_id
+        if target_revision_id:
+            params["tgt_id"] = target_revision_id
+        if edge_type is None:
+            params["types"] = _DOMAIN_REL_TYPES
+        if min_confidence is not None:
+            params["min_conf"] = min_confidence
+        if max_confidence is not None:
+            params["max_conf"] = max_confidence
+
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, **params)
+            return [
+                _to_edge(
+                    dict(rec["props"]),
+                    str(rec["rel_type"]),
+                    str(rec["src_id"]),
+                    str(rec["tgt_id"]),
+                )
+                async for rec in result
+            ]
 
     # -- Internal ---------------------------------------------------------
 

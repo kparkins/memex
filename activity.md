@@ -178,3 +178,26 @@
 - `uv run ruff format --check src/ tests/` -- 21 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 13 source files
 - `uv run pytest tests/ -v` -- 152 passed (19 new belief-revision tests + 133 existing)
+
+## T08: Implement edge metadata support on typed relationships (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/stores/neo4j_store.py` with edge metadata support:
+  - `_EDGE_TYPE_TO_REL` / `_DOMAIN_REL_TYPES`: Mapping from domain `EdgeType` to Neo4j `RelType` for all 8 domain edge types
+  - `_edge_rel_props`: Property builder storing id, timestamp, confidence, reason, context on Neo4j relationships
+  - `_to_edge`: Converter reconstructing Edge domain models from Neo4j relationship properties + structural info (source/target IDs, relationship type)
+  - `create_edge`: Creates typed relationships between revisions with full metadata properties
+  - `get_edge`: Retrieves a domain edge by its unique ID, searching across all domain relationship types
+  - `get_edges`: Flexible query with keyword-only filters (source_revision_id, target_revision_id, edge_type, min_confidence, max_confidence) combined with AND logic; uses `r.id IS NOT NULL` to distinguish metadata-bearing domain edges from structural edges
+- Created `tests/test_edge_metadata.py` with 11 integration tests across 3 test classes:
+  - `TestCreateEdge`: 3 tests (full metadata round-trip, minimal metadata with None defaults, multiple edge types between same revisions)
+  - `TestGetEdge`: 2 tests (retrieve by ID, nonexistent returns None)
+  - `TestFilterEdges`: 6 tests (filter by source, target, edge type, confidence range with min/max/both, combined criteria, no filters returns all)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 22 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 13 source files
+- `uv run pytest tests/ -v` -- 163 passed (11 new edge metadata tests + 152 existing)

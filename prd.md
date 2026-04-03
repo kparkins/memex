@@ -523,7 +523,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Support reading and filtering edges by metadata fields",
       "Add tests for edge metadata round-trip and filter queries"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
