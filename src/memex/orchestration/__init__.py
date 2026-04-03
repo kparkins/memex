@@ -36,6 +36,7 @@ from memex.orchestration.events import (
     publish_revision_created,
     publish_revision_deprecated,
 )
+from memex.orchestration.lookup import get_item_by_path
 from memex.orchestration.ingest import (
     ArtifactSpec,
     EdgeSpec,
@@ -74,6 +75,7 @@ __all__ = [
     "IngestParams",
     "IngestResult",
     "IngestService",
+    "get_item_by_path",
     "ReviseParams",
     "ReviseResult",
     "ScheduledTrigger",

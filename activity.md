@@ -1063,3 +1063,27 @@
 - `uv run pytest tests/test_revise.py -v` -- 15 passed
 - `uv run pytest tests/test_mcp_mutation_tools.py::TestReviseItem -v` -- 4 passed (existing revise MCP tests unchanged)
 - `uv run pytest tests/ -v` -- 726 passed, 5 pre-existing failures unchanged (temporal timing, enrichment embedding)
+
+## T36: Add convenience item lookup by project/space/name path (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/orchestration/lookup.py` with `get_item_by_path` async function:
+  - Accepts `(store: NameLookupStore, project_id, space_name, item_name, item_kind)` -> `Item | None`
+  - Resolves space via `store.find_space()`, returns None early if space not found
+  - Delegates to `store.get_item_by_name()` with the resolved `space.id`
+- Updated `src/memex/orchestration/__init__.py` to import and export `get_item_by_path`
+- Created `tests/test_lookup.py` with 5 unit tests in `TestGetItemByPath`:
+  - `test_returns_item_when_found`: happy path, verifies delegation chain
+  - `test_returns_none_when_space_missing`: space not found -> None, get_item_by_name not called
+  - `test_returns_none_when_item_missing`: space exists, item not found -> None
+  - `test_passes_space_id_to_item_lookup`: resolved space.id forwarded, not space name
+  - `test_accepts_string_kind`: works with plain string kind, not just ItemKind enum
+
+**Verification**:
+- `uv run ruff check` on changed files -- All checks passed
+- `uv run ruff format --check` on changed files -- All files already formatted
+- `uv run mypy src/memex/orchestration/lookup.py` -- Success: no issues found in 1 source file
+- `uv run pytest tests/test_lookup.py -v` -- 5 passed
+- `uv run pytest tests/ -v` -- 731 passed, 5 pre-existing failures unchanged (temporal timing, enrichment embedding)

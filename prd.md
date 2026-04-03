@@ -909,7 +909,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Add unit tests with a mock NameLookupStore verifying space resolution + item lookup delegation",
       "Verify existing tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
