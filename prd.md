@@ -606,7 +606,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Filter deprecated items before returning results",
       "Add tests: vector search correctness, beta calibration effect, deprecated-item exclusion"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

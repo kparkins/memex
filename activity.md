@@ -327,3 +327,25 @@
 - `uv run ruff format --check src/ tests/` -- 29 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 15 source files
 - `uv run pytest tests/ -v` -- 284 passed (39 new BM25 search tests + 245 existing)
+
+## T14: Implement vector similarity retrieval (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/retrieval/vector.py` with vector similarity search module:
+  - `VectorResult` (frozen=True): Result model with revision, raw_score, beta-calibrated score, item_id, item_kind
+  - `generate_embedding`: Async embedding generation via litellm with configurable model and dimensions (default text-embedding-3-small, 1536 dims)
+  - `vector_search`: Queries `revision_embedding` vector index with beta-calibrated cosine similarity (default beta=0.85), deprecated-item filtering in Cypher, over-fetches candidates (2x limit) to compensate for filtering
+- Updated `src/memex/retrieval/__init__.py` to re-export `VectorResult`, `generate_embedding`, `vector_search`
+- Created `tests/test_vector_search.py` with 13 tests across 5 test classes:
+  - `TestGenerateEmbedding`: 3 unit tests (provider call, custom model/dims, failure wrapping)
+  - `TestVectorSearch`: 5 integration tests (closest match, score ordering, limit, model structure, close-vs-far scoring)
+  - `TestBetaCalibration`: 3 integration tests (default beta=0.85 applied, custom beta, beta=1.0 preserves raw)
+  - `TestVectorDeprecatedExclusion`: 2 integration tests (excluded by default, included with flag)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 31 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 16 source files
+- `uv run pytest tests/ -v` -- 297 passed (13 new vector search tests + 284 existing)
