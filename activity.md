@@ -244,3 +244,36 @@
 - `uv run ruff format --check src/ tests/` -- 24 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 13 source files
 - `uv run pytest tests/ -v` -- 200 passed (19 new provenance/impact tests + 181 existing)
+
+## T11: Implement Redis session buffer for working memory (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/stores/redis_store.py` with:
+  - `MessageRole` StrEnum: user, assistant
+  - `WorkingMemoryMessage` (frozen=True): immutable message model with role, content, and UTC timestamp
+  - `build_session_id()`: generates session IDs in `{context}:{user_hash}:{YYYYMMDD}:{sequence:04d}` format, SHA-256 hashing user ID for privacy
+  - `RedisWorkingMemory`: bounded session buffer class with:
+    - `add_message`: appends message, trims to max_messages via LTRIM, refreshes TTL via atomic pipeline
+    - `get_messages`: retrieves ordered message list for a session
+    - `clear_session`: deletes all messages in a session
+    - `get_ttl`: returns remaining TTL for session key
+  - Key namespace: `memex:wm:{project_id}:{session_id}` for project+session isolation
+  - Context field in session ID acts as namespace boundary (personal vs work)
+- Updated `tests/conftest.py` with `redis_client` async fixture (skip-if-unavailable pattern)
+- Updated `src/memex/stores/__init__.py` to re-export MessageRole, RedisWorkingMemory, WorkingMemoryMessage, build_session_id
+- Created `tests/test_redis_store.py` with 27 tests across 7 test classes:
+  - `TestBuildSessionId`: 6 tests (format, hash isolation, stability, zero-padding, namespace boundary, default date)
+  - `TestWorkingMemoryMessage`: 5 tests (roles, frozen immutability, serialization round-trip, timestamp default)
+  - `TestAddAndRetrieve`: 5 tests (user message, assistant message, string role coercion, ordering, empty session)
+  - `TestSessionIsolation`: 3 tests (session isolation, project isolation, context namespace isolation)
+  - `TestBoundedRetention`: 2 tests (trims beyond max, retains at limit)
+  - `TestTTLBehavior`: 3 tests (TTL set on add, refreshed on subsequent add, absent key returns -2)
+  - `TestClearOperations`: 3 tests (clear removes messages, nonexistent returns 0, clear does not affect other sessions)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 26 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 14 source files
+- `uv run pytest tests/ -v` -- 227 passed (27 new Redis working-memory tests + 200 existing)

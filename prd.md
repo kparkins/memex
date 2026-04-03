@@ -566,7 +566,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Redis is not the source of truth for long-term memory",
       "Add tests: session isolation, bounded retention, TTL behavior, clear operations"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
