@@ -808,7 +808,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Test operator include_deprecated inspection across the full lifecycle",
       "Test Dream State processes ingest-created events and produces an audit report"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

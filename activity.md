@@ -849,3 +849,39 @@
 - `uv run ruff format --check src/ tests/` -- 59 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 31 source files
 - `uv run pytest tests/ -v` -- 641 passed (22 new operator access tests + 619 existing)
+
+## T29: Add end-to-end integration tests for full memory lifecycle (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `tests/test_e2e_lifecycle.py` with 20 end-to-end integration tests across 3 test classes:
+  - **`TestFullLifecycleFlow`**: 5 tests exercising the complete ingest -> recall -> revise -> impact -> audit flow
+    - Ingest creates retrievable memory via hybrid search
+    - Revise creates SUPERSEDES chain visible in revision history
+    - DEPENDS_ON edge enables transitive impact analysis
+    - Provenance query separates incoming/outgoing edge directions
+    - All lifecycle responses round-trip through orjson
+  - **`TestOperatorDeprecatedLifecycle`**: 7 tests covering operator include_deprecated inspection across the full lifecycle
+    - Deprecated item excluded from default recall and listing
+    - Deprecated item visible with include_deprecated flag
+    - Full revision history accessible on deprecated items via operator flag
+    - Undeprecate restores default visibility
+    - Superseded revisions remain auditable with full chain annotations
+    - All operator responses JSON serializable
+  - **`TestDreamStateProcessesIngestEvents`**: 8 tests verifying Dream State processes ingest-created events and produces audit reports
+    - Ingest publishes events to consolidation feed
+    - Dream State consumes events and persists audit report
+    - Audit report retrievable via operator tool after Dream run
+    - Multiple Dream runs produce listed audit reports
+    - Dry-run does not advance cursor (events reprocessable)
+    - Non-dry-run advances cursor (events consumed)
+    - Dream State with LLM-returned actions executes them and reports
+    - Dream report round-trips through orjson
+- Created `_FakeLLMClient` test double satisfying the `LLMClient` protocol for Dream State E2E tests without requiring a real LLM provider
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 60 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 31 source files
+- `uv run pytest tests/ -v` -- 661 passed (20 new E2E tests + 641 existing)
