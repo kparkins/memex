@@ -441,7 +441,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Verify round-trip correctness and human readability",
       "Add unit tests for valid URIs, invalid URIs, and edge cases (deep nesting, missing optional parts, special characters)"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
