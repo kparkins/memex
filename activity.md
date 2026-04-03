@@ -982,3 +982,24 @@
 - `uv run ruff format --check src/memex/stores/protocols.py src/memex/stores/__init__.py` -- 2 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 39 source files
 - `uv run pytest tests/ -v` -- 708 passed, 8 pre-existing failures unchanged
+
+## T33: Eliminate MCP tool alias duplication via declarative registration (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Added module-level `_TOOL_ALIASES` dict in `src/memex/mcp/tools.py` mapping all 24 primary `memex_*` tool names to their paper-taxonomy alias names (e.g. `memex_ingest` -> `memory_ingest`, `memex_revise` -> `mutation_revise`)
+- Deleted all 24 alias function definitions that duplicated primary handler bodies (e.g. `memory_ingest_alias`, `mutation_revise_alias`, etc.)
+- Added declarative alias registration loop at the end of `create_mcp_server`: iterates `_TOOL_ALIASES` and calls `mcp.add_tool(scope[primary_name], name=alias_name)` for each pair
+- Tool count remains at 48 (24 primaries via `@mcp.tool` + 24 aliases via `mcp.add_tool`)
+- Fixed stale tool count assertions in 3 test files:
+  - `tests/test_mcp_graph_tools.py`: 46 -> 48
+  - `tests/test_mcp_mutation_tools.py`: `EXPECTED_TOOL_COUNT` 46 -> 48
+  - `tests/test_operator_access.py`: `EXPECTED_TOTAL_TOOL_COUNT` 46 -> 48
+- Net reduction: ~500 lines of duplicated alias handler code removed from `create_mcp_server`
+
+**Verification**:
+- `uv run ruff check src/memex/mcp/ tests/test_mcp_*.py tests/test_operator_access.py` -- All checks passed
+- `uv run ruff format --check src/memex/mcp/` -- 2 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 39 source files
+- `uv run pytest tests/ -v` -- 711 passed, 5 pre-existing failures unchanged (3 previously-failing tool count assertions now pass)

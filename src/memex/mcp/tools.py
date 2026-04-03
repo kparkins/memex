@@ -21,6 +21,11 @@ import orjson
 from pydantic import BaseModel, Field
 
 from memex.domain import Edge, EdgeType, Item, ItemKind, Revision, TagAssignment
+from memex.domain.kref_resolution import (
+    DEFAULT_KREF_TAG_NAME,
+    KrefResolutionError,
+    resolve_kref,
+)
 from memex.orchestration.dream_pipeline import DreamAuditReport, DreamStatePipeline
 from memex.orchestration.events import (
     publish_edge_created,
@@ -35,7 +40,7 @@ from memex.orchestration.ingest import (
 )
 from memex.retrieval.models import MatchSource, SearchRequest, SearchResult
 from memex.retrieval.strategy import SearchStrategy
-from memex.stores.protocols import MemoryStore
+from memex.stores.protocols import KrefResolvableStore, MemoryStore
 from memex.stores.redis_store import (
     ConsolidationEventFeed,
     DreamStateCursor,
@@ -405,6 +410,20 @@ class ListAuditReportsInput(BaseModel):
     limit: int = Field(default=50, ge=1, le=500)
 
 
+class ResolveKrefInput(BaseModel):
+    """Input schema for ``memex_resolve_kref`` / ``kref_resolve``.
+
+    Args:
+        uri: Full ``kref://`` URI string.
+        tag_name: Tag used when ``?r=`` is omitted.
+        include_deprecated: If True, resolve deprecated items too.
+    """
+
+    uri: str
+    tag_name: str = Field(default=DEFAULT_KREF_TAG_NAME)
+    include_deprecated: bool = False
+
+
 # -- Serialization helpers -------------------------------------------------
 
 
@@ -650,7 +669,8 @@ class MemexToolService:
             from memex.retrieval.multi_query import MultiQuerySearch
 
             multi = MultiQuerySearch(
-                self._search, llm_client=LiteLLMClient(),
+                self._search,
+                llm_client=LiteLLMClient(),
             )
             results = await multi.search(request)
         else:
@@ -815,6 +835,50 @@ class MemexToolService:
             "count": len(enriched),
             "item_id": inp.item_id,
             "deprecated": item.deprecated,
+        }
+
+    async def kref_resolve(self, inp: ResolveKrefInput) -> dict[str, Any]:
+        """Resolve a kref URI to project, space, item, revision, and artifact.
+
+        Matches ``Project.name`` and walks nested spaces by name. Does
+        not fetch artifact bytes; ``location`` is the external pointer.
+
+        Args:
+            inp: kref URI and optional tag name when ``?r=`` is omitted.
+
+        Returns:
+            Dictionary with serialized domain objects and ids.
+
+        Raises:
+            ValueError: When resolution fails (unknown segment).
+            RuntimeError: When the injected store does not implement
+                :class:`~memex.stores.protocols.KrefResolvableStore`.
+        """
+        if not isinstance(self._store, KrefResolvableStore):
+            raise RuntimeError(
+                "Kref resolution requires a store implementing KrefResolvableStore"
+            )
+        try:
+            target = await resolve_kref(
+                self._store,
+                inp.uri,
+                tag_name=inp.tag_name,
+                include_deprecated=inp.include_deprecated,
+            )
+        except KrefResolutionError as e:
+            logger.warning("Kref resolution failed: %s", e)
+            raise ValueError(str(e)) from e
+        return {
+            "uri": inp.uri,
+            "project": target.project.model_dump(mode="json"),
+            "space": target.space.model_dump(mode="json"),
+            "item": _serialize_item(target.item),
+            "revision": _serialize_revision(target.revision),
+            "artifact": (
+                target.artifact.model_dump(mode="json")
+                if target.artifact is not None
+                else None
+            ),
         }
 
     # -- Provenance and impact methods -------------------------------------
@@ -1241,6 +1305,40 @@ def _serialize_audit_report(report: DreamAuditReport) -> dict[str, Any]:
     }
 
 
+# -- Declarative alias mapping ---------------------------------------------
+# Maps each primary ``memex_*`` tool name to its paper-taxonomy alias.
+# Aliases are registered programmatically in ``create_mcp_server`` via
+# ``mcp.add_tool`` so that each capability is available under both names
+# without duplicating handler definitions.
+
+_TOOL_ALIASES: dict[str, str] = {
+    "memex_ingest": "memory_ingest",
+    "memex_recall": "memory_recall",
+    "memex_working_memory_get": "working_memory_get",
+    "memex_working_memory_clear": "working_memory_clear",
+    "memex_get_edges": "graph_get_edges",
+    "memex_list_items": "graph_list_items",
+    "memex_get_revisions": "graph_get_revisions",
+    "memex_resolve_kref": "kref_resolve",
+    "memex_provenance": "graph_provenance",
+    "memex_dependencies": "graph_dependencies",
+    "memex_impact_analysis": "graph_impact_analysis",
+    "memex_resolve_by_tag": "temporal_resolve_by_tag",
+    "memex_resolve_as_of": "temporal_resolve_as_of",
+    "memex_resolve_tag_at_time": "temporal_resolve_tag_at_time",
+    "memex_revise": "mutation_revise",
+    "memex_rollback": "mutation_rollback",
+    "memex_deprecate": "mutation_deprecate",
+    "memex_undeprecate": "mutation_undeprecate",
+    "memex_move_tag": "mutation_move_tag",
+    "memex_create_edge": "mutation_create_edge",
+    "memex_dream_state": "dream_state_invoke",
+    "memex_rerank": "memory_rerank",
+    "memex_get_audit_report": "operator_get_audit_report",
+    "memex_list_audit_reports": "operator_list_audit_reports",
+}
+
+
 # -- MCP server factory ----------------------------------------------------
 
 
@@ -1329,35 +1427,6 @@ def create_mcp_server(
         result = await service.ingest(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="memory_ingest")
-    async def memory_ingest_alias(
-        project_id: str,
-        space_name: str,
-        item_name: str,
-        item_kind: str,
-        content: str,
-        search_text: str | None = None,
-        tag_names: list[str] | None = None,
-        session_id: str | None = None,
-        message_role: str = "user",
-        bundle_item_id: str | None = None,
-    ) -> str:
-        """Ingest a memory unit (paper taxonomy alias for memex_ingest)."""
-        inp = IngestToolInput(
-            project_id=project_id,
-            space_name=space_name,
-            item_name=item_name,
-            item_kind=item_kind,
-            content=content,
-            search_text=search_text,
-            tag_names=tag_names or ["active"],
-            session_id=session_id,
-            message_role=message_role,
-            bundle_item_id=bundle_item_id,
-        )
-        result = await service.ingest(inp)
-        return orjson.dumps(result).decode()
-
     # -- Recall: hybrid retrieval ------------------------------------------
 
     @mcp.tool(name="memex_recall")
@@ -1387,29 +1456,6 @@ def create_mcp_server(
         result = await service.recall(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="memory_recall")
-    async def memory_recall_alias(
-        query: str,
-        project_id: str | None = None,
-        memory_limit: int = 3,
-        context_top_k: int = 7,
-        include_deprecated: bool = False,
-        multi_query: bool = False,
-        reranking_mode: str = "auto",
-    ) -> str:
-        """Search memory (paper taxonomy alias for memex_recall)."""
-        inp = RecallToolInput(
-            query=query,
-            project_id=project_id,
-            memory_limit=memory_limit,
-            context_top_k=context_top_k,
-            include_deprecated=include_deprecated,
-            multi_query=multi_query,
-            reranking_mode=reranking_mode,
-        )
-        result = await service.recall(inp)
-        return orjson.dumps(result).decode()
-
     # -- Working memory: get and clear -------------------------------------
 
     @mcp.tool(name="memex_working_memory_get")
@@ -1425,38 +1471,12 @@ def create_mcp_server(
         result = await service.working_memory_get(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="working_memory_get")
-    async def working_memory_get_alias(
-        project_id: str,
-        session_id: str,
-    ) -> str:
-        """Retrieve working-memory messages (paper taxonomy alias)."""
-        inp = WorkingMemoryGetInput(
-            project_id=project_id,
-            session_id=session_id,
-        )
-        result = await service.working_memory_get(inp)
-        return orjson.dumps(result).decode()
-
     @mcp.tool(name="memex_working_memory_clear")
     async def memex_working_memory_clear(
         project_id: str,
         session_id: str,
     ) -> str:
         """Clear all messages from a working-memory session buffer."""
-        inp = WorkingMemoryClearInput(
-            project_id=project_id,
-            session_id=session_id,
-        )
-        result = await service.working_memory_clear(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="working_memory_clear")
-    async def working_memory_clear_alias(
-        project_id: str,
-        session_id: str,
-    ) -> str:
-        """Clear working-memory session (paper taxonomy alias)."""
         inp = WorkingMemoryClearInput(
             project_id=project_id,
             session_id=session_id,
@@ -1489,25 +1509,6 @@ def create_mcp_server(
         result = await service.get_edges(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="graph_get_edges")
-    async def graph_get_edges_alias(
-        source_revision_id: str | None = None,
-        target_revision_id: str | None = None,
-        edge_type: str | None = None,
-        min_confidence: float | None = None,
-        max_confidence: float | None = None,
-    ) -> str:
-        """Query edges (paper taxonomy alias for memex_get_edges)."""
-        inp = GetEdgesInput(
-            source_revision_id=source_revision_id,
-            target_revision_id=target_revision_id,
-            edge_type=edge_type,
-            min_confidence=min_confidence,
-            max_confidence=max_confidence,
-        )
-        result = await service.get_edges(inp)
-        return orjson.dumps(result).decode()
-
     @mcp.tool(name="memex_list_items")
     async def memex_list_items(
         space_id: str,
@@ -1518,19 +1519,6 @@ def create_mcp_server(
         Returns items ordered by creation time. Deprecated items are
         excluded by default per FR-4 contraction semantics.
         """
-        inp = ListItemsInput(
-            space_id=space_id,
-            include_deprecated=include_deprecated,
-        )
-        result = await service.list_items(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="graph_list_items")
-    async def graph_list_items_alias(
-        space_id: str,
-        include_deprecated: bool = False,
-    ) -> str:
-        """List items in a space (paper taxonomy alias)."""
         inp = ListItemsInput(
             space_id=space_id,
             include_deprecated=include_deprecated,
@@ -1557,17 +1545,25 @@ def create_mcp_server(
         result = await service.get_revisions(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="graph_get_revisions")
-    async def graph_get_revisions_alias(
-        item_id: str,
+    # -- Kref resolution -----------------------------------------------------
+
+    @mcp.tool(name="memex_resolve_kref")
+    async def memex_resolve_kref(
+        uri: str,
+        tag_name: str = DEFAULT_KREF_TAG_NAME,
         include_deprecated: bool = False,
     ) -> str:
-        """Get revision history (paper taxonomy alias)."""
-        inp = GetRevisionsInput(
-            item_id=item_id,
+        """Resolve a kref:// URI to graph ids and artifact pointer metadata.
+
+        Walks project name, nested space path, item.kind, optional ?r=N,
+        optional ?a=artifact. Does not load file bytes; returns location URI.
+        """
+        inp = ResolveKrefInput(
+            uri=uri,
+            tag_name=tag_name,
             include_deprecated=include_deprecated,
         )
-        result = await service.get_revisions(inp)
+        result = await service.kref_resolve(inp)
         return orjson.dumps(result).decode()
 
     # -- Provenance and impact analysis ------------------------------------
@@ -1580,13 +1576,6 @@ def create_mcp_server(
         incoming and outgoing for agent-side reasoning about dependency
         direction and causal chains.
         """
-        inp = ProvenanceInput(revision_id=revision_id)
-        result = await service.provenance(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="graph_provenance")
-    async def graph_provenance_alias(revision_id: str) -> str:
-        """Provenance summary (paper taxonomy alias)."""
         inp = ProvenanceInput(revision_id=revision_id)
         result = await service.provenance(inp)
         return orjson.dumps(result).decode()
@@ -1605,16 +1594,6 @@ def create_mcp_server(
         result = await service.dependencies(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="graph_dependencies")
-    async def graph_dependencies_alias(
-        revision_id: str,
-        depth: int = 10,
-    ) -> str:
-        """Dependency traversal (paper taxonomy alias)."""
-        inp = DependenciesInput(revision_id=revision_id, depth=depth)
-        result = await service.dependencies(inp)
-        return orjson.dumps(result).decode()
-
     @mcp.tool(name="memex_impact_analysis")
     async def memex_impact_analysis(
         revision_id: str,
@@ -1625,16 +1604,6 @@ def create_mcp_server(
         Finds all revisions that depend on the given revision via
         incoming DEPENDS_ON and DERIVED_FROM edges. Depth range 1-20.
         """
-        inp = ImpactAnalysisInput(revision_id=revision_id, depth=depth)
-        result = await service.impact_analysis(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="graph_impact_analysis")
-    async def graph_impact_analysis_alias(
-        revision_id: str,
-        depth: int = 10,
-    ) -> str:
-        """Impact analysis (paper taxonomy alias)."""
         inp = ImpactAnalysisInput(revision_id=revision_id, depth=depth)
         result = await service.impact_analysis(inp)
         return orjson.dumps(result).decode()
@@ -1655,16 +1624,6 @@ def create_mcp_server(
         result = await service.resolve_by_tag(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="temporal_resolve_by_tag")
-    async def temporal_resolve_by_tag_alias(
-        item_id: str,
-        tag_name: str,
-    ) -> str:
-        """Resolve by tag (paper taxonomy alias)."""
-        inp = ResolveByTagInput(item_id=item_id, tag_name=tag_name)
-        result = await service.resolve_by_tag(inp)
-        return orjson.dumps(result).decode()
-
     @mcp.tool(name="memex_resolve_as_of")
     async def memex_resolve_as_of(
         item_id: str,
@@ -1679,16 +1638,6 @@ def create_mcp_server(
         result = await service.resolve_as_of(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="temporal_resolve_as_of")
-    async def temporal_resolve_as_of_alias(
-        item_id: str,
-        timestamp: str,
-    ) -> str:
-        """Resolve as-of time (paper taxonomy alias)."""
-        inp = ResolveAsOfInput(item_id=item_id, timestamp=timestamp)
-        result = await service.resolve_as_of(inp)
-        return orjson.dumps(result).decode()
-
     @mcp.tool(name="memex_resolve_tag_at_time")
     async def memex_resolve_tag_at_time(
         tag_id: str,
@@ -1699,16 +1648,6 @@ def create_mcp_server(
         Uses tag-assignment history for point-in-time resolution per FR-5.
         Accepts an ISO 8601 timestamp string.
         """
-        inp = ResolveTagAtTimeInput(tag_id=tag_id, timestamp=timestamp)
-        result = await service.resolve_tag_at_time(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="temporal_resolve_tag_at_time")
-    async def temporal_resolve_tag_at_time_alias(
-        tag_id: str,
-        timestamp: str,
-    ) -> str:
-        """Resolve tag at time (paper taxonomy alias)."""
         inp = ResolveTagAtTimeInput(tag_id=tag_id, timestamp=timestamp)
         result = await service.resolve_tag_at_time(inp)
         return orjson.dumps(result).decode()
@@ -1736,23 +1675,6 @@ def create_mcp_server(
         result = await service.revise_item(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="mutation_revise")
-    async def mutation_revise_alias(
-        item_id: str,
-        content: str,
-        search_text: str | None = None,
-        tag_name: str = "active",
-    ) -> str:
-        """Revise an item (paper taxonomy alias for memex_revise)."""
-        inp = ReviseItemInput(
-            item_id=item_id,
-            content=content,
-            search_text=search_text,
-            tag_name=tag_name,
-        )
-        result = await service.revise_item(inp)
-        return orjson.dumps(result).decode()
-
     @mcp.tool(name="memex_rollback")
     async def memex_rollback(
         tag_id: str,
@@ -1763,19 +1685,6 @@ def create_mcp_server(
         Validates the target belongs to the same item and has a lower
         revision number than the current pointer.
         """
-        inp = RollbackTagInput(
-            tag_id=tag_id,
-            target_revision_id=target_revision_id,
-        )
-        result = await service.rollback_tag(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="mutation_rollback")
-    async def mutation_rollback_alias(
-        tag_id: str,
-        target_revision_id: str,
-    ) -> str:
-        """Rollback a tag (paper taxonomy alias for memex_rollback)."""
         inp = RollbackTagInput(
             tag_id=tag_id,
             target_revision_id=target_revision_id,
@@ -1794,13 +1703,6 @@ def create_mcp_server(
         result = await service.deprecate_item(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="mutation_deprecate")
-    async def mutation_deprecate_alias(item_id: str) -> str:
-        """Deprecate an item (paper taxonomy alias)."""
-        inp = DeprecateItemInput(item_id=item_id)
-        result = await service.deprecate_item(inp)
-        return orjson.dumps(result).decode()
-
     @mcp.tool(name="memex_undeprecate")
     async def memex_undeprecate(item_id: str) -> str:
         """Restore an item from deprecation, making it visible again.
@@ -1808,13 +1710,6 @@ def create_mcp_server(
         Clears the deprecation flag so the item appears in default
         retrieval paths.
         """
-        inp = UndeprecateItemInput(item_id=item_id)
-        result = await service.undeprecate_item(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="mutation_undeprecate")
-    async def mutation_undeprecate_alias(item_id: str) -> str:
-        """Undeprecate an item (paper taxonomy alias)."""
         inp = UndeprecateItemInput(item_id=item_id)
         result = await service.undeprecate_item(inp)
         return orjson.dumps(result).decode()
@@ -1829,19 +1724,6 @@ def create_mcp_server(
         Updates the tag pointer and records a new TagAssignment
         in the history for point-in-time resolution.
         """
-        inp = MoveTagInput(
-            tag_id=tag_id,
-            new_revision_id=new_revision_id,
-        )
-        result = await service.move_tag(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="mutation_move_tag")
-    async def mutation_move_tag_alias(
-        tag_id: str,
-        new_revision_id: str,
-    ) -> str:
-        """Move a tag (paper taxonomy alias for memex_move_tag)."""
         inp = MoveTagInput(
             tag_id=tag_id,
             new_revision_id=new_revision_id,
@@ -1874,27 +1756,6 @@ def create_mcp_server(
         result = await service.create_edge(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="mutation_create_edge")
-    async def mutation_create_edge_alias(
-        source_revision_id: str,
-        target_revision_id: str,
-        edge_type: str,
-        confidence: float | None = None,
-        reason: str | None = None,
-        context: str | None = None,
-    ) -> str:
-        """Create an edge (paper taxonomy alias for memex_create_edge)."""
-        inp = CreateEdgeInput(
-            source_revision_id=source_revision_id,
-            target_revision_id=target_revision_id,
-            edge_type=edge_type,
-            confidence=confidence,
-            reason=reason,
-            context=context,
-        )
-        result = await service.create_edge(inp)
-        return orjson.dumps(result).decode()
-
     # -- Dream State invocation -----------------------------------------------
 
     @mcp.tool(name="memex_dream_state")
@@ -1908,21 +1769,6 @@ def create_mcp_server(
         Runs event collection, LLM assessment, circuit-breaker checks,
         action execution (unless dry_run), and persists an audit report.
         """
-        inp = DreamStateInvokeInput(
-            project_id=project_id,
-            dry_run=dry_run,
-            model=model,
-        )
-        result = await service.invoke_dream_state(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="dream_state_invoke")
-    async def dream_state_invoke_alias(
-        project_id: str,
-        dry_run: bool = False,
-        model: str | None = None,
-    ) -> str:
-        """Invoke Dream State (paper taxonomy alias)."""
         inp = DreamStateInvokeInput(
             project_id=project_id,
             dry_run=dry_run,
@@ -1952,21 +1798,6 @@ def create_mcp_server(
         result = await service.rerank(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="memory_rerank")
-    async def memory_rerank_alias(
-        query: str,
-        results: list[dict[str, Any]] | None = None,
-        mode: str = "auto",
-    ) -> str:
-        """Rerank results (paper taxonomy alias for memex_rerank)."""
-        inp = RerankInput(
-            results=results or [],
-            query=query,
-            mode=mode,
-        )
-        result = await service.rerank(inp)
-        return orjson.dumps(result).decode()
-
     # -- Operator access: audit reports ----------------------------------------
 
     @mcp.tool(name="memex_get_audit_report")
@@ -1976,13 +1807,6 @@ def create_mcp_server(
         Enables operator inspection of consolidation decisions,
         circuit-breaker outcomes, and action results per FR-14.
         """
-        inp = GetAuditReportInput(report_id=report_id)
-        result = await service.get_audit_report(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="operator_get_audit_report")
-    async def operator_get_audit_report_alias(report_id: str) -> str:
-        """Get audit report (paper taxonomy alias)."""
         inp = GetAuditReportInput(report_id=report_id)
         result = await service.get_audit_report(inp)
         return orjson.dumps(result).decode()
@@ -2001,14 +1825,9 @@ def create_mcp_server(
         result = await service.list_audit_reports(inp)
         return orjson.dumps(result).decode()
 
-    @mcp.tool(name="operator_list_audit_reports")
-    async def operator_list_audit_reports_alias(
-        project_id: str,
-        limit: int = 50,
-    ) -> str:
-        """List audit reports (paper taxonomy alias)."""
-        inp = ListAuditReportsInput(project_id=project_id, limit=limit)
-        result = await service.list_audit_reports(inp)
-        return orjson.dumps(result).decode()
+    # -- Register paper-taxonomy aliases via declarative mapping ---------------
+    scope = locals()
+    for primary_name, alias_name in _TOOL_ALIASES.items():
+        mcp.add_tool(scope[primary_name], name=alias_name)
 
     return mcp

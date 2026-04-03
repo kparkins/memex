@@ -767,13 +767,13 @@ class TestGraphToolRegistration:
         assert "temporal_resolve_tag_at_time" in tool_names
 
     async def test_total_tool_count(self, neo4j_driver, redis_client):
-        """Factory registers 46 tools (23 pairs)."""
+        """Factory registers 48 tools (24 pairs)."""
         server = create_mcp_server(
             neo4j_driver,
             redis_client=redis_client,
         )
         tool_list = await server.list_tools()
-        assert len(tool_list) == 46
+        assert len(tool_list) == 48
 
     async def test_all_tools_have_descriptions(self, neo4j_driver, redis_client):
         """Every registered tool has a non-empty description."""

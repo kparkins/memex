@@ -611,7 +611,7 @@ class TestRerank:
 
 # -- Tool registration tests ------------------------------------------------
 
-EXPECTED_TOOL_COUNT = 46  # 21 original pairs + 2 operator pairs = 23 pairs x 2
+EXPECTED_TOOL_COUNT = 48  # 24 primary tools + 24 paper-taxonomy aliases
 
 
 class TestMutationToolRegistration:

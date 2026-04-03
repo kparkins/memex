@@ -456,7 +456,7 @@ EXPECTED_OPERATOR_TOOLS = {
     "operator_list_audit_reports",
 }
 
-EXPECTED_TOTAL_TOOL_COUNT = 46
+EXPECTED_TOTAL_TOOL_COUNT = 48
 
 
 class TestOperatorToolRegistration:
@@ -472,7 +472,7 @@ class TestOperatorToolRegistration:
             assert name in names, f"Missing operator tool: {name}"
 
     async def test_total_tool_count(self, neo4j_driver, redis_client):
-        """Factory registers exactly 46 tools (23 pairs)."""
+        """Factory registers exactly 48 tools (24 pairs)."""
         server = create_mcp_server(neo4j_driver, redis_client=redis_client)
         tool_list = await server.list_tools()
         assert len(tool_list) == EXPECTED_TOTAL_TOOL_COUNT

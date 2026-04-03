@@ -864,7 +864,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Verify tool count remains at 48 (24 primaries + 24 aliases) in all test assertions",
       "Verify all existing MCP tool tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
