@@ -796,7 +796,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Support inspection of full revision histories including superseded revisions",
       "Add tests: deprecated items visible when flag is set, audit reports retrievable, full history accessible"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

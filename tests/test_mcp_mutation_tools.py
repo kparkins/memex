@@ -608,7 +608,7 @@ class TestRerank:
 
 # -- Tool registration tests ------------------------------------------------
 
-EXPECTED_TOOL_COUNT = 42  # 13 original pairs + 8 new pairs = 21 pairs x 2
+EXPECTED_TOOL_COUNT = 46  # 21 original pairs + 2 operator pairs = 23 pairs x 2
 
 
 class TestMutationToolRegistration:
@@ -655,7 +655,7 @@ class TestMutationToolRegistration:
         assert "memory_rerank" in names
 
     async def test_total_tool_count(self, neo4j_driver, redis_client):
-        """Factory registers exactly 42 tools (21 pairs)."""
+        """Factory registers exactly 46 tools (23 pairs)."""
         server = create_mcp_server(neo4j_driver, redis_client=redis_client)
         tool_list = await server.list_tools()
         assert len(tool_list) == EXPECTED_TOOL_COUNT

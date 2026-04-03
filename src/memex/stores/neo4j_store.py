@@ -1245,6 +1245,40 @@ class Neo4jStore:
             rec = await result.single()
             return _to_revision(dict(rec["t"])) if rec else None
 
+    async def get_supersession_map(
+        self, item_id: str
+    ) -> dict[str, dict[str, str | None]]:
+        """Build a supersession map for all revisions of an item.
+
+        Returns a mapping from revision ID to its supersession
+        relationships (``supersedes`` and ``superseded_by``).
+
+        Args:
+            item_id: Item whose revision chain to inspect.
+
+        Returns:
+            Dict mapping revision_id to
+            ``{"supersedes": id|None, "superseded_by": id|None}``.
+        """
+        query = (
+            f"MATCH (r:{NodeLabel.REVISION} {{item_id: $iid}}) "
+            f"OPTIONAL MATCH (r)-[:{RelType.SUPERSEDES}]->"
+            f"(prev:{NodeLabel.REVISION}) "
+            f"OPTIONAL MATCH (next:{NodeLabel.REVISION})"
+            f"-[:{RelType.SUPERSEDES}]->(r) "
+            f"RETURN r.id AS rid, prev.id AS supersedes, "
+            f"next.id AS superseded_by"
+        )
+        result_map: dict[str, dict[str, str | None]] = {}
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, iid=item_id)
+            async for rec in result:
+                result_map[rec["rid"]] = {
+                    "supersedes": rec["supersedes"],
+                    "superseded_by": rec["superseded_by"],
+                }
+        return result_map
+
     # -- Edge operations ---------------------------------------------------
 
     async def create_edge(self, edge: Edge) -> Edge:

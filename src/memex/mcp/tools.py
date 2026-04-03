@@ -179,9 +179,11 @@ class GetRevisionsInput(BaseModel):
 
     Args:
         item_id: Item to retrieve revision history for.
+        include_deprecated: Include revisions from deprecated items.
     """
 
     item_id: str
+    include_deprecated: bool = False
 
 
 # -- Provenance and impact input models -----------------------------------
@@ -375,6 +377,31 @@ class RerankInput(BaseModel):
     results: list[dict[str, Any]] = Field(default_factory=list)
     query: str
     mode: str = RERANKING_MODE_AUTO
+
+
+# -- Operator access input models ------------------------------------------
+
+
+class GetAuditReportInput(BaseModel):
+    """Input schema for ``memex_get_audit_report`` / ``operator_get_audit_report``.
+
+    Args:
+        report_id: Unique audit report identifier.
+    """
+
+    report_id: str
+
+
+class ListAuditReportsInput(BaseModel):
+    """Input schema for ``memex_list_audit_reports`` / ``operator_list_audit_reports``.
+
+    Args:
+        project_id: Project to list reports for.
+        limit: Maximum number of reports to return.
+    """
+
+    project_id: str
+    limit: int = Field(default=50, ge=1, le=500)
 
 
 # -- Serialization helpers -------------------------------------------------
@@ -742,17 +769,51 @@ class MemexToolService:
     async def get_revisions(self, inp: GetRevisionsInput) -> dict[str, Any]:
         """Retrieve full revision history for an item.
 
+        When ``include_deprecated`` is False (default) and the item is
+        deprecated, an empty result set is returned. When True, all
+        revisions are returned regardless of item deprecation status.
+
+        The response annotates each revision with its supersession
+        relationships (``supersedes_id`` and ``superseded_by_id``) so
+        operators can inspect the full versioning chain.
+
         Args:
-            inp: Item identifier.
+            inp: Item identifier and deprecation filter.
 
         Returns:
-            Dictionary with revisions ordered by revision_number.
+            Dictionary with revisions, supersession info, and item state.
         """
+        item = await self._store.get_item(inp.item_id)
+        if item is None:
+            return {
+                "revisions": [],
+                "count": 0,
+                "item_id": inp.item_id,
+                "deprecated": False,
+            }
+
+        if item.deprecated and not inp.include_deprecated:
+            return {
+                "revisions": [],
+                "count": 0,
+                "item_id": inp.item_id,
+                "deprecated": True,
+            }
+
         revisions = await self._store.get_revisions_for_item(inp.item_id)
+        supersession = await self._store.get_supersession_map(inp.item_id)
+        enriched = []
+        for r in revisions:
+            entry = _serialize_revision(r)
+            entry["supersedes_id"] = supersession.get(r.id, {}).get("supersedes")
+            entry["superseded_by_id"] = supersession.get(r.id, {}).get("superseded_by")
+            enriched.append(entry)
+
         return {
-            "revisions": [_serialize_revision(r) for r in revisions],
-            "count": len(revisions),
+            "revisions": enriched,
+            "count": len(enriched),
             "item_id": inp.item_id,
+            "deprecated": item.deprecated,
         }
 
     # -- Provenance and impact methods -------------------------------------
@@ -1099,6 +1160,44 @@ class MemexToolService:
             "query": inp.query,
         }
 
+    # -- Operator access methods -----------------------------------------------
+
+    async def get_audit_report(
+        self,
+        inp: GetAuditReportInput,
+    ) -> dict[str, Any]:
+        """Retrieve a Dream State audit report by ID.
+
+        Args:
+            inp: Report identifier.
+
+        Returns:
+            Dictionary with the report data or not-found indicator.
+        """
+        report = await self._store.get_audit_report(inp.report_id)
+        if report is None:
+            return {"found": False, "report_id": inp.report_id}
+        return {"found": True, "report_id": inp.report_id, "report": report}
+
+    async def list_audit_reports(
+        self,
+        inp: ListAuditReportsInput,
+    ) -> dict[str, Any]:
+        """List Dream State audit reports for a project.
+
+        Args:
+            inp: Project identifier and limit.
+
+        Returns:
+            Dictionary with reports and count.
+        """
+        reports = await self._store.list_audit_reports(inp.project_id, limit=inp.limit)
+        return {
+            "reports": reports,
+            "count": len(reports),
+            "project_id": inp.project_id,
+        }
+
 
 def _serialize_audit_report(report: DreamAuditReport) -> dict[str, Any]:
     """Serialize a DreamAuditReport to a JSON-safe dictionary.
@@ -1437,20 +1536,34 @@ def create_mcp_server(
         return orjson.dumps(result).decode()
 
     @mcp.tool(name="memex_get_revisions")
-    async def memex_get_revisions(item_id: str) -> str:
+    async def memex_get_revisions(
+        item_id: str,
+        include_deprecated: bool = False,
+    ) -> str:
         """Retrieve the full revision history for an item.
 
         Returns all revisions ordered by revision number ascending,
-        enabling inspection of the complete versioning chain.
+        with supersession chain annotations. Deprecated items are
+        excluded by default; set include_deprecated=True for operator
+        inspection per FR-14.
         """
-        inp = GetRevisionsInput(item_id=item_id)
+        inp = GetRevisionsInput(
+            item_id=item_id,
+            include_deprecated=include_deprecated,
+        )
         result = await service.get_revisions(inp)
         return orjson.dumps(result).decode()
 
     @mcp.tool(name="graph_get_revisions")
-    async def graph_get_revisions_alias(item_id: str) -> str:
+    async def graph_get_revisions_alias(
+        item_id: str,
+        include_deprecated: bool = False,
+    ) -> str:
         """Get revision history (paper taxonomy alias)."""
-        inp = GetRevisionsInput(item_id=item_id)
+        inp = GetRevisionsInput(
+            item_id=item_id,
+            include_deprecated=include_deprecated,
+        )
         result = await service.get_revisions(inp)
         return orjson.dumps(result).decode()
 
@@ -1849,6 +1962,50 @@ def create_mcp_server(
             mode=mode,
         )
         result = await service.rerank(inp)
+        return orjson.dumps(result).decode()
+
+    # -- Operator access: audit reports ----------------------------------------
+
+    @mcp.tool(name="memex_get_audit_report")
+    async def memex_get_audit_report(report_id: str) -> str:
+        """Retrieve a Dream State audit report by ID.
+
+        Enables operator inspection of consolidation decisions,
+        circuit-breaker outcomes, and action results per FR-14.
+        """
+        inp = GetAuditReportInput(report_id=report_id)
+        result = await service.get_audit_report(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="operator_get_audit_report")
+    async def operator_get_audit_report_alias(report_id: str) -> str:
+        """Get audit report (paper taxonomy alias)."""
+        inp = GetAuditReportInput(report_id=report_id)
+        result = await service.get_audit_report(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_list_audit_reports")
+    async def memex_list_audit_reports(
+        project_id: str,
+        limit: int = 50,
+    ) -> str:
+        """List Dream State audit reports for a project.
+
+        Returns reports newest first. Enables operator review of
+        consolidation history per FR-14.
+        """
+        inp = ListAuditReportsInput(project_id=project_id, limit=limit)
+        result = await service.list_audit_reports(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="operator_list_audit_reports")
+    async def operator_list_audit_reports_alias(
+        project_id: str,
+        limit: int = 50,
+    ) -> str:
+        """List audit reports (paper taxonomy alias)."""
+        inp = ListAuditReportsInput(project_id=project_id, limit=limit)
+        result = await service.list_audit_reports(inp)
         return orjson.dumps(result).decode()
 
     return mcp

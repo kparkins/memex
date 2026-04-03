@@ -484,14 +484,14 @@ class TestCreateMCPServer:
         assert "working_memory_clear" in tool_names
 
     async def test_tool_count(self, neo4j_driver, redis_client):
-        """Factory registers exactly 42 tools (21 pairs)."""
+        """Factory registers exactly 46 tools (23 pairs)."""
         server = create_mcp_server(
             neo4j_driver,
             redis_client=redis_client,
         )
 
         tool_list = await server.list_tools()
-        assert len(tool_list) == 42
+        assert len(tool_list) == 46
 
     async def test_tools_have_descriptions(self, neo4j_driver, redis_client):
         """Every registered tool has a non-empty description."""

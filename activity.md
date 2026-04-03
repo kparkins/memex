@@ -816,3 +816,36 @@
 - `uv run ruff format --check src/ tests/` -- 58 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 31 source files
 - `uv run pytest tests/ -v` -- 619 passed (34 new mutation tool tests + 585 existing)
+
+## T28: Implement operator access paths (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/mcp/tools.py` with operator access capabilities:
+  - **`GetRevisionsInput`**: Added `include_deprecated: bool = False` field; deprecated items return empty revisions by default, full history when flag is set
+  - **`GetAuditReportInput`**: New input model for retrieving a single Dream State audit report by ID
+  - **`ListAuditReportsInput`**: New input model for listing audit reports by project (limit 1-500, default 50)
+  - **`MemexToolService.get_revisions()`**: Checks item deprecation status, enriches each revision with `supersedes_id` and `superseded_by_id` annotations from supersession chain
+  - **`MemexToolService.get_audit_report()`**: Delegates to `Neo4jStore.get_audit_report()`, returns found/not-found indicator
+  - **`MemexToolService.list_audit_reports()`**: Delegates to `Neo4jStore.list_audit_reports()`, returns reports with count
+  - **MCP tool registrations**: 4 new tools (2 pairs): `memex_get_audit_report`/`operator_get_audit_report`, `memex_list_audit_reports`/`operator_list_audit_reports`
+  - **`memex_get_revisions`/`graph_get_revisions`**: Updated to accept `include_deprecated` parameter
+  - Total tools: 46 (42 previous + 4 new operator access)
+- Extended `src/memex/stores/neo4j_store.py`:
+  - **`Neo4jStore.get_supersession_map(item_id)`**: New method that queries all SUPERSEDES edges for an item's revisions in a single Cypher query, returning a dict mapping revision_id to `{supersedes, superseded_by}`
+- Updated `src/memex/mcp/__init__.py`: Re-exports `GetAuditReportInput` and `ListAuditReportsInput`
+- Updated tool counts in `tests/test_mcp_tools.py`, `tests/test_mcp_graph_tools.py`, `tests/test_mcp_mutation_tools.py` from 42 to 46
+- Created `tests/test_operator_access.py` with 22 tests across 6 test classes:
+  - `TestGetRevisionsDeprecated`: 4 tests (excluded by default, visible with flag, non-deprecated always visible, nonexistent item)
+  - `TestListItemsDeprecated`: 2 tests (excluded from list, visible with flag)
+  - `TestGetAuditReport`: 3 tests (retrieve saved, nonexistent not-found, JSON serializable)
+  - `TestListAuditReports`: 4 tests (list for project, limit respected, empty project, JSON serializable)
+  - `TestSupersessionChain`: 5 tests (single revision, two-revision chain, three-revision chain, accessible after deprecation, JSON serializable)
+  - `TestOperatorToolRegistration`: 4 tests (tools registered, total count 46, descriptions present, get_revisions accepts include_deprecated)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 59 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 31 source files
+- `uv run pytest tests/ -v` -- 641 passed (22 new operator access tests + 619 existing)
