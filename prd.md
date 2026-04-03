@@ -621,7 +621,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Return structured metadata including search_mode transparency field for client-side sibling reranking",
       "Add tests: fusion scoring correctness, type weight application, result ordering, metadata completeness"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

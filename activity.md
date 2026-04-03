@@ -349,3 +349,37 @@
 - `uv run ruff format --check src/ tests/` -- 31 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 16 source files
 - `uv run pytest tests/ -v` -- 297 passed (13 new vector search tests + 284 existing)
+
+## T15: Implement hybrid scoring and retrieval fusion (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/retrieval/hybrid.py` with hybrid retrieval fusion module:
+  - `MatchSource` StrEnum: item, revision, artifact (for type weight selection)
+  - `SearchMode` StrEnum: lexical, vector, hybrid (transparency field per FR-7)
+  - `HybridResult` (frozen=True): Result model with full scoring breakdown (score, lexical_score, vector_score), match_source, search_mode, and item metadata for client-side sibling reranking
+  - `DEFAULT_TYPE_WEIGHTS`: item=1.0, revision=0.9, artifact=0.8 matching RetrievalSettings
+  - `compute_fused_score`: Implements S(q,m) = w(m) * max(s_lex(m), s_vec(m)) per the paper
+  - `hybrid_search`: Main entry point combining BM25 and vector branches via UNION ALL Cypher query before fusion
+  - Three Cypher builders: `_build_hybrid_cypher` (UNION ALL), `_build_lexical_cypher`, `_build_vector_cypher` for mode-specific query construction
+  - `_resolve_query`: Mode dispatcher selecting Cypher and parameters
+  - `_execute_and_collect`: Runs query and deduplicates candidates by revision ID across branches
+  - `_fuse_and_limit`: Applies fusion scoring, sorts by fused score, enforces memory_limit on unique items
+  - Configurable: beta (default 0.85), memory_limit (default 3), context_top_k (default 7), type_weights, include_deprecated
+  - Deprecated items filtered in Cypher before scoring; vector branch over-fetches 2x to compensate
+- Updated `src/memex/retrieval/__init__.py` to re-export HybridResult, MatchSource, SearchMode, DEFAULT_TYPE_WEIGHTS, compute_fused_score, hybrid_search
+- Created `tests/test_hybrid_search.py` with 22 tests across 8 test classes:
+  - `TestComputeFusedScore`: 5 unit tests (max of branches, type weight, zero scores, zero weight, equal scores)
+  - `TestHybridSearch`: 5 integration tests (hybrid finds results, mode field, lexical-only, vector-only, empty returns empty)
+  - `TestFusionScoring`: 3 integration tests (formula correctness, result ordering, both-branch scores)
+  - `TestTypeWeights`: 3 integration tests (default revision weight, custom weight, match source)
+  - `TestMemoryLimit`: 2 integration tests (caps unique items, large limit returns all)
+  - `TestHybridDeprecatedExclusion`: 2 integration tests (excluded by default, included with flag)
+  - `TestMetadataCompleteness`: 2 integration tests (all fields present, serialization round-trip)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 33 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 17 source files
+- `uv run pytest tests/ -v` -- 319 passed (22 new hybrid search tests + 297 existing)
