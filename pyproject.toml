@@ -11,6 +11,7 @@ dependencies = [
     "redis>=5.0,<6",
     "litellm>=1.0",
     "orjson>=3.9",
+    "mcp>=1.0",
 ]
 
 [build-system]

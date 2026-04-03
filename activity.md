@@ -712,3 +712,36 @@
 - `uv run ruff format --check src/ tests/` -- 54 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 30 source files
 - `uv run pytest tests/ -v` -- 521 passed (all existing tests pass with refactored code)
+
+## T25: Implement MCP tools: memory lifecycle, recall, and working memory (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Added `mcp>=1.0` to `pyproject.toml` dependencies (installs mcp 1.27.0 with FastMCP)
+- Created `src/memex/mcp/tools.py` with MCP tool service and server factory:
+  - `IngestToolInput`, `RecallToolInput`, `WorkingMemoryGetInput`, `WorkingMemoryClearInput`: Pydantic input models for each tool
+  - `_serialize_hybrid_result`: Serializes HybridResult to JSON-safe dict with all FR-7 metadata (score breakdown, match_source, search_mode)
+  - `_serialize_message`: Serializes WorkingMemoryMessage with role, content, and timestamp
+  - `MemexToolService`: Injectable service layer with constructor-injected Neo4jStore, AsyncDriver, RedisWorkingMemory, and ConsolidationEventFeed; methods for `ingest()`, `recall()`, `working_memory_get()`, `working_memory_clear()`
+  - `create_mcp_server()`: Factory building a FastMCP server with all tools registered under both repo-local (`memex_*`) and paper-taxonomy (`memory_*`, `working_memory_*`) names
+  - `memex_ingest` / `memory_ingest`: Dual-action tool -- buffers working-memory turn, commits memory unit atomically, returns recall context (FR-13)
+  - `memex_recall` / `memory_recall`: Hybrid retrieval tool with BM25 + vector search, memory_limit, reranking_mode (client/dedicated/auto), optional multi-query reformulation
+  - `memex_working_memory_get` / `working_memory_get`: Retrieves session buffer messages
+  - `memex_working_memory_clear` / `working_memory_clear`: Clears session buffer
+  - 8 tools total (4 capability pairs: repo alias + paper taxonomy canonical name)
+- Updated `src/memex/mcp/__init__.py` to re-export MemexToolService, create_mcp_server, and all input models
+- Created `tests/test_mcp_tools.py` with 27 tests across 8 test classes:
+  - `TestMemexIngest`: 6 tests (basic ingest, recall_context key, recall finds prior items, session buffers turn, custom tags, PII redacted)
+  - `TestMemexRecall`: 6 tests (returns results, metadata fields complete, memory_limit enforced, empty query, reranking_mode pass-through, invalid reranking defaults to auto)
+  - `TestWorkingMemoryGet`: 4 tests (returns messages, empty session, timestamps present, no Redis raises)
+  - `TestWorkingMemoryClear`: 3 tests (removes messages, nonexistent session, no Redis raises)
+  - `TestWorkingMemoryRoundTrip`: 2 tests (ingest then get, ingest-clear-get cycle)
+  - `TestCreateMCPServer`: 3 tests (all 8 tool names registered, tool count, descriptions present)
+  - `TestToolOutputSerialization`: 3 tests (ingest JSON, recall JSON, working memory JSON)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 56 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 31 source files
+- `uv run pytest tests/ -v` -- 548 passed (27 new MCP tool tests + 521 existing)

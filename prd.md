@@ -756,7 +756,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Support repo-local memex_* aliases while aligning capability names to paper taxonomy",
       "Add tests: lifecycle tools produce correct graph state, recall tool returns hybrid results, working-memory tools round-trip"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
