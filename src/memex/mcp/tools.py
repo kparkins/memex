@@ -11,14 +11,16 @@ canonical capability names to the paper's taxonomy.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_type_hints
 
 import orjson
 from pydantic import BaseModel, Field
+from pydantic_core import PydanticUndefined
 
 from memex.domain import Edge, EdgeType, Item, ItemKind, Revision, TagAssignment
 from memex.domain.kref_resolution import (
@@ -1339,6 +1341,294 @@ _TOOL_ALIASES: dict[str, str] = {
 }
 
 
+# -- Tool handler factory ---------------------------------------------------
+
+
+def _make_tool_handler(
+    service: MemexToolService,
+    method_name: str,
+    input_cls: type[BaseModel],
+    tool_name: str,
+    description: str,
+) -> Any:
+    """Create an async MCP tool handler from a service method and Input model.
+
+    Builds an ``inspect.Signature`` from *input_cls* fields so that
+    FastMCP generates the correct JSON schema without hand-written
+    closures.  Fields that use ``default_factory`` are exposed as
+    nullable with ``None`` default; the handler omits ``None`` for
+    those fields so the model applies its factory.
+
+    Args:
+        service: Backing MemexToolService instance.
+        method_name: Service method to delegate to.
+        input_cls: Pydantic input model whose fields define the schema.
+        tool_name: MCP tool name (set as ``__name__``).
+        description: Tool docstring (set as ``__doc__``).
+
+    Returns:
+        Async handler callable with ``__signature__`` set.
+    """
+    factory_fields = frozenset(
+        name
+        for name, info in input_cls.model_fields.items()
+        if info.default_factory is not None
+    )
+
+    async def handler(**kwargs: Any) -> str:
+        if factory_fields:
+            kwargs = {
+                k: v
+                for k, v in kwargs.items()
+                if not (k in factory_fields and v is None)
+            }
+        inp = input_cls(**kwargs)
+        result = await getattr(service, method_name)(inp)
+        return orjson.dumps(result).decode()
+
+    hints = get_type_hints(input_cls)
+    required_params: list[inspect.Parameter] = []
+    optional_params: list[inspect.Parameter] = []
+    for field_name, field_info in input_cls.model_fields.items():
+        annotation = hints[field_name]
+        if field_info.default is not PydanticUndefined:
+            optional_params.append(
+                inspect.Parameter(
+                    field_name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=field_info.default,
+                    annotation=annotation,
+                )
+            )
+        elif field_info.default_factory is not None:
+            optional_params.append(
+                inspect.Parameter(
+                    field_name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=None,
+                    annotation=annotation | None,
+                )
+            )
+        else:
+            required_params.append(
+                inspect.Parameter(
+                    field_name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=annotation,
+                )
+            )
+
+    sig = inspect.Signature(
+        required_params + optional_params,
+        return_annotation=str,
+    )
+    setattr(handler, "__signature__", sig)  # noqa: B010
+    handler.__name__ = tool_name
+    handler.__doc__ = description
+    return handler
+
+
+# -- Declarative tool definitions -------------------------------------------
+# Each entry is (tool_name, input_model_class, service_method_name, description).
+# The loop in ``create_mcp_server`` registers both the primary name and its
+# paper-taxonomy alias from ``_TOOL_ALIASES``.
+
+_TOOL_DEFS: list[tuple[str, type[BaseModel], str, str]] = [
+    (
+        "memex_ingest",
+        IngestToolInput,
+        "ingest",
+        "Ingest a memory unit: buffer turn, commit to graph, "
+        "return recall context.\n\n"
+        "Dual-action tool per FR-13: atomically persists the memory unit,\n"
+        "buffers the working-memory turn, and returns hybrid recall context.",
+    ),
+    (
+        "memex_recall",
+        RecallToolInput,
+        "recall",
+        "Search memory using hybrid BM25 + vector retrieval.\n\n"
+        "Returns ranked results with structured metadata for\n"
+        "client-side sibling reranking per FR-7.",
+    ),
+    (
+        "memex_working_memory_get",
+        WorkingMemoryGetInput,
+        "working_memory_get",
+        "Retrieve messages from a working-memory session buffer.",
+    ),
+    (
+        "memex_working_memory_clear",
+        WorkingMemoryClearInput,
+        "working_memory_clear",
+        "Clear all messages from a working-memory session buffer.",
+    ),
+    (
+        "memex_get_edges",
+        GetEdgesInput,
+        "get_edges",
+        "Query typed edges between revisions with optional filters.\n\n"
+        "Supports filtering by source, target, edge type, and confidence\n"
+        "range. Returns all matching edges with full metadata.",
+    ),
+    (
+        "memex_list_items",
+        ListItemsInput,
+        "list_items",
+        "List items in a space with optional deprecation filter.\n\n"
+        "Returns items ordered by creation time. Deprecated items are\n"
+        "excluded by default per FR-4 contraction semantics.",
+    ),
+    (
+        "memex_get_revisions",
+        GetRevisionsInput,
+        "get_revisions",
+        "Retrieve the full revision history for an item.\n\n"
+        "Returns all revisions ordered by revision number ascending,\n"
+        "with supersession chain annotations. Deprecated items are\n"
+        "excluded by default; set include_deprecated=True for operator\n"
+        "inspection per FR-14.",
+    ),
+    (
+        "memex_resolve_kref",
+        ResolveKrefInput,
+        "kref_resolve",
+        "Resolve a kref:// URI to graph ids and artifact pointer metadata.\n\n"
+        "Walks project name, nested space path, item.kind, optional ?r=N,\n"
+        "optional ?a=artifact. Does not load file bytes; returns location URI.",
+    ),
+    (
+        "memex_provenance",
+        ProvenanceInput,
+        "provenance",
+        "Get the provenance summary for a revision.\n\n"
+        "Returns all edges connected to the revision, separated into\n"
+        "incoming and outgoing for agent-side reasoning about dependency\n"
+        "direction and causal chains.",
+    ),
+    (
+        "memex_dependencies",
+        DependenciesInput,
+        "dependencies",
+        "Traverse transitive dependencies from a revision.\n\n"
+        "Follows outgoing DEPENDS_ON and DERIVED_FROM edges up to the\n"
+        "specified depth (1-20, default 10).",
+    ),
+    (
+        "memex_impact_analysis",
+        ImpactAnalysisInput,
+        "impact_analysis",
+        "Analyze transitive impact of a revision.\n\n"
+        "Finds all revisions that depend on the given revision via\n"
+        "incoming DEPENDS_ON and DERIVED_FROM edges. Depth range 1-20.",
+    ),
+    (
+        "memex_resolve_by_tag",
+        ResolveByTagInput,
+        "resolve_by_tag",
+        "Resolve the revision a named tag currently points to.\n\n"
+        "Follows the live POINTS_TO edge from a tag with the given name\n"
+        "on the specified item.",
+    ),
+    (
+        "memex_resolve_as_of",
+        ResolveAsOfInput,
+        "resolve_as_of",
+        "Resolve the latest revision of an item at or before a timestamp.\n\n"
+        "Accepts an ISO 8601 timestamp string. Returns the most recent\n"
+        "revision created at or before that time.",
+    ),
+    (
+        "memex_resolve_tag_at_time",
+        ResolveTagAtTimeInput,
+        "resolve_tag_at_time",
+        "Resolve what revision a tag pointed to at a historical time.\n\n"
+        "Uses tag-assignment history for point-in-time resolution per FR-5.\n"
+        "Accepts an ISO 8601 timestamp string.",
+    ),
+    (
+        "memex_revise",
+        ReviseItemInput,
+        "revise_item",
+        "Create a new revision on an item with SUPERSEDES edge and tag advance.\n\n"
+        "Atomically creates an immutable revision, links it via SUPERSEDES\n"
+        "to the previous revision, and moves the named tag forward.",
+    ),
+    (
+        "memex_rollback",
+        RollbackTagInput,
+        "rollback_tag",
+        "Roll a tag back to a strictly earlier revision.\n\n"
+        "Validates the target belongs to the same item and has a lower\n"
+        "revision number than the current pointer.",
+    ),
+    (
+        "memex_deprecate",
+        DeprecateItemInput,
+        "deprecate_item",
+        "Deprecate an item, hiding it from default retrieval paths.\n\n"
+        "Sets the deprecation flag and publishes a revision.deprecated\n"
+        "event for Dream State processing.",
+    ),
+    (
+        "memex_undeprecate",
+        UndeprecateItemInput,
+        "undeprecate_item",
+        "Restore an item from deprecation, making it visible again.\n\n"
+        "Clears the deprecation flag so the item appears in default\n"
+        "retrieval paths.",
+    ),
+    (
+        "memex_move_tag",
+        MoveTagInput,
+        "move_tag",
+        "Move a tag to point at a different revision.\n\n"
+        "Updates the tag pointer and records a new TagAssignment\n"
+        "in the history for point-in-time resolution.",
+    ),
+    (
+        "memex_create_edge",
+        CreateEdgeInput,
+        "create_edge",
+        "Create a typed edge between two revisions.\n\n"
+        "Supports all edge types: SUPERSEDES, DEPENDS_ON, DERIVED_FROM,\n"
+        "REFERENCES, RELATED_TO, SUPPORTS, CONTRADICTS, BUNDLES.",
+    ),
+    (
+        "memex_dream_state",
+        DreamStateInvokeInput,
+        "invoke_dream_state",
+        "Trigger the Dream State consolidation pipeline.\n\n"
+        "Runs event collection, LLM assessment, circuit-breaker checks,\n"
+        "action execution (unless dry_run), and persists an audit report.",
+    ),
+    (
+        "memex_rerank",
+        RerankInput,
+        "rerank",
+        "Rerank previously retrieved memory results.\n\n"
+        "Modes: client (pass-through with metadata), dedicated\n"
+        "(server-side score sort), auto (picks best strategy).",
+    ),
+    (
+        "memex_get_audit_report",
+        GetAuditReportInput,
+        "get_audit_report",
+        "Retrieve a Dream State audit report by ID.\n\n"
+        "Enables operator inspection of consolidation decisions,\n"
+        "circuit-breaker outcomes, and action results per FR-14.",
+    ),
+    (
+        "memex_list_audit_reports",
+        ListAuditReportsInput,
+        "list_audit_reports",
+        "List Dream State audit reports for a project.\n\n"
+        "Returns reports newest first. Enables operator review of\n"
+        "consolidation history per FR-14.",
+    ),
+]
+
+
 # -- MCP server factory ----------------------------------------------------
 
 
@@ -1352,7 +1642,7 @@ def create_mcp_server(
 
     Creates a :class:`MemexToolService` with injected dependencies and
     registers each tool under both the repo-local ``memex_*`` alias and
-    the paper-taxonomy canonical name.
+    the paper-taxonomy canonical name via declarative ``_TOOL_DEFS``.
 
     Args:
         neo4j_driver: Async Neo4j driver.
@@ -1392,442 +1682,13 @@ def create_mcp_server(
 
     mcp = FastMCP("Memex")
 
-    # -- Memory lifecycle: ingest (dual-action) ----------------------------
-
-    @mcp.tool(name="memex_ingest")
-    async def memex_ingest(
-        project_id: str,
-        space_name: str,
-        item_name: str,
-        item_kind: str,
-        content: str,
-        search_text: str | None = None,
-        tag_names: list[str] | None = None,
-        session_id: str | None = None,
-        message_role: str = "user",
-        bundle_item_id: str | None = None,
-    ) -> str:
-        """Ingest a memory unit: buffer turn, commit to graph, return recall context.
-
-        Dual-action tool per FR-13: atomically persists the memory unit,
-        buffers the working-memory turn, and returns hybrid recall context.
-        """
-        inp = IngestToolInput(
-            project_id=project_id,
-            space_name=space_name,
-            item_name=item_name,
-            item_kind=item_kind,
-            content=content,
-            search_text=search_text,
-            tag_names=tag_names or ["active"],
-            session_id=session_id,
-            message_role=message_role,
-            bundle_item_id=bundle_item_id,
+    for tool_name, input_cls, method_name, description in _TOOL_DEFS:
+        handler = _make_tool_handler(
+            service, method_name, input_cls, tool_name, description
         )
-        result = await service.ingest(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Recall: hybrid retrieval ------------------------------------------
-
-    @mcp.tool(name="memex_recall")
-    async def memex_recall(
-        query: str,
-        project_id: str | None = None,
-        memory_limit: int = 3,
-        context_top_k: int = 7,
-        include_deprecated: bool = False,
-        multi_query: bool = False,
-        reranking_mode: str = "auto",
-    ) -> str:
-        """Search memory using hybrid BM25 + vector retrieval.
-
-        Returns ranked results with structured metadata for
-        client-side sibling reranking per FR-7.
-        """
-        inp = RecallToolInput(
-            query=query,
-            project_id=project_id,
-            memory_limit=memory_limit,
-            context_top_k=context_top_k,
-            include_deprecated=include_deprecated,
-            multi_query=multi_query,
-            reranking_mode=reranking_mode,
-        )
-        result = await service.recall(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Working memory: get and clear -------------------------------------
-
-    @mcp.tool(name="memex_working_memory_get")
-    async def memex_working_memory_get(
-        project_id: str,
-        session_id: str,
-    ) -> str:
-        """Retrieve messages from a working-memory session buffer."""
-        inp = WorkingMemoryGetInput(
-            project_id=project_id,
-            session_id=session_id,
-        )
-        result = await service.working_memory_get(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_working_memory_clear")
-    async def memex_working_memory_clear(
-        project_id: str,
-        session_id: str,
-    ) -> str:
-        """Clear all messages from a working-memory session buffer."""
-        inp = WorkingMemoryClearInput(
-            project_id=project_id,
-            session_id=session_id,
-        )
-        result = await service.working_memory_clear(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Graph navigation: edges, items, revisions -------------------------
-
-    @mcp.tool(name="memex_get_edges")
-    async def memex_get_edges(
-        source_revision_id: str | None = None,
-        target_revision_id: str | None = None,
-        edge_type: str | None = None,
-        min_confidence: float | None = None,
-        max_confidence: float | None = None,
-    ) -> str:
-        """Query typed edges between revisions with optional filters.
-
-        Supports filtering by source, target, edge type, and confidence
-        range. Returns all matching edges with full metadata.
-        """
-        inp = GetEdgesInput(
-            source_revision_id=source_revision_id,
-            target_revision_id=target_revision_id,
-            edge_type=edge_type,
-            min_confidence=min_confidence,
-            max_confidence=max_confidence,
-        )
-        result = await service.get_edges(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_list_items")
-    async def memex_list_items(
-        space_id: str,
-        include_deprecated: bool = False,
-    ) -> str:
-        """List items in a space with optional deprecation filter.
-
-        Returns items ordered by creation time. Deprecated items are
-        excluded by default per FR-4 contraction semantics.
-        """
-        inp = ListItemsInput(
-            space_id=space_id,
-            include_deprecated=include_deprecated,
-        )
-        result = await service.list_items(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_get_revisions")
-    async def memex_get_revisions(
-        item_id: str,
-        include_deprecated: bool = False,
-    ) -> str:
-        """Retrieve the full revision history for an item.
-
-        Returns all revisions ordered by revision number ascending,
-        with supersession chain annotations. Deprecated items are
-        excluded by default; set include_deprecated=True for operator
-        inspection per FR-14.
-        """
-        inp = GetRevisionsInput(
-            item_id=item_id,
-            include_deprecated=include_deprecated,
-        )
-        result = await service.get_revisions(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Kref resolution -----------------------------------------------------
-
-    @mcp.tool(name="memex_resolve_kref")
-    async def memex_resolve_kref(
-        uri: str,
-        tag_name: str = DEFAULT_KREF_TAG_NAME,
-        include_deprecated: bool = False,
-    ) -> str:
-        """Resolve a kref:// URI to graph ids and artifact pointer metadata.
-
-        Walks project name, nested space path, item.kind, optional ?r=N,
-        optional ?a=artifact. Does not load file bytes; returns location URI.
-        """
-        inp = ResolveKrefInput(
-            uri=uri,
-            tag_name=tag_name,
-            include_deprecated=include_deprecated,
-        )
-        result = await service.kref_resolve(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Provenance and impact analysis ------------------------------------
-
-    @mcp.tool(name="memex_provenance")
-    async def memex_provenance(revision_id: str) -> str:
-        """Get the provenance summary for a revision.
-
-        Returns all edges connected to the revision, separated into
-        incoming and outgoing for agent-side reasoning about dependency
-        direction and causal chains.
-        """
-        inp = ProvenanceInput(revision_id=revision_id)
-        result = await service.provenance(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_dependencies")
-    async def memex_dependencies(
-        revision_id: str,
-        depth: int = 10,
-    ) -> str:
-        """Traverse transitive dependencies from a revision.
-
-        Follows outgoing DEPENDS_ON and DERIVED_FROM edges up to the
-        specified depth (1-20, default 10).
-        """
-        inp = DependenciesInput(revision_id=revision_id, depth=depth)
-        result = await service.dependencies(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_impact_analysis")
-    async def memex_impact_analysis(
-        revision_id: str,
-        depth: int = 10,
-    ) -> str:
-        """Analyze transitive impact of a revision.
-
-        Finds all revisions that depend on the given revision via
-        incoming DEPENDS_ON and DERIVED_FROM edges. Depth range 1-20.
-        """
-        inp = ImpactAnalysisInput(revision_id=revision_id, depth=depth)
-        result = await service.impact_analysis(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Temporal resolution -----------------------------------------------
-
-    @mcp.tool(name="memex_resolve_by_tag")
-    async def memex_resolve_by_tag(
-        item_id: str,
-        tag_name: str,
-    ) -> str:
-        """Resolve the revision a named tag currently points to.
-
-        Follows the live POINTS_TO edge from a tag with the given name
-        on the specified item.
-        """
-        inp = ResolveByTagInput(item_id=item_id, tag_name=tag_name)
-        result = await service.resolve_by_tag(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_resolve_as_of")
-    async def memex_resolve_as_of(
-        item_id: str,
-        timestamp: str,
-    ) -> str:
-        """Resolve the latest revision of an item at or before a timestamp.
-
-        Accepts an ISO 8601 timestamp string. Returns the most recent
-        revision created at or before that time.
-        """
-        inp = ResolveAsOfInput(item_id=item_id, timestamp=timestamp)
-        result = await service.resolve_as_of(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_resolve_tag_at_time")
-    async def memex_resolve_tag_at_time(
-        tag_id: str,
-        timestamp: str,
-    ) -> str:
-        """Resolve what revision a tag pointed to at a historical time.
-
-        Uses tag-assignment history for point-in-time resolution per FR-5.
-        Accepts an ISO 8601 timestamp string.
-        """
-        inp = ResolveTagAtTimeInput(tag_id=tag_id, timestamp=timestamp)
-        result = await service.resolve_tag_at_time(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Graph mutation: revise, rollback, deprecate, tag, edge ---------------
-
-    @mcp.tool(name="memex_revise")
-    async def memex_revise(
-        item_id: str,
-        content: str,
-        search_text: str | None = None,
-        tag_name: str = "active",
-    ) -> str:
-        """Create a new revision on an item with SUPERSEDES edge and tag advance.
-
-        Atomically creates an immutable revision, links it via SUPERSEDES
-        to the previous revision, and moves the named tag forward.
-        """
-        inp = ReviseItemInput(
-            item_id=item_id,
-            content=content,
-            search_text=search_text,
-            tag_name=tag_name,
-        )
-        result = await service.revise_item(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_rollback")
-    async def memex_rollback(
-        tag_id: str,
-        target_revision_id: str,
-    ) -> str:
-        """Roll a tag back to a strictly earlier revision.
-
-        Validates the target belongs to the same item and has a lower
-        revision number than the current pointer.
-        """
-        inp = RollbackTagInput(
-            tag_id=tag_id,
-            target_revision_id=target_revision_id,
-        )
-        result = await service.rollback_tag(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_deprecate")
-    async def memex_deprecate(item_id: str) -> str:
-        """Deprecate an item, hiding it from default retrieval paths.
-
-        Sets the deprecation flag and publishes a revision.deprecated
-        event for Dream State processing.
-        """
-        inp = DeprecateItemInput(item_id=item_id)
-        result = await service.deprecate_item(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_undeprecate")
-    async def memex_undeprecate(item_id: str) -> str:
-        """Restore an item from deprecation, making it visible again.
-
-        Clears the deprecation flag so the item appears in default
-        retrieval paths.
-        """
-        inp = UndeprecateItemInput(item_id=item_id)
-        result = await service.undeprecate_item(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_move_tag")
-    async def memex_move_tag(
-        tag_id: str,
-        new_revision_id: str,
-    ) -> str:
-        """Move a tag to point at a different revision.
-
-        Updates the tag pointer and records a new TagAssignment
-        in the history for point-in-time resolution.
-        """
-        inp = MoveTagInput(
-            tag_id=tag_id,
-            new_revision_id=new_revision_id,
-        )
-        result = await service.move_tag(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_create_edge")
-    async def memex_create_edge(
-        source_revision_id: str,
-        target_revision_id: str,
-        edge_type: str,
-        confidence: float | None = None,
-        reason: str | None = None,
-        context: str | None = None,
-    ) -> str:
-        """Create a typed edge between two revisions.
-
-        Supports all edge types: SUPERSEDES, DEPENDS_ON, DERIVED_FROM,
-        REFERENCES, RELATED_TO, SUPPORTS, CONTRADICTS, BUNDLES.
-        """
-        inp = CreateEdgeInput(
-            source_revision_id=source_revision_id,
-            target_revision_id=target_revision_id,
-            edge_type=edge_type,
-            confidence=confidence,
-            reason=reason,
-            context=context,
-        )
-        result = await service.create_edge(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Dream State invocation -----------------------------------------------
-
-    @mcp.tool(name="memex_dream_state")
-    async def memex_dream_state(
-        project_id: str,
-        dry_run: bool = False,
-        model: str | None = None,
-    ) -> str:
-        """Trigger the Dream State consolidation pipeline.
-
-        Runs event collection, LLM assessment, circuit-breaker checks,
-        action execution (unless dry_run), and persists an audit report.
-        """
-        inp = DreamStateInvokeInput(
-            project_id=project_id,
-            dry_run=dry_run,
-            model=model,
-        )
-        result = await service.invoke_dream_state(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Reranking support ----------------------------------------------------
-
-    @mcp.tool(name="memex_rerank")
-    async def memex_rerank(
-        query: str,
-        results: list[dict[str, Any]] | None = None,
-        mode: str = "auto",
-    ) -> str:
-        """Rerank previously retrieved memory results.
-
-        Modes: client (pass-through with metadata), dedicated
-        (server-side score sort), auto (picks best strategy).
-        """
-        inp = RerankInput(
-            results=results or [],
-            query=query,
-            mode=mode,
-        )
-        result = await service.rerank(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Operator access: audit reports ----------------------------------------
-
-    @mcp.tool(name="memex_get_audit_report")
-    async def memex_get_audit_report(report_id: str) -> str:
-        """Retrieve a Dream State audit report by ID.
-
-        Enables operator inspection of consolidation decisions,
-        circuit-breaker outcomes, and action results per FR-14.
-        """
-        inp = GetAuditReportInput(report_id=report_id)
-        result = await service.get_audit_report(inp)
-        return orjson.dumps(result).decode()
-
-    @mcp.tool(name="memex_list_audit_reports")
-    async def memex_list_audit_reports(
-        project_id: str,
-        limit: int = 50,
-    ) -> str:
-        """List Dream State audit reports for a project.
-
-        Returns reports newest first. Enables operator review of
-        consolidation history per FR-14.
-        """
-        inp = ListAuditReportsInput(project_id=project_id, limit=limit)
-        result = await service.list_audit_reports(inp)
-        return orjson.dumps(result).decode()
-
-    # -- Register paper-taxonomy aliases via declarative mapping ---------------
-    scope = locals()
-    for primary_name, alias_name in _TOOL_ALIASES.items():
-        mcp.add_tool(scope[primary_name], name=alias_name)
+        mcp.add_tool(handler, name=tool_name)
+        alias = _TOOL_ALIASES.get(tool_name)
+        if alias:
+            mcp.add_tool(handler, name=alias)
 
     return mcp

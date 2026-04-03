@@ -1003,3 +1003,28 @@
 - `uv run ruff format --check src/memex/mcp/` -- 2 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 39 source files
 - `uv run pytest tests/ -v` -- 711 passed, 5 pre-existing failures unchanged (3 previously-failing tool count assertions now pass)
+
+## T34: Replace hand-written MCP tool closures with declarative tool registry (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Added `_make_tool_handler` factory function in `src/memex/mcp/tools.py` that creates async MCP tool handlers from a service method name and Pydantic Input model class
+  - Builds `inspect.Signature` from input model fields so FastMCP generates correct JSON schema
+  - Fields with `default_factory` exposed as nullable with `None` default; handler omits `None` so model applies its factory
+  - Required parameters sorted before optional parameters in the signature
+  - Sets `__signature__`, `__name__`, `__doc__` on generated handler
+- Defined `_TOOL_DEFS` list mapping all 24 tools as `(tool_name, input_model_class, service_method_name, description)` tuples
+- Replaced all 24 hand-written primary closures in `create_mcp_server` with a 7-line loop over `_TOOL_DEFS` that calls `_make_tool_handler` and registers both primary and alias via `_TOOL_ALIASES`
+- Added imports: `inspect`, `get_type_hints` from typing, `PydanticUndefined` from pydantic_core
+- Net reduction: ~430 lines of hand-written closure code replaced by declarative registry + factory
+- Tool count remains at 48 (24 primaries + 24 aliases)
+
+**Verification**:
+- `uv run ruff check src/memex/mcp/tools.py` -- All checks passed
+- `uv run ruff format --check src/memex/mcp/tools.py` -- 1 file already formatted
+- `uv run mypy src/` -- Success: no issues found in 39 source files
+- `uv run pytest tests/ -v` -- 711 passed, 5 pre-existing failures unchanged
+- Tool count test (test_tool_count) passes: 48 tools registered
+- include_deprecated schema test (test_get_revisions_accepts_include_deprecated) passes
+- All 120 MCP-specific tests pass across 4 test files
