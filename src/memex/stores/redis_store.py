@@ -385,3 +385,71 @@ class ConsolidationEventFeed:
             cursor="0-0",
             event_type=event_type,
         )
+
+
+# ---------------------------------------------------------------------------
+# Dream State cursor persistence
+# ---------------------------------------------------------------------------
+
+_CURSOR_INITIAL = "0-0"
+
+
+class DreamStateCursor:
+    """Persists Dream State cursor position in Redis.
+
+    The cursor tracks the last-processed Redis Stream entry ID so the
+    Dream State pipeline can resume incrementally after interruption.
+
+    Args:
+        client: Async Redis client connection.
+    """
+
+    _KEY_PREFIX = "memex:dream:cursor"
+
+    def __init__(self, client: aioredis.Redis) -> None:
+        self._client = client
+
+    def _key(self, project_id: str) -> str:
+        """Build the Redis key for a project's cursor.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            Namespaced Redis key string.
+        """
+        return f"{self._KEY_PREFIX}:{project_id}"
+
+    async def save(self, project_id: str, cursor_id: str) -> None:
+        """Persist cursor position after successful processing.
+
+        Args:
+            project_id: Project identifier.
+            cursor_id: Redis Stream entry ID to persist.
+        """
+        await self._client.set(self._key(project_id), cursor_id)
+
+    async def load(self, project_id: str) -> str:
+        """Load the persisted cursor position.
+
+        Returns ``"0-0"`` (stream beginning) when no cursor has been
+        saved, allowing a fresh pipeline run to process all events.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            Last-persisted stream ID, or ``"0-0"`` if unset.
+        """
+        val = await self._client.get(self._key(project_id))
+        if val is None:
+            return _CURSOR_INITIAL
+        return val.decode() if isinstance(val, bytes) else str(val)
+
+    async def clear(self, project_id: str) -> None:
+        """Reset cursor to the beginning of the stream.
+
+        Args:
+            project_id: Project identifier.
+        """
+        await self._client.delete(self._key(project_id))

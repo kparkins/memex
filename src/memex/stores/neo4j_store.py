@@ -1384,6 +1384,32 @@ class Neo4jStore:
                 async for rec in result
             ]
 
+    async def get_bundle_memberships(self, item_id: str) -> list[str]:
+        """Return bundle item IDs that the given item belongs to.
+
+        Follows outgoing ``BUNDLES`` edges from any revision of the
+        item to discover which bundles contain it.
+
+        Args:
+            item_id: ID of the item to inspect.
+
+        Returns:
+            Deduplicated list of bundle item IDs.
+        """
+        query = (
+            f"MATCH (:{NodeLabel.ITEM} {{id: $iid}})"
+            f"<-[:{RelType.REVISION_OF}]-"
+            f"(rev:{NodeLabel.REVISION})"
+            f"-[:{RelType.BUNDLES}]->"
+            f"(brev:{NodeLabel.REVISION})"
+            f"-[:{RelType.REVISION_OF}]->"
+            f"(bi:{NodeLabel.ITEM}) "
+            f"RETURN DISTINCT bi.id AS bundle_id"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, iid=item_id)
+            return [str(rec["bundle_id"]) async for rec in result]
+
     # -- Provenance and impact analysis ------------------------------------
 
     async def get_provenance_summary(self, revision_id: str) -> list[Edge]:

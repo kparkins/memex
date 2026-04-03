@@ -1,9 +1,20 @@
 """Orchestration: ingest, Dream State, and async enrichment."""
 
+from memex.orchestration.dream_collector import (
+    CollectedRevision,
+    DreamStateCollector,
+    DreamStateEventBatch,
+)
 from memex.orchestration.enrichment import (
     EnrichmentResult,
     enrich_revision,
     schedule_enrichment,
+)
+from memex.orchestration.events import (
+    publish_after_ingest,
+    publish_edge_created,
+    publish_revision_created,
+    publish_revision_deprecated,
 )
 from memex.orchestration.ingest import (
     ArtifactSpec,
@@ -21,7 +32,10 @@ from memex.orchestration.privacy import (
 
 __all__ = [
     "ArtifactSpec",
+    "CollectedRevision",
     "CredentialViolationError",
+    "DreamStateCollector",
+    "DreamStateEventBatch",
     "EdgeSpec",
     "EnrichmentResult",
     "IngestParams",
@@ -29,6 +43,10 @@ __all__ = [
     "apply_privacy_hooks",
     "enrich_revision",
     "memory_ingest",
+    "publish_after_ingest",
+    "publish_edge_created",
+    "publish_revision_created",
+    "publish_revision_deprecated",
     "redact_pii",
     "reject_credentials",
     "schedule_enrichment",

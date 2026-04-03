@@ -25,10 +25,11 @@ from memex.domain import (
     Tag,
     TagAssignment,
 )
+from memex.orchestration.events import publish_after_ingest
 from memex.orchestration.privacy import apply_privacy_hooks
 from memex.retrieval.hybrid import HybridResult, MatchSource, hybrid_search
 from memex.stores.neo4j_store import Neo4jStore
-from memex.stores.redis_store import RedisWorkingMemory
+from memex.stores.redis_store import ConsolidationEventFeed, RedisWorkingMemory
 
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
@@ -140,6 +141,7 @@ async def memory_ingest(
     *,
     privacy: PrivacySettings | None = None,
     retrieval: RetrievalSettings | None = None,
+    event_feed: ConsolidationEventFeed | None = None,
     database: str = "neo4j",
 ) -> IngestResult:
     """Execute the atomic memory ingest operation.
@@ -150,8 +152,9 @@ async def memory_ingest(
     2. Resolve or create the target space.
     3. Create item, revision, tags, artifacts, edges, and bundle
        membership atomically in one Neo4j transaction.
-    4. Buffer the working-memory turn in Redis.
-    5. Return immediate recall context via hybrid retrieval.
+    4. Publish Dream State events (only after successful commit).
+    5. Buffer the working-memory turn in Redis.
+    6. Return immediate recall context via hybrid retrieval.
 
     Args:
         neo4j_driver: Neo4j async driver instance.
@@ -160,6 +163,8 @@ async def memory_ingest(
         params: Ingest parameters.
         privacy: Privacy hook settings.
         retrieval: Retrieval tuning for recall context.
+        event_feed: Consolidation event feed for Dream State
+            publication. ``None`` skips event publication.
         database: Neo4j database name.
 
     Returns:
@@ -248,7 +253,17 @@ async def memory_ingest(
     if bundle_edge is not None:
         edges = [*edges, bundle_edge]
 
-    # 5. Buffer working-memory turn
+    # 5. Publish Dream State events (post-commit only)
+    if event_feed is not None:
+        try:
+            await publish_after_ingest(event_feed, params.project_id, revision, edges)
+        except Exception:
+            logger.warning(
+                "Dream State event publication failed; "
+                "ingest succeeded but events were not published",
+            )
+
+    # 6. Buffer working-memory turn
     if params.session_id is not None and redis_client is not None:
         wm = RedisWorkingMemory(redis_client)
         await wm.add_message(
@@ -258,7 +273,7 @@ async def memory_ingest(
             content=sanitized_content,
         )
 
-    # 6. Recall context via hybrid retrieval
+    # 7. Recall context via hybrid retrieval
     recall_context: list[HybridResult] = []
     try:
         recall_context = await hybrid_search(

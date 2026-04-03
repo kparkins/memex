@@ -501,3 +501,48 @@
 - `uv run ruff format --check src/ tests/` -- 42 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 22 source files
 - `uv run pytest tests/ -v` -- 417 passed (26 new enrichment tests + 391 existing)
+
+## T20: Implement post-commit Dream State event publication and cursor management (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/stores/redis_store.py` with `DreamStateCursor` class:
+  - `save(project_id, cursor_id)`: Persist cursor position in Redis
+  - `load(project_id) -> str`: Load cursor, returns `"0-0"` when unset
+  - `clear(project_id)`: Reset cursor to stream beginning
+  - Key format: `memex:dream:cursor:{project_id}`
+- Extended `src/memex/stores/neo4j_store.py` with `get_bundle_memberships(item_id) -> list[str]`:
+  - Traverses `REVISION_OF -> BUNDLES -> REVISION_OF` to find bundle items containing the given item
+- Created `src/memex/orchestration/events.py` with post-commit event publication:
+  - `publish_revision_created`: Publishes `revision.created` with revision_id and item_id
+  - `publish_edge_created`: Publishes `edge.created` with edge_id, source/target revision IDs, edge_type
+  - `publish_revision_deprecated`: Publishes `revision.deprecated` with item_id
+  - `publish_after_ingest`: Convenience helper publishing revision.created + edge.created for all edges
+  - All functions only called after successful Neo4j commit; failed writes never reach publication
+- Created `src/memex/orchestration/dream_collector.py` with cursor-driven event collection:
+  - `CollectedRevision` (frozen): Revision with bundle_item_ids for context
+  - `DreamStateEventBatch` (frozen): Events, revision map, and cursor for commit
+  - `DreamStateCollector`: Coordinates Redis feed/cursor with Neo4j revision/bundle lookups
+    - `collect(project_id, count=None)`: Load cursor, read events, fetch revisions + bundle context
+    - `commit_cursor(project_id, cursor)`: Persist cursor after successful processing
+    - `reset_cursor(project_id)`: Reset to stream beginning
+- Modified `src/memex/orchestration/ingest.py`:
+  - Added optional `event_feed: ConsolidationEventFeed | None` parameter to `memory_ingest`
+  - Publishes events after successful atomic graph write (step 5), before working-memory buffering
+  - Event publication failure is logged but does not fail the ingest
+- Updated `src/memex/orchestration/__init__.py` to re-export all new types and functions
+- Created `tests/test_dream_state_events.py` with 23 tests across 7 test classes:
+  - `TestPostCommitPublication`: 5 tests (revision.created, edge.created, revision.deprecated, ingest publishes events, ingest publishes bundle edge event)
+  - `TestNoEventOnRollback`: 2 tests (credential rejection publishes no events, no-feed skips publication)
+  - `TestCursorPersistence`: 4 tests (initial cursor, save/load, clear resets, project isolation)
+  - `TestEventCollectionSinceCursor`: 5 tests (collect all, collect after cursor commit, count limit, empty stream, fetches affected revisions)
+  - `TestBundleContextInspection`: 2 tests (revision with bundle context, revision without bundle)
+  - `TestCursorResume`: 3 tests (resume processes remaining, reset reprocesses all, no-commit reprocesses)
+  - `TestEventTypeCoverage`: 2 tests (all three event types in feed, publish_after_ingest helper)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 45 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 24 source files
+- `uv run pytest tests/ -v` -- 440 passed (23 new Dream State event tests + 417 existing)

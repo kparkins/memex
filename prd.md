@@ -692,7 +692,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Support cursor-based resume after interruption",
       "Add tests: post-commit event publication, no event on rollback, cursor persistence and reload, event collection since cursor, resume after simulated failure"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
