@@ -634,7 +634,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Deduplicate and merge results across variants",
       "Add tests: variant generation, deduplication, merged result correctness"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

@@ -383,3 +383,26 @@
 - `uv run ruff format --check src/ tests/` -- 33 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 17 source files
 - `uv run pytest tests/ -v` -- 319 passed (22 new hybrid search tests + 297 existing)
+
+## T16: Add optional multi-query reformulation for recall-heavy flows (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/retrieval/multi_query.py` with multi-query reformulation module:
+  - `generate_query_variants`: Generates 3-4 semantic query variants via litellm `acompletion`, with configurable model, max 4 variants cap, blank-line filtering, and RuntimeError wrapping on failure
+  - `_deduplicate_results`: Merges results across query variant batches, keeping the highest-scoring HybridResult per revision ID
+  - `_apply_memory_limit`: Sorts merged candidates by score descending and enforces memory_limit on unique items
+  - `multi_query_search`: Main entry point -- generates variants, runs original + variants through `hybrid_search` in parallel via `asyncio.gather`, deduplicates, and applies memory_limit
+- Updated `src/memex/retrieval/__init__.py` to re-export `generate_query_variants` and `multi_query_search`
+- Created `tests/test_multi_query.py` with 17 tests across 5 test classes:
+  - `TestGenerateQueryVariants`: 5 unit tests (variant generation, max cap at 4, blank-line filtering, custom model forwarding, RuntimeError on failure)
+  - `TestDeduplicateResults`: 4 unit tests (highest score wins, empty batches, single batch pass-through, disjoint batches union)
+  - `TestApplyMemoryLimit`: 3 unit tests (unique item cap, descending sort, empty candidates)
+  - `TestMultiQuerySearch`: 5 integration tests (merged results, deduplication across variants, memory_limit enforcement, score ordering, variant broadens recall)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 35 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 18 source files
+- `uv run pytest tests/ -v` -- 336 passed (17 new multi-query tests + 319 existing)

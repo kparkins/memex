@@ -1,4 +1,4 @@
-"""Hybrid retrieval: BM25, vector, and graph navigation."""
+"""Hybrid retrieval: BM25, vector, graph navigation, and multi-query."""
 
 from memex.retrieval.bm25 import (
     BM25Result,
@@ -13,6 +13,10 @@ from memex.retrieval.hybrid import (
     SearchMode,
     compute_fused_score,
     hybrid_search,
+)
+from memex.retrieval.multi_query import (
+    generate_query_variants,
+    multi_query_search,
 )
 from memex.retrieval.vector import (
     VectorResult,
@@ -31,7 +35,9 @@ __all__ = [
     "build_search_query",
     "compute_fused_score",
     "generate_embedding",
+    "generate_query_variants",
     "hybrid_search",
+    "multi_query_search",
     "sanitize_query",
     "vector_search",
 ]
