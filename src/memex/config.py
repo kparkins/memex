@@ -73,12 +73,25 @@ class EnrichmentSettings(BaseSettings):
 
 
 class DreamStateSettings(BaseSettings):
-    """Dream State consolidation settings."""
+    """Dream State consolidation settings.
+
+    Args:
+        batch_size: Max revisions per LLM assessment batch.
+        max_deprecation_ratio: Circuit-breaker threshold (0.1-0.9).
+        schedule_interval_seconds: Interval for scheduled trigger mode.
+        idle_timeout_seconds: Inactivity window for idle trigger mode.
+        event_threshold: Pending event count for threshold trigger mode.
+        poll_interval_seconds: Polling frequency for idle/threshold loops.
+    """
 
     model_config = SettingsConfigDict(env_prefix="MEMEX_DREAM_")
 
     batch_size: int = 20
     max_deprecation_ratio: float = Field(default=0.5, ge=0.1, le=0.9)
+    schedule_interval_seconds: float = 300.0
+    idle_timeout_seconds: float = 60.0
+    event_threshold: int = 50
+    poll_interval_seconds: float = 2.0
 
 
 class PrivacySettings(BaseSettings):

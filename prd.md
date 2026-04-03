@@ -732,7 +732,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Support memory-count or queue-threshold execution",
       "Add tests: each trigger mode fires the Dream State pipeline correctly"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "T24",

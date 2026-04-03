@@ -16,6 +16,14 @@ from memex.orchestration.dream_pipeline import (
     apply_circuit_breaker,
     compute_deprecation_ratio,
 )
+from memex.orchestration.dream_triggers import (
+    DreamStateTrigger,
+    ExplicitTrigger,
+    IdleTrigger,
+    ScheduledTrigger,
+    ThresholdTrigger,
+    TriggerMode,
+)
 from memex.orchestration.enrichment import (
     EnrichmentResult,
     enrich_revision,
@@ -51,9 +59,12 @@ __all__ = [
     "DreamStateEventBatch",
     "DreamStateExecutor",
     "DreamStatePipeline",
+    "DreamStateTrigger",
     "EdgeSpec",
     "EnrichmentResult",
     "ExecutionReport",
+    "ExplicitTrigger",
+    "IdleTrigger",
     "IngestParams",
     "IngestResult",
     "apply_circuit_breaker",
@@ -67,5 +78,8 @@ __all__ = [
     "publish_revision_deprecated",
     "redact_pii",
     "reject_credentials",
+    "ScheduledTrigger",
+    "ThresholdTrigger",
+    "TriggerMode",
     "schedule_enrichment",
 ]

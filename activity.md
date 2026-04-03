@@ -624,3 +624,35 @@
 - `uv run ruff format --check src/ tests/` -- 50 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 27 source files
 - `uv run pytest tests/ -v` -- 495 passed (24 new safety guard tests + 471 existing)
+
+## T23: Implement Dream State trigger modes (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/config.py` DreamStateSettings with 4 new trigger-related fields:
+  - `schedule_interval_seconds` (default 300.0): Interval for scheduled trigger mode
+  - `idle_timeout_seconds` (default 60.0): Inactivity window for idle trigger mode
+  - `event_threshold` (default 50): Pending event count for threshold trigger mode
+  - `poll_interval_seconds` (default 2.0): Polling frequency for idle/threshold loops
+- Created `src/memex/orchestration/dream_triggers.py` with Strategy pattern trigger architecture:
+  - `TriggerMode` (StrEnum): explicit, scheduled, idle, threshold (FR-10 modes)
+  - `DreamStateTrigger` (ABC): Base class with `fire()` for manual invocation (lock-protected), abstract `start()`/`stop()` lifecycle
+  - `ExplicitTrigger`: No background loop; fires only via direct `fire()` invocation (API/MCP)
+  - `_BackgroundTrigger` (ABC): Intermediate base managing asyncio task lifecycle (create/cancel), abstract `_loop()` for subclass polling strategy
+  - `ScheduledTrigger`: Sleeps for `schedule_interval_seconds` then fires pipeline, repeat; errors logged without crashing loop
+  - `IdleTrigger`: Polls event feed at `poll_interval_seconds`; fires when pending events exist and most recent event timestamp exceeds `idle_timeout_seconds`
+  - `ThresholdTrigger`: Polls event feed at `poll_interval_seconds`; fires when pending event count >= `event_threshold`
+- Updated `src/memex/orchestration/__init__.py` to re-export DreamStateTrigger, ExplicitTrigger, IdleTrigger, ScheduledTrigger, ThresholdTrigger, TriggerMode
+- Created `tests/test_dream_triggers.py` with 26 tests across 6 test classes:
+  - `TestTriggerMode`: 5 tests (enum values, mode count)
+  - `TestExplicitTrigger`: 4 tests (fire invokes pipeline, dry-run forwarding, start/stop toggle, no background task)
+  - `TestScheduledTrigger`: 6 tests (fires after interval, stops cleanly, no fire after stop, start idempotent, error resilience, manual fire during loop)
+  - `TestIdleTrigger`: 6 tests (fires on idle timeout, no fire without events, no fire for recent events, latest timestamp selection, manual fire, error resilience)
+  - `TestThresholdTrigger`: 5 tests (fires at threshold, fires above threshold, no fire below threshold, manual fire, error resilience)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 52 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 28 source files
+- `uv run pytest tests/ -v` -- 521 passed (26 new trigger tests + 495 existing)
