@@ -646,7 +646,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Implement credential-pattern rejection before summarization or indexing",
       "Add tests: PII patterns detected and redacted, credentials rejected, clean content passes through unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

@@ -406,3 +406,34 @@
 - `uv run ruff format --check src/ tests/` -- 35 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 18 source files
 - `uv run pytest tests/ -v` -- 336 passed (17 new multi-query tests + 319 existing)
+
+## T17: Implement PII redaction and credential rejection hooks (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/orchestration/privacy.py` with privacy enforcement hooks:
+  - `redact_pii`: Regex-based PII detection and replacement with bracketed markers for emails (`[EMAIL_REDACTED]`), SSNs (`[SSN_REDACTED]`), US phone numbers (`[PHONE_REDACTED]`), and credit card numbers (`[CREDIT_CARD_REDACTED]`)
+  - `reject_credentials`: Pattern-based credential detection raising `CredentialViolationError` for AWS access keys, PEM private keys, GitHub tokens, generic key=value secrets (api_key, password, secret, etc.), and Bearer tokens (20+ char values)
+  - `apply_privacy_hooks`: Combined hook running credential rejection first (so secrets are never partially redacted and allowed through), then PII redaction; both independently toggleable
+  - `CredentialViolationError`: Custom exception for credential pattern matches
+- Updated `src/memex/orchestration/__init__.py` to re-export `CredentialViolationError`, `apply_privacy_hooks`, `redact_pii`, `reject_credentials`
+- Created `tests/test_privacy.py` with 39 tests across 12 test classes:
+  - `TestRedactEmail`: 4 tests (simple, plus-tag, multiple, no match)
+  - `TestRedactSSN`: 3 tests (basic, embedded, non-SSN format)
+  - `TestRedactPhone`: 4 tests (dashed, parenthesized, dotted, country code)
+  - `TestRedactCreditCard`: 3 tests (spaced, dashed, plain)
+  - `TestRedactMultiplePII`: 2 tests (mixed PII, clean passthrough)
+  - `TestRejectAWSKey`: 2 tests (standalone, embedded)
+  - `TestRejectPEMKey`: 3 tests (RSA, generic, EC)
+  - `TestRejectGitHubToken`: 2 tests (ghp_, github_pat)
+  - `TestRejectGenericSecret`: 4 tests (api_key=, password:, secret_key quoted, access_token)
+  - `TestRejectBearer`: 2 tests (standard, case-insensitive)
+  - `TestRejectCleanContent`: 3 tests (normal text, short values, code discussion)
+  - `TestApplyPrivacyHooks`: 7 tests (redacts PII, rejects credentials, rejection-before-redaction order, clean passthrough, each toggle disabled, both disabled)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 37 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 19 source files
+- `uv run pytest tests/ -v` -- 375 passed (39 new privacy tests + 336 existing)
