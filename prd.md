@@ -578,7 +578,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Support event types: revision.created, edge.created, revision.deprecated",
       "Add tests: event enqueue, dequeue ordering, event type filtering"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

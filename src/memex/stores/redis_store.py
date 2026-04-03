@@ -1,8 +1,11 @@
-"""Redis working-memory session buffer.
+"""Redis working-memory session buffer and consolidation event feed.
 
 Implements FR-6: session-local bounded message buffer with TTL,
 isolated by project/context/user/session. Redis is not the
 system of record for long-term memory.
+
+Also provides the consolidation event feed (Redis Streams) consumed
+by the Dream State pipeline.
 """
 
 from __future__ import annotations
@@ -195,3 +198,190 @@ class RedisWorkingMemory:
         """
         result: int = await self._client.ttl(self._key(project_id, session_id))
         return result
+
+
+# ---------------------------------------------------------------------------
+# Consolidation event feed (Redis Streams) for Dream State
+# ---------------------------------------------------------------------------
+
+
+class ConsolidationEventType(StrEnum):
+    """Event types published to the Dream State consolidation feed.
+
+    Values:
+        REVISION_CREATED: A new revision was persisted.
+        EDGE_CREATED: A new domain edge was created.
+        REVISION_DEPRECATED: An item/revision was deprecated.
+    """
+
+    REVISION_CREATED = "revision.created"
+    EDGE_CREATED = "edge.created"
+    REVISION_DEPRECATED = "revision.deprecated"
+
+
+class ConsolidationEvent(BaseModel, frozen=True):
+    """A single event in the Dream State consolidation feed.
+
+    Args:
+        event_id: Redis Stream entry ID assigned on publish.
+        event_type: Type of consolidation event.
+        data: Event payload (e.g. revision_id, item_id).
+        timestamp: UTC timestamp when the event was published.
+    """
+
+    event_id: str
+    event_type: ConsolidationEventType
+    data: dict[str, str]
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ConsolidationEventFeed:
+    """Redis Stream-backed event feed for Dream State consolidation.
+
+    Publishes ordered events and supports cursor-based reading
+    for incremental processing by the Dream State pipeline.
+
+    Args:
+        client: Async Redis client connection.
+    """
+
+    _KEY_PREFIX = "memex:events"
+
+    def __init__(self, client: aioredis.Redis) -> None:
+        self._client = client
+
+    def _key(self, project_id: str) -> str:
+        """Build the Redis Stream key for a project event feed.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            Namespaced Redis Stream key string.
+        """
+        return f"{self._KEY_PREFIX}:{project_id}"
+
+    async def publish(
+        self,
+        project_id: str,
+        event_type: ConsolidationEventType | str,
+        data: dict[str, str],
+    ) -> ConsolidationEvent:
+        """Publish an event to the consolidation feed.
+
+        Args:
+            project_id: Project identifier.
+            event_type: Type of consolidation event.
+            data: Event payload (e.g. revision_id, item_id).
+
+        Returns:
+            The published event with its assigned stream ID.
+        """
+        event_type_val = ConsolidationEventType(event_type)
+        now = datetime.now(UTC)
+        fields: dict[str, str | bytes] = {
+            "event_type": event_type_val.value,
+            "data": orjson.dumps(data).decode(),
+            "timestamp": now.isoformat(),
+        }
+        entry_id = await self._client.xadd(self._key(project_id), fields)  # type: ignore[arg-type]
+        eid = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
+        return ConsolidationEvent(
+            event_id=eid,
+            event_type=event_type_val,
+            data=data,
+            timestamp=now,
+        )
+
+    @staticmethod
+    def _decode(value: bytes | str) -> str:
+        """Decode a bytes or str value to str.
+
+        Args:
+            value: Raw value from Redis.
+
+        Returns:
+            Decoded string.
+        """
+        return value.decode() if isinstance(value, bytes) else value
+
+    def _parse_entry(
+        self,
+        entry_id: bytes | str,
+        fields: dict[bytes | str, bytes | str],
+    ) -> ConsolidationEvent:
+        """Parse a raw Redis Stream entry into a domain event.
+
+        Args:
+            entry_id: Redis Stream entry ID.
+            fields: Raw field mapping from the stream entry.
+
+        Returns:
+            Parsed ConsolidationEvent.
+        """
+        eid = self._decode(entry_id)
+        decoded = {self._decode(k): self._decode(v) for k, v in fields.items()}
+        return ConsolidationEvent(
+            event_id=eid,
+            event_type=ConsolidationEventType(decoded["event_type"]),
+            data=orjson.loads(decoded["data"]),
+            timestamp=datetime.fromisoformat(decoded["timestamp"]),
+        )
+
+    async def read_since(
+        self,
+        project_id: str,
+        cursor: str = "0-0",
+        count: int | None = None,
+        event_type: ConsolidationEventType | str | None = None,
+    ) -> list[ConsolidationEvent]:
+        """Read events published after the given cursor.
+
+        Use cursor ``"0-0"`` to read from the beginning of the feed.
+
+        Args:
+            project_id: Project identifier.
+            cursor: Stream ID to read after (exclusive). ``"0-0"``
+                reads from the start.
+            count: Maximum entries fetched from Redis (before type
+                filtering).
+            event_type: Optional filter to return only this event type.
+
+        Returns:
+            Ordered list of events after the cursor.
+        """
+        key = self._key(project_id)
+        if cursor == "0-0":
+            entries = await self._client.xrange(key, min="-", max="+", count=count)
+        else:
+            entries = await self._client.xrange(
+                key, min=f"({cursor}", max="+", count=count
+            )
+
+        events = [self._parse_entry(eid, fields) for eid, fields in entries]
+
+        if event_type is not None:
+            filter_type = ConsolidationEventType(event_type)
+            events = [e for e in events if e.event_type == filter_type]
+
+        return events
+
+    async def read_all(
+        self,
+        project_id: str,
+        event_type: ConsolidationEventType | str | None = None,
+    ) -> list[ConsolidationEvent]:
+        """Read all events in a project's consolidation feed.
+
+        Args:
+            project_id: Project identifier.
+            event_type: Optional filter to return only this event type.
+
+        Returns:
+            Ordered list of all events in the feed.
+        """
+        return await self.read_since(
+            project_id,
+            cursor="0-0",
+            event_type=event_type,
+        )

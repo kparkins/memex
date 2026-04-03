@@ -3,6 +3,9 @@
 from memex.stores.neo4j_schema import NodeLabel, RelType, ensure_schema
 from memex.stores.neo4j_store import Neo4jStore
 from memex.stores.redis_store import (
+    ConsolidationEvent,
+    ConsolidationEventFeed,
+    ConsolidationEventType,
     MessageRole,
     RedisWorkingMemory,
     WorkingMemoryMessage,
@@ -10,6 +13,9 @@ from memex.stores.redis_store import (
 )
 
 __all__ = [
+    "ConsolidationEvent",
+    "ConsolidationEventFeed",
+    "ConsolidationEventType",
     "MessageRole",
     "Neo4jStore",
     "NodeLabel",

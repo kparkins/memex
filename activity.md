@@ -277,3 +277,28 @@
 - `uv run ruff format --check src/ tests/` -- 26 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 14 source files
 - `uv run pytest tests/ -v` -- 227 passed (27 new Redis working-memory tests + 200 existing)
+
+## T12: Add consolidation event feed on Redis for Dream State (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/stores/redis_store.py` with consolidation event feed backed by Redis Streams:
+  - `ConsolidationEventType` StrEnum: revision.created, edge.created, revision.deprecated
+  - `ConsolidationEvent` (frozen=True): immutable event model with event_id (Redis Stream ID), event_type, data payload, and UTC timestamp
+  - `ConsolidationEventFeed`: Redis Stream-backed event feed class with:
+    - `publish`: appends event via XADD with serialized type, data (orjson), and timestamp
+    - `read_since`: cursor-based reading via XRANGE with exclusive start (`(cursor`), optional count limit and event-type filtering
+    - `read_all`: convenience wrapper reading from stream start
+    - `_parse_entry`: deserializes raw Redis Stream entries back to domain events
+- Updated `src/memex/stores/__init__.py` to re-export ConsolidationEvent, ConsolidationEventFeed, ConsolidationEventType
+- Created `tests/test_consolidation_feed.py` with 18 integration tests across 3 test classes:
+  - `TestPublishEvent`: 5 tests (revision.created, edge.created, revision.deprecated, string coercion, read-back)
+  - `TestDequeueOrdering`: 6 tests (publish order preserved, mixed types maintain order, cursor-based reading, cursor at last returns empty, empty feed, count limits)
+  - `TestEventTypeFiltering`: 7 tests (filter each type, string filter, no match returns empty, filter combined with cursor, project isolation)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 27 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 14 source files
+- `uv run pytest tests/ -v` -- 245 passed (18 new consolidation feed tests + 227 existing)
