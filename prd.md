@@ -550,7 +550,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Implement impact analysis with configurable depth (default 10, valid range 1-20)",
       "Add tests: provenance chain traversal, transitive dependency resolution, depth limiting and boundary validation"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

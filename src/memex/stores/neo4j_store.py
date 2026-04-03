@@ -1190,6 +1190,117 @@ class Neo4jStore:
                 async for rec in result
             ]
 
+    # -- Provenance and impact analysis ------------------------------------
+
+    async def get_provenance_summary(self, revision_id: str) -> list[Edge]:
+        """Collect all domain edges connected to a revision.
+
+        Returns both outgoing and incoming revision-scoped edges,
+        giving a complete picture of a revision's provenance context:
+        what it depends on, what it was derived from, and what
+        references or supports it.
+
+        Args:
+            revision_id: ID of the focal revision.
+
+        Returns:
+            All domain edges where the revision is source or target.
+        """
+        query = (
+            f"MATCH (src:{NodeLabel.REVISION} {{id: $rid}})"
+            f"-[r]->(tgt:{NodeLabel.REVISION}) "
+            f"WHERE r.id IS NOT NULL AND type(r) IN $types "
+            f"RETURN src.id AS src_id, tgt.id AS tgt_id, "
+            f"type(r) AS rel_type, properties(r) AS props "
+            f"UNION ALL "
+            f"MATCH (src:{NodeLabel.REVISION})-[r]->"
+            f"(tgt:{NodeLabel.REVISION} {{id: $rid}}) "
+            f"WHERE r.id IS NOT NULL AND type(r) IN $types "
+            f"RETURN src.id AS src_id, tgt.id AS tgt_id, "
+            f"type(r) AS rel_type, properties(r) AS props"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, rid=revision_id, types=_DOMAIN_REL_TYPES)
+            return [
+                _to_edge(
+                    dict(rec["props"]),
+                    str(rec["rel_type"]),
+                    str(rec["src_id"]),
+                    str(rec["tgt_id"]),
+                )
+                async for rec in result
+            ]
+
+    async def get_dependencies(
+        self,
+        revision_id: str,
+        *,
+        depth: int = 10,
+    ) -> list[Revision]:
+        """Traverse outgoing dependency edges transitively.
+
+        Follows ``DEPENDS_ON`` and ``DERIVED_FROM`` edges from the
+        given revision up to the specified depth.
+
+        Args:
+            revision_id: Starting revision ID.
+            depth: Maximum traversal depth (default 10, range 1-20).
+
+        Returns:
+            All transitively reachable dependency revisions,
+            ordered by created_at.
+
+        Raises:
+            ValueError: If depth is outside the 1-20 range.
+        """
+        if not 1 <= depth <= 20:
+            raise ValueError(f"depth must be 1-20, got {depth}")
+        query = (
+            f"MATCH (:{NodeLabel.REVISION} {{id: $rid}})"
+            f"-[:{RelType.DEPENDS_ON}|{RelType.DERIVED_FROM}*1..{depth}]->"
+            f"(dep:{NodeLabel.REVISION}) "
+            f"RETURN DISTINCT dep ORDER BY dep.created_at"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, rid=revision_id)
+            return [_to_revision(dict(rec["dep"])) async for rec in result]
+
+    async def analyze_impact(
+        self,
+        revision_id: str,
+        *,
+        depth: int = 10,
+    ) -> list[Revision]:
+        """Find all revisions transitively impacted by a change.
+
+        Follows incoming ``DEPENDS_ON`` and ``DERIVED_FROM`` edges
+        in reverse to discover downstream dependents.
+
+        Per FR-5, default depth is 10 with valid range 1-20.
+
+        Args:
+            revision_id: ID of the changed revision.
+            depth: Maximum traversal depth (default 10, range 1-20).
+
+        Returns:
+            All transitively dependent revisions, ordered by
+            created_at.
+
+        Raises:
+            ValueError: If depth is outside the 1-20 range.
+        """
+        if not 1 <= depth <= 20:
+            raise ValueError(f"depth must be 1-20, got {depth}")
+        query = (
+            f"MATCH (impacted:{NodeLabel.REVISION})"
+            f"-[:{RelType.DEPENDS_ON}|{RelType.DERIVED_FROM}*1..{depth}]->"
+            f"(:{NodeLabel.REVISION} {{id: $rid}}) "
+            f"RETURN DISTINCT impacted ORDER BY impacted.created_at"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, rid=revision_id)
+            return [_to_revision(dict(rec["impacted"])) async for rec in result]
+
     # -- Internal ---------------------------------------------------------
 
     async def _get_node(

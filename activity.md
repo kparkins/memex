@@ -223,3 +223,24 @@
 - `uv run ruff format --check src/ tests/` -- 23 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 13 source files
 - `uv run pytest tests/ -v` -- 181 passed (18 new temporal query tests + 163 existing)
+
+## T10: Implement provenance summary and impact analysis (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/stores/neo4j_store.py` with 3 new methods on `Neo4jStore`:
+  - `get_provenance_summary`: Collects all domain edges connected to a revision (both outgoing and incoming) via UNION ALL Cypher query, filtering by `r.id IS NOT NULL` and domain relationship types to exclude structural edges
+  - `get_dependencies`: Traverses outgoing DEPENDS_ON and DERIVED_FROM edges transitively using variable-length path `*1..depth`, with configurable depth (default 10, valid range 1-20)
+  - `analyze_impact`: Traverses incoming DEPENDS_ON and DERIVED_FROM edges transitively to find all downstream dependents, with configurable depth (default 10, valid range 1-20) per FR-5
+- All methods validate depth parameter bounds and raise ValueError for out-of-range values
+- Created `tests/test_provenance_impact.py` with 19 integration tests across 3 test classes:
+  - `TestProvenanceSummary`: 5 tests (outgoing edges, incoming edges, both directions, empty provenance, structural edges excluded)
+  - `TestDependencyTraversal`: 5 tests (direct dependency, transitive chain, DERIVED_FROM included, no dependencies, depth limits traversal)
+  - `TestImpactAnalysis`: 9 tests (direct impact, transitive impact, depth=1 limits to direct, default depth=10 verified with 12-node chain, DERIVED_FROM included, no impact, depth below 1 rejected, depth above 20 rejected, boundary depth=20 accepted)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 24 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 13 source files
+- `uv run pytest tests/ -v` -- 200 passed (19 new provenance/impact tests + 181 existing)
