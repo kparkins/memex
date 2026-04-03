@@ -5,6 +5,11 @@ from memex.orchestration.dream_collector import (
     DreamStateCollector,
     DreamStateEventBatch,
 )
+from memex.orchestration.dream_executor import (
+    ActionResult,
+    DreamStateExecutor,
+    ExecutionReport,
+)
 from memex.orchestration.enrichment import (
     EnrichmentResult,
     enrich_revision,
@@ -31,13 +36,16 @@ from memex.orchestration.privacy import (
 )
 
 __all__ = [
+    "ActionResult",
     "ArtifactSpec",
     "CollectedRevision",
     "CredentialViolationError",
     "DreamStateCollector",
     "DreamStateEventBatch",
+    "DreamStateExecutor",
     "EdgeSpec",
     "EnrichmentResult",
+    "ExecutionReport",
     "IngestParams",
     "IngestResult",
     "apply_privacy_hooks",

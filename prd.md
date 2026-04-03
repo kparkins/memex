@@ -705,7 +705,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Per-action error isolation: one action failure does not abort the batch",
       "Add tests: batch assessment invocation, action execution correctness, error isolation between actions"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

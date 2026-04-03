@@ -546,3 +546,46 @@
 - `uv run ruff format --check src/ tests/` -- 45 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 24 source files
 - `uv run pytest tests/ -v` -- 440 passed (23 new Dream State event tests + 417 existing)
+
+## T21: Implement Dream State LLM assessment and action execution (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/llm/dream_assessment.py` with LLM-based consolidation assessment:
+  - `DreamActionType` (StrEnum): deprecate_item, move_tag, update_metadata, create_relationship
+  - `MetadataUpdate` (frozen=True): typed model for summary/topics/keywords updates
+  - `DreamAction` (frozen=True): action model with type-conditional fields (item_id, tag_id, revision_id, source/target_revision_id, edge_type, metadata_updates)
+  - `RevisionSummary` (frozen=True): lightweight revision context for LLM input
+  - `_DREAM_EDGE_TYPES`: derived from EdgeType enum excluding structural types (SUPERSEDES, BUNDLES)
+  - `_build_context`: serializes revision summaries as indented JSON for prompt
+  - `_parse_actions`: parses LLM JSON with per-action error tolerance (invalid actions skipped, valid ones kept)
+  - `assess_batch`: sends revision batch to LLM via litellm.acompletion, returns list of DreamActions; empty input short-circuits without LLM call
+- Created `src/memex/orchestration/dream_executor.py` with per-action error isolation:
+  - `ActionResult` (frozen=True): per-action success/failure with error message
+  - `ExecutionReport` (frozen=True): aggregate report with total/succeeded/failed counts
+  - `DreamStateExecutor`: executes actions against Neo4jStore with match-based dispatch:
+    - `_deprecate`: validates item_id, calls store.deprecate_item
+    - `_move_tag`: validates tag_id + target_revision_id, calls store.move_tag
+    - `_update_metadata`: validates revision_id + metadata_updates, calls store.update_revision_enrichment
+    - `_create_relationship`: validates source/target + edge_type, creates Edge with UUID and calls store.create_edge with reason from action
+  - Each action wrapped in try/except for isolation; failures logged and recorded without aborting batch
+- Updated `src/memex/llm/__init__.py` to re-export DreamAction, DreamActionType, MetadataUpdate, RevisionSummary, assess_batch
+- Updated `src/memex/orchestration/__init__.py` to re-export ActionResult, DreamStateExecutor, ExecutionReport
+- Created `tests/test_dream_executor.py` with 31 tests across 10 test classes:
+  - `TestBuildContext`: 3 tests (minimal, full, multiple revisions)
+  - `TestStripMarkdownFence`: 3 tests (no fence, json fence, bare fence)
+  - `TestParseActions`: 6 tests (deprecate, relationship, metadata, empty, skip invalid, fenced)
+  - `TestAssessBatch`: 5 unit tests (LLM returns actions, empty input, custom model, LLM failure, invalid JSON)
+  - `TestDeprecateItemAction`: 2 integration tests (marks item, missing item_id)
+  - `TestMoveTagAction`: 2 integration tests (moves to new revision, missing fields)
+  - `TestUpdateMetadataAction`: 3 integration tests (summary, topics+keywords, missing fields)
+  - `TestCreateRelationshipAction`: 2 integration tests (creates edge with reason, missing fields)
+  - `TestErrorIsolation`: 4 integration tests (failure doesn't block next, all fail, mixed types, empty list)
+  - `TestExecutionReport`: 1 test (serialization round-trip)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 48 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 26 source files
+- `uv run pytest tests/ -v` -- 471 passed (31 new Dream State executor tests + 440 existing)
