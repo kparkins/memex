@@ -586,3 +586,39 @@ class TestEventTypeCoverage:
         assert published[0].event_type == ConsolidationEventType.REVISION_CREATED
         assert published[1].event_type == ConsolidationEventType.EDGE_CREATED
         assert published[2].event_type == ConsolidationEventType.EDGE_CREATED
+
+
+# -- R6: Batch fetching in collector ----------------------------------------
+
+
+class TestCollectorBatchFetching:
+    """Known gap tracked by PRD R6: collector uses N+1 sequential queries
+    instead of batch fetching revisions and items."""
+
+    async def test_batch_fetches_revisions(self, env):
+        """Collector should batch-fetch revisions in a single query."""
+
+        space = await env.store.resolve_space(env.project.id, "facts")
+        revisions = []
+        for i in range(3):
+            item = Item(space_id=space.id, name=f"batch-{i}", kind=ItemKind.FACT)
+            rev = Revision(
+                item_id=item.id,
+                revision_number=1,
+                content=f"content-{i}",
+                search_text=f"content-{i}",
+            )
+            tag = Tag(item_id=item.id, name="active", revision_id=rev.id)
+            await env.store.create_item_with_revision(item, rev, tags=[tag])
+            await publish_revision_created(env.feed, env.project.id, rev)
+            revisions.append(rev)
+
+        collector = DreamStateCollector(env.store, env.feed, env.cursor)
+        batch = await collector.collect(env.project.id)
+
+        assert len(batch.revisions) == 3
+
+        # Verify the store has a get_revisions_batch method
+        assert hasattr(env.store, "get_revisions_batch"), (
+            "Neo4jStore must implement get_revisions_batch for batch fetching"
+        )

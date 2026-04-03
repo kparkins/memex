@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
 from memex.stores.neo4j_schema import NodeLabel, RelType
-from memex.stores.protocols import StorePersistenceError
+from memex.stores.protocols import EnrichmentUpdate, StorePersistenceError
 
 # -- Serialization helpers ------------------------------------------------
 
@@ -56,6 +56,7 @@ _EDGE_PROPS_EXCLUDE: set[str] = {
 }
 
 _ROOT_SENTINEL = "__ROOT__"
+MAX_TRAVERSAL_DEPTH = 20
 
 
 # -- Transaction helper ---------------------------------------------------
@@ -772,6 +773,26 @@ class Neo4jStore:
         node = await self._get_node(NodeLabel.ITEM, item_id)
         return Item.model_validate(dict(node)) if node else None
 
+    async def get_items_batch(self, item_ids: list[str]) -> dict[str, Item]:
+        """Retrieve multiple Items by ID in a single query.
+
+        Args:
+            item_ids: List of item identifiers.
+
+        Returns:
+            Dict mapping item_id to Item for found items.
+        """
+        if not item_ids:
+            return {}
+        cypher = f"MATCH (n:{NodeLabel.ITEM}) WHERE n.id IN $ids RETURN n"
+        items: dict[str, Item] = {}
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, ids=item_ids)
+            async for rec in result:
+                item = Item.model_validate(dict(rec["n"]))
+                items[item.id] = item
+        return items
+
     async def get_revision(self, revision_id: str) -> Revision | None:
         """Retrieve a Revision by ID.
 
@@ -783,6 +804,26 @@ class Neo4jStore:
         """
         node = await self._get_node(NodeLabel.REVISION, revision_id)
         return Revision.model_validate(dict(node)) if node else None
+
+    async def get_revisions_batch(self, revision_ids: list[str]) -> dict[str, Revision]:
+        """Retrieve multiple Revisions by ID in a single query.
+
+        Args:
+            revision_ids: List of revision identifiers.
+
+        Returns:
+            Dict mapping revision_id to Revision for found revisions.
+        """
+        if not revision_ids:
+            return {}
+        cypher = f"MATCH (r:{NodeLabel.REVISION}) WHERE r.id IN $ids RETURN r"
+        revisions: dict[str, Revision] = {}
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, ids=revision_ids)
+            async for rec in result:
+                rev = Revision.model_validate(dict(rec["r"]))
+                revisions[rev.id] = rev
+        return revisions
 
     async def get_tag(self, tag_id: str) -> Tag | None:
         """Retrieve a Tag by ID.
@@ -1496,6 +1537,38 @@ class Neo4jStore:
             result = await session.run(query, iid=item_id)
             return [str(rec["bundle_id"]) async for rec in result]
 
+    async def get_bundle_memberships_batch(
+        self, item_ids: list[str]
+    ) -> dict[str, list[str]]:
+        """Return bundle item IDs for multiple items in a single query.
+
+        Args:
+            item_ids: List of item identifiers.
+
+        Returns:
+            Dict mapping item_id to list of bundle item IDs.
+        """
+        if not item_ids:
+            return {}
+        query = (
+            f"MATCH (i:{NodeLabel.ITEM})"
+            f"<-[:{RelType.REVISION_OF}]-"
+            f"(rev:{NodeLabel.REVISION})"
+            f"-[:{RelType.BUNDLES}]->"
+            f"(brev:{NodeLabel.REVISION})"
+            f"-[:{RelType.REVISION_OF}]->"
+            f"(bi:{NodeLabel.ITEM}) "
+            "WHERE i.id IN $ids "
+            "RETURN DISTINCT i.id AS item_id, bi.id AS bundle_id"
+        )
+        result_map: dict[str, list[str]] = {iid: [] for iid in item_ids}
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, ids=item_ids)
+            async for rec in result:
+                iid = str(rec["item_id"])
+                result_map[iid].append(str(rec["bundle_id"]))
+        return result_map
+
     # -- Provenance and impact analysis ------------------------------------
 
     async def get_provenance_summary(self, revision_id: str) -> list[Edge]:
@@ -1561,7 +1634,7 @@ class Neo4jStore:
         Raises:
             ValueError: If depth is outside the 1-20 range.
         """
-        if not 1 <= depth <= 20:
+        if not 1 <= depth <= MAX_TRAVERSAL_DEPTH:
             raise ValueError(f"depth must be 1-20, got {depth}")
         query = (
             f"MATCH (:{NodeLabel.REVISION} {{id: $rid}})"
@@ -1597,7 +1670,7 @@ class Neo4jStore:
         Raises:
             ValueError: If depth is outside the 1-20 range.
         """
-        if not 1 <= depth <= 20:
+        if not 1 <= depth <= MAX_TRAVERSAL_DEPTH:
             raise ValueError(f"depth must be 1-20, got {depth}")
         query = (
             f"MATCH (impacted:{NodeLabel.REVISION})"
@@ -1616,16 +1689,7 @@ class Neo4jStore:
     async def update_revision_enrichment(
         self,
         revision_id: str,
-        *,
-        summary: str | None = None,
-        topics: list[str] | None = None,
-        keywords: list[str] | None = None,
-        facts: list[str] | None = None,
-        events: list[str] | None = None,
-        implications: list[str] | None = None,
-        embedding_text_override: str | None = None,
-        embedding: list[float] | None = None,
-        search_text: str | None = None,
+        update: EnrichmentUpdate,
     ) -> Revision | None:
         """Update enrichment fields on an existing Revision node.
 
@@ -1635,38 +1699,12 @@ class Neo4jStore:
 
         Args:
             revision_id: ID of the revision to update.
-            summary: Enrichment summary text.
-            topics: Extracted topic labels.
-            keywords: Extracted keywords.
-            facts: Extracted factual statements.
-            events: Structured event descriptions.
-            implications: Prospective indexing scenarios.
-            embedding_text_override: Override text for embeddings.
-            embedding: Updated embedding vector.
-            search_text: Updated search text incorporating enrichments.
+            update: Enrichment fields to set.
 
         Returns:
             Updated Revision, or None if no revision with the ID exists.
         """
-        updates: dict[str, object] = {}
-        if summary is not None:
-            updates["summary"] = summary
-        if topics is not None:
-            updates["topics"] = topics
-        if keywords is not None:
-            updates["keywords"] = keywords
-        if facts is not None:
-            updates["facts"] = facts
-        if events is not None:
-            updates["events"] = events
-        if implications is not None:
-            updates["implications"] = implications
-        if embedding_text_override is not None:
-            updates["embedding_text_override"] = embedding_text_override
-        if embedding is not None:
-            updates["embedding"] = embedding
-        if search_text is not None:
-            updates["search_text"] = search_text
+        updates = update.to_dict()
 
         if not updates:
             return await self.get_revision(revision_id)
@@ -1681,14 +1719,16 @@ class Neo4jStore:
 
         async with self._driver.session(database=self._database) as session:
 
-            async def _run(tx: AsyncManagedTransaction) -> Revision | None:
+            async def _run_update(
+                tx: AsyncManagedTransaction,
+            ) -> Revision | None:
                 result = await tx.run(cypher, **params)
                 record = await result.single()
                 if record is None:
                     return None
                 return Revision.model_validate(dict(record["r"]))
 
-            return await session.execute_write(_run)
+            return await session.execute_write(_run_update)
 
     # -- Audit reports ----------------------------------------------------
 

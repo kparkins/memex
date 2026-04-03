@@ -132,6 +132,8 @@ class DreamStateCollector:
     ) -> dict[str, CollectedRevision]:
         """Fetch revisions and their bundle context from Neo4j.
 
+        Uses batch queries to avoid N+1 per-revision lookups.
+
         Args:
             revision_ids: Unique revision IDs to fetch.
 
@@ -139,13 +141,20 @@ class DreamStateCollector:
             Mapping of revision ID to collected revision with bundle
             context. Missing revisions are silently skipped.
         """
+        if not revision_ids:
+            return {}
+
+        revisions = await self._store.get_revisions_batch(list(revision_ids))
+        item_ids = list({r.item_id for r in revisions.values()})
+        bundles_map = await self._store.get_bundle_memberships_batch(item_ids)
+
         result: dict[str, CollectedRevision] = {}
-        for rid in revision_ids:
-            revision = await self._store.get_revision(rid)
-            if revision is None:
-                continue
-            bundles = await self._store.get_bundle_memberships(revision.item_id)
-            result[rid] = CollectedRevision(revision=revision, bundle_item_ids=bundles)
+        for rid, revision in revisions.items():
+            bundles = bundles_map.get(revision.item_id, [])
+            result[rid] = CollectedRevision(
+                revision=revision,
+                bundle_item_ids=bundles,
+            )
         return result
 
 

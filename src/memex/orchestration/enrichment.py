@@ -28,7 +28,7 @@ from memex.llm.client import (
 )
 from memex.llm.enrichment import EnrichmentOutput, extract_enrichments
 from memex.orchestration.privacy import apply_privacy_hooks
-from memex.stores.protocols import MemoryStore
+from memex.stores.protocols import EnrichmentUpdate, MemoryStore
 
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
@@ -218,15 +218,17 @@ class EnrichmentService:
 
             await self._store.update_revision_enrichment(
                 revision_id,
-                summary=sanitized.summary,
-                topics=list(sanitized.topics),
-                keywords=list(sanitized.keywords),
-                facts=list(sanitized.facts),
-                events=list(sanitized.events),
-                implications=list(sanitized.implications),
-                embedding_text_override=sanitized.embedding_text_override,
-                embedding=embedding,
-                search_text=enriched_search_text,
+                EnrichmentUpdate(
+                    summary=sanitized.summary,
+                    topics=list(sanitized.topics),
+                    keywords=list(sanitized.keywords),
+                    facts=list(sanitized.facts),
+                    events=list(sanitized.events),
+                    implications=list(sanitized.implications),
+                    embedding_text_override=sanitized.embedding_text_override,
+                    embedding=embedding,
+                    search_text=enriched_search_text,
+                ),
             )
 
             return EnrichmentResult(

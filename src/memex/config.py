@@ -96,6 +96,7 @@ class DreamStateSettings(BaseSettings):
     Args:
         batch_size: Max revisions per LLM assessment batch.
         max_deprecation_ratio: Circuit-breaker threshold (0.1-0.9).
+        model: LLM model for Dream State assessment.
         schedule_interval_seconds: Interval for scheduled trigger mode.
         idle_timeout_seconds: Inactivity window for idle trigger mode.
         event_threshold: Pending event count for threshold trigger mode.
@@ -106,6 +107,7 @@ class DreamStateSettings(BaseSettings):
 
     batch_size: int = 20
     max_deprecation_ratio: float = Field(default=0.5, ge=0.1, le=0.9)
+    model: str = "gpt-4o-mini"
     schedule_interval_seconds: float = 300.0
     idle_timeout_seconds: float = 60.0
     event_threshold: int = 50

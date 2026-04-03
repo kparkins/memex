@@ -147,6 +147,8 @@ async def _resolve_item_kinds(
 ) -> dict[str, str]:
     """Look up item kinds for all unique items in a revision batch.
 
+    Uses batch query to avoid N+1 per-item lookups.
+
     Args:
         store: Memory store for item lookups.
         revisions: Collected revisions containing item_id references.
@@ -154,13 +156,11 @@ async def _resolve_item_kinds(
     Returns:
         Mapping of item_id to item kind string.
     """
-    item_ids = {c.revision.item_id for c in revisions.values()}
-    kinds: dict[str, str] = {}
-    for item_id in item_ids:
-        item = await store.get_item(item_id)
-        if item is not None:
-            kinds[item_id] = item.kind.value
-    return kinds
+    item_ids = list({c.revision.item_id for c in revisions.values()})
+    if not item_ids:
+        return {}
+    items = await store.get_items_batch(item_ids)
+    return {iid: item.kind.value for iid, item in items.items()}
 
 
 class DreamStatePipeline:
@@ -298,7 +298,7 @@ class DreamStatePipeline:
         summaries = _to_revision_summaries(batch.revisions, item_kinds)
         return await assess_batch(
             summaries,
-            model=model or "gpt-4o-mini",
+            model=model or self._settings.model,
             llm_client=self._llm_client,
         )
 

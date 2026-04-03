@@ -1300,3 +1300,49 @@
 - `uv run mypy src/` -- Success: no issues found in 41 source files
 - `uv run pytest tests/test_r5_validation.py -v` -- 24 passed
 - `uv run pytest tests/ -v` -- 819 passed (24 new R5 tests + 6 previously-xfailing R5 tests now passing), 2 xfailed (R6 future), 5 pre-existing failures unchanged (temporal timing, enrichment embedding)
+
+## R6: Fix magic numbers, N+1 queries, parameter bloat, and minor issues (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Added `model: str = "gpt-4o-mini"` field to `DreamStateSettings` in `src/memex/config.py`
+  - Replaced magic string `"gpt-4o-mini"` in `DreamStatePipeline._assess` with `self._settings.model`
+- Added `get_revisions_batch(revision_ids)` to `RevisionStore` protocol and `Neo4jStore`:
+  - Single Cypher `WHERE r.id IN $ids` query instead of N individual lookups
+  - Used in `DreamStateCollector._fetch_revisions` replacing N+1 sequential calls
+- Added `get_items_batch(item_ids)` to `ItemStore` protocol and `Neo4jStore`:
+  - Single Cypher `WHERE n.id IN $ids` query
+  - Used in `_resolve_item_kinds` in `dream_pipeline.py` replacing N+1 sequential calls
+- Added `get_bundle_memberships_batch(item_ids)` to `EdgeStore` protocol and `Neo4jStore`:
+  - Single Cypher `WHERE i.id IN $ids` query replacing per-revision bundle lookups
+  - Used in `DreamStateCollector._fetch_revisions` alongside revision batching
+- Defined `MAX_TRAVERSAL_DEPTH = 20` constant in `neo4j_store.py`:
+  - Replaced hardcoded `20` in `get_dependencies` and `analyze_impact` depth validation
+- Promoted `_new_id` and `_utcnow` from `models.py` to public `new_id` and `utcnow` in `src/memex/domain/utils.py`:
+  - Updated imports in `models.py` and `edges.py`
+  - Exported from `domain/__init__.py`
+- Renamed inner `_run` function in `update_revision_enrichment` to `_run_update` to avoid shadowing module-level `_run`
+- Created `EnrichmentUpdate` frozen dataclass in `stores/protocols.py`:
+  - Encapsulates 9 optional enrichment fields with `to_dict()` method
+  - Changed `update_revision_enrichment` protocol and Neo4jStore to accept `EnrichmentUpdate` instead of 9 keyword arguments
+  - Updated callers in `enrichment.py` and `dream_executor.py`
+- Removed 2 `@pytest.mark.xfail(strict=True)` markers from previously-failing R6 tests:
+  - `tests/test_dream_safety.py`: `test_configured_model_forwarded_to_assessment`
+  - `tests/test_dream_state_events.py`: `test_batch_fetches_revisions`
+- Created `tests/test_r6_batch_and_config.py` with 17 tests across 9 test classes:
+  - `TestBatchRevisionFetch`: 3 tests (all returned, empty input, missing skipped)
+  - `TestBatchItemFetch`: 2 tests (all returned, empty input)
+  - `TestBatchBundleMembership`: 2 tests (empty lists for non-bundled, empty input)
+  - `TestCollectorBatchFetching`: 1 test (collector produces 3 revisions via batch)
+  - `TestDreamStateModelConfig`: 2 tests (default model, custom model)
+  - `TestEnrichmentUpdate`: 3 tests (filters None, empty, frozen)
+  - `TestMaxTraversalDepth`: 1 test (equals 20)
+  - `TestDomainUtils`: 3 tests (uuid string, unique, utcnow timezone-aware)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- All files already formatted
+- `uv run mypy src/` -- Success: no issues found in 42 source files
+- `uv run pytest tests/test_r6_batch_and_config.py -v` -- 17 passed
+- `uv run pytest tests/ -v` -- 838 passed (17 new R6 tests + 2 previously-xfailing R6 tests now passing), 0 xfailed, 5 pre-existing failures unchanged (temporal timing, enrichment embedding)

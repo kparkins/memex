@@ -16,7 +16,7 @@ from memex.llm.dream_assessment import (
     DreamAction,
     DreamActionType,
 )
-from memex.stores.protocols import MemoryStore
+from memex.stores.protocols import EnrichmentUpdate, MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +169,11 @@ class DreamStateExecutor:
         updates = action.metadata_updates
         await self._store.update_revision_enrichment(
             action.revision_id,
-            summary=updates.summary,
-            topics=list(updates.topics) if updates.topics else None,
-            keywords=list(updates.keywords) if updates.keywords else None,
+            EnrichmentUpdate(
+                summary=updates.summary,
+                topics=list(updates.topics) if updates.topics else None,
+                keywords=list(updates.keywords) if updates.keywords else None,
+            ),
         )
 
     async def _create_relationship(self, action: DreamAction) -> None:

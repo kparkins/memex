@@ -724,3 +724,52 @@ class TestAuditReportPersistence:
         # All 3 actions recommended, but only 1 executed
         assert len(stored["actions_recommended"]) == 3
         assert stored["execution"]["total"] == 1
+
+
+# -- R6: Dream State model config ------------------------------------------
+
+
+class TestDreamStateModelConfig:
+    """Known gap tracked by PRD R6: Dream State pipeline hardcodes
+    'gpt-4o-mini' instead of reading from DreamStateSettings."""
+
+    @pytest.mark.asyncio
+    async def test_configured_model_forwarded_to_assessment(self, env) -> None:
+        """Pipeline should forward DreamStateSettings.model to assess_batch."""
+        item, rev, _ = await _create_item(env.store, env.space)
+
+        custom_settings = DreamStateSettings(model="custom-model-v1")
+        pipeline = DreamStatePipeline(
+            env.collector,
+            env.executor,
+            env.store,
+            settings=custom_settings,
+        )
+
+        with (
+            patch(
+                "memex.orchestration.dream_pipeline.assess_batch",
+                new_callable=AsyncMock,
+                return_value=[],
+            ) as mock_assess,
+            patch.object(
+                env.collector,
+                "collect",
+                new_callable=AsyncMock,
+                return_value=DreamStateEventBatch(
+                    events=[],
+                    revisions={
+                        rev.id: CollectedRevision(revision=rev),
+                    },
+                    cursor="0-0",
+                ),
+            ),
+        ):
+            await pipeline.run(env.project.id)
+
+        # The configured model should be forwarded, not 'gpt-4o-mini'
+        call_kwargs = mock_assess.call_args
+        assert call_kwargs is not None
+        # Check the model kwarg passed to assess_batch
+        model_arg = call_kwargs.kwargs.get("model") or call_kwargs[1].get("model")
+        assert model_arg == "custom-model-v1"

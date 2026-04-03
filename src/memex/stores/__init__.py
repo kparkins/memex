@@ -1,10 +1,11 @@
 """Persistence stores: Neo4j graph and Redis working memory."""
 
 from memex.stores.neo4j_schema import NodeLabel, RelType, ensure_schema
-from memex.stores.neo4j_store import Neo4jStore
+from memex.stores.neo4j_store import MAX_TRAVERSAL_DEPTH, Neo4jStore
 from memex.stores.protocols import (
     AuditStore,
     EdgeStore,
+    EnrichmentUpdate,
     Ingestor,
     ItemStore,
     KrefResolvableStore,
@@ -32,6 +33,7 @@ __all__ = [
     "ConsolidationEventFeed",
     "ConsolidationEventType",
     "EdgeStore",
+    "EnrichmentUpdate",
     "Ingestor",
     "ItemStore",
     "KrefResolvableStore",
@@ -49,5 +51,6 @@ __all__ = [
     "TemporalResolver",
     "WorkingMemoryMessage",
     "build_session_id",
+    "MAX_TRAVERSAL_DEPTH",
     "ensure_schema",
 ]

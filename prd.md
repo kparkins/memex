@@ -1025,7 +1025,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Add tests: Dream State collector batch-fetches revisions in one query, Dream State item-kind resolution batch-fetches items, and the configured Dream State model is forwarded into assessment calls by default",
       "Verify all existing tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   }
 ]
 ```

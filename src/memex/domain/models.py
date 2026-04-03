@@ -12,21 +12,12 @@ Models:
 
 from __future__ import annotations
 
-import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-
-def _utcnow() -> datetime:
-    """Return the current UTC datetime."""
-    return datetime.now(UTC)
-
-
-def _new_id() -> str:
-    """Generate a new UUID4 string identifier."""
-    return str(uuid.uuid4())
+from memex.domain.utils import new_id, utcnow
 
 
 class ItemKind(StrEnum):
@@ -65,9 +56,9 @@ class Project(BaseModel):
         metadata: Arbitrary key-value metadata.
     """
 
-    id: str = Field(default_factory=_new_id)
+    id: str = Field(default_factory=new_id)
     name: str
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
     metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
@@ -82,11 +73,11 @@ class Space(BaseModel):
         created_at: Creation timestamp (UTC).
     """
 
-    id: str = Field(default_factory=_new_id)
+    id: str = Field(default_factory=new_id)
     project_id: str
     name: str
     parent_space_id: str | None = None
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class Item(BaseModel):
@@ -105,13 +96,13 @@ class Item(BaseModel):
         created_at: Creation timestamp (UTC).
     """
 
-    id: str = Field(default_factory=_new_id)
+    id: str = Field(default_factory=new_id)
     space_id: str
     name: str
     kind: ItemKind
     deprecated: bool = False
     deprecated_at: datetime | None = None
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class Revision(BaseModel, frozen=True):
@@ -138,13 +129,13 @@ class Revision(BaseModel, frozen=True):
         embedding_text_override: Enrichment: override text for embedding.
     """
 
-    id: str = Field(default_factory=_new_id)
+    id: str = Field(default_factory=new_id)
     item_id: str
     revision_number: int = Field(ge=1)
     content: str
     search_text: str
     embedding: tuple[float, ...] | None = None
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
     # FR-8 enrichment metadata (populated asynchronously after creation)
     summary: str | None = None
@@ -172,12 +163,12 @@ class Tag(BaseModel):
         updated_at: Last update timestamp (UTC).
     """
 
-    id: str = Field(default_factory=_new_id)
+    id: str = Field(default_factory=new_id)
     item_id: str
     name: str
     revision_id: str
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
 
 
 class Artifact(BaseModel):
@@ -197,11 +188,11 @@ class Artifact(BaseModel):
         created_at: Creation timestamp (UTC).
     """
 
-    id: str = Field(default_factory=_new_id)
+    id: str = Field(default_factory=new_id)
     revision_id: str
     name: str
     location: str
     media_type: str | None = None
     size_bytes: int | None = Field(default=None, ge=0)
     metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(default_factory=utcnow)

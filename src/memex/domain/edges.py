@@ -13,7 +13,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from memex.domain.models import _new_id, _utcnow
+from memex.domain.utils import new_id, utcnow
 
 
 class EdgeType(StrEnum):
@@ -59,11 +59,11 @@ class Edge(BaseModel):
         context: Optional contextual information about the edge.
     """
 
-    id: str = Field(default_factory=_new_id)
+    id: str = Field(default_factory=new_id)
     source_revision_id: str
     target_revision_id: str
     edge_type: EdgeType
-    timestamp: datetime = Field(default_factory=_utcnow)
+    timestamp: datetime = Field(default_factory=utcnow)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     reason: str | None = None
     context: str | None = None
@@ -85,8 +85,8 @@ class TagAssignment(BaseModel, frozen=True):
         assigned_at: When the tag was pointed to this revision (UTC).
     """
 
-    id: str = Field(default_factory=_new_id)
+    id: str = Field(default_factory=new_id)
     tag_id: str
     item_id: str
     revision_id: str
-    assigned_at: datetime = Field(default_factory=_utcnow)
+    assigned_at: datetime = Field(default_factory=utcnow)

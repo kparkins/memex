@@ -9,13 +9,55 @@ to a specific backend.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, fields
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
+
+
+@dataclass(frozen=True)
+class EnrichmentUpdate:
+    """Encapsulates enrichment fields for a revision update.
+
+    Only non-None fields will be persisted to the revision node.
+
+    Args:
+        summary: Enrichment summary text.
+        topics: Extracted topic labels.
+        keywords: Extracted keywords.
+        facts: Extracted factual statements.
+        events: Structured event descriptions.
+        implications: Prospective indexing scenarios.
+        embedding_text_override: Override text for embeddings.
+        embedding: Updated embedding vector.
+        search_text: Updated fulltext search text.
+    """
+
+    summary: str | None = None
+    topics: list[str] | None = None
+    keywords: list[str] | None = None
+    facts: list[str] | None = None
+    events: list[str] | None = None
+    implications: list[str] | None = None
+    embedding_text_override: str | None = None
+    embedding: list[float] | None = None
+    search_text: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return non-None fields as a dict for Cypher SET clauses.
+
+        Returns:
+            Dict of field name to value for non-None fields.
+        """
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if getattr(self, f.name) is not None
+        }
 
 
 class StorePersistenceError(Exception):
@@ -154,6 +196,17 @@ class ItemStore(Protocol):
         """
         ...
 
+    async def get_items_batch(self, item_ids: list[str]) -> dict[str, Item]:
+        """Retrieve multiple Items by ID in a single query.
+
+        Args:
+            item_ids: List of item identifiers.
+
+        Returns:
+            Dict mapping item_id to Item for found items.
+        """
+        ...
+
 
 @runtime_checkable
 class RevisionStore(Protocol):
@@ -167,6 +220,17 @@ class RevisionStore(Protocol):
 
         Returns:
             Revision if found, None otherwise.
+        """
+        ...
+
+    async def get_revisions_batch(self, revision_ids: list[str]) -> dict[str, Revision]:
+        """Retrieve multiple Revisions by ID in a single query.
+
+        Args:
+            revision_ids: List of revision identifiers.
+
+        Returns:
+            Dict mapping revision_id to Revision for found revisions.
         """
         ...
 
@@ -205,30 +269,13 @@ class RevisionStore(Protocol):
     async def update_revision_enrichment(
         self,
         revision_id: str,
-        *,
-        summary: str | None = None,
-        topics: list[str] | None = None,
-        keywords: list[str] | None = None,
-        facts: list[str] | None = None,
-        events: list[str] | None = None,
-        implications: list[str] | None = None,
-        embedding_text_override: str | None = None,
-        embedding: list[float] | None = None,
-        search_text: str | None = None,
+        update: EnrichmentUpdate,
     ) -> Revision | None:
         """Update enrichment fields on an existing revision.
 
         Args:
             revision_id: ID of the revision to update.
-            summary: Enrichment summary text.
-            topics: Extracted topic labels.
-            keywords: Extracted keywords.
-            facts: Extracted factual statements.
-            events: Structured event descriptions.
-            implications: Prospective indexing scenarios.
-            embedding_text_override: Override text for embeddings.
-            embedding: Updated embedding vector.
-            search_text: Updated fulltext search text.
+            update: Enrichment fields to set.
 
         Returns:
             Updated Revision, or None if not found.
@@ -321,6 +368,19 @@ class EdgeStore(Protocol):
 
         Returns:
             Deduplicated list of bundle item IDs.
+        """
+        ...
+
+    async def get_bundle_memberships_batch(
+        self, item_ids: list[str]
+    ) -> dict[str, list[str]]:
+        """Return bundle item IDs for multiple items in a single query.
+
+        Args:
+            item_ids: List of item identifiers.
+
+        Returns:
+            Dict mapping item_id to list of bundle item IDs.
         """
         ...
 
