@@ -1,8 +1,9 @@
-"""MCP tool definitions for memory lifecycle, recall, and working memory.
+"""MCP tool definitions for the Memex cognitive memory system.
 
 Implements FR-13: the MCP tool surface covering memory lifecycle,
-working memory, and recall. Tools use repo-local ``memex_*`` aliases
-while aligning canonical capability names to the paper's taxonomy.
+working memory, recall, graph navigation, provenance, temporal queries,
+and reasoning. Tools use repo-local ``memex_*`` aliases while aligning
+canonical capability names to the paper's taxonomy.
 
 ``MemexToolService`` is the injectable service layer. The module-level
 ``create_mcp_server`` factory wires tools to the service via closure.
@@ -11,12 +12,13 @@ while aligning canonical capability names to the paper's taxonomy.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import orjson
 from pydantic import BaseModel, Field
 
-from memex.domain import ItemKind
+from memex.domain import Edge, EdgeType, Item, ItemKind, Revision, TagAssignment
 from memex.orchestration.ingest import (
     ArtifactSpec,
     EdgeSpec,
@@ -131,6 +133,125 @@ class WorkingMemoryClearInput(BaseModel):
     session_id: str
 
 
+# -- Graph navigation input models ----------------------------------------
+
+
+class GetEdgesInput(BaseModel):
+    """Input schema for the ``memex_get_edges`` / ``graph_get_edges`` tool.
+
+    Args:
+        source_revision_id: Filter by source revision.
+        target_revision_id: Filter by target revision.
+        edge_type: Filter by edge type name.
+        min_confidence: Minimum confidence threshold.
+        max_confidence: Maximum confidence threshold.
+    """
+
+    source_revision_id: str | None = None
+    target_revision_id: str | None = None
+    edge_type: str | None = None
+    min_confidence: float | None = None
+    max_confidence: float | None = None
+
+
+class ListItemsInput(BaseModel):
+    """Input schema for the ``memex_list_items`` / ``graph_list_items`` tool.
+
+    Args:
+        space_id: Space to list items from.
+        include_deprecated: Include deprecated items in results.
+    """
+
+    space_id: str
+    include_deprecated: bool = False
+
+
+class GetRevisionsInput(BaseModel):
+    """Input schema for the ``memex_get_revisions`` / ``graph_get_revisions`` tool.
+
+    Args:
+        item_id: Item to retrieve revision history for.
+    """
+
+    item_id: str
+
+
+# -- Provenance and impact input models -----------------------------------
+
+
+class ProvenanceInput(BaseModel):
+    """Input schema for the ``memex_provenance`` / ``graph_provenance`` tool.
+
+    Args:
+        revision_id: Revision to inspect provenance for.
+    """
+
+    revision_id: str
+
+
+class DependenciesInput(BaseModel):
+    """Input schema for the ``memex_dependencies`` / ``graph_dependencies`` tool.
+
+    Args:
+        revision_id: Root revision for dependency traversal.
+        depth: Maximum traversal depth (1-20, default 10).
+    """
+
+    revision_id: str
+    depth: int = Field(default=10, ge=1, le=20)
+
+
+class ImpactAnalysisInput(BaseModel):
+    """Input schema for ``memex_impact_analysis`` / ``graph_impact_analysis``.
+
+    Args:
+        revision_id: Root revision for impact analysis.
+        depth: Maximum traversal depth (1-20, default 10).
+    """
+
+    revision_id: str
+    depth: int = Field(default=10, ge=1, le=20)
+
+
+# -- Temporal input models ------------------------------------------------
+
+
+class ResolveByTagInput(BaseModel):
+    """Input schema for ``memex_resolve_by_tag`` / ``temporal_resolve_by_tag``.
+
+    Args:
+        item_id: Item containing the tag.
+        tag_name: Name of the tag to resolve.
+    """
+
+    item_id: str
+    tag_name: str
+
+
+class ResolveAsOfInput(BaseModel):
+    """Input schema for ``memex_resolve_as_of`` / ``temporal_resolve_as_of``.
+
+    Args:
+        item_id: Item to resolve.
+        timestamp: ISO 8601 timestamp for point-in-time resolution.
+    """
+
+    item_id: str
+    timestamp: str
+
+
+class ResolveTagAtTimeInput(BaseModel):
+    """Input for ``memex_resolve_tag_at_time`` / ``temporal_resolve_tag_at_time``.
+
+    Args:
+        tag_id: Tag identifier.
+        timestamp: ISO 8601 timestamp for point-in-time tag resolution.
+    """
+
+    tag_id: str
+    timestamp: str
+
+
 # -- Serialization helpers -------------------------------------------------
 
 
@@ -170,6 +291,84 @@ def _serialize_message(msg: WorkingMemoryMessage) -> dict[str, Any]:
         "role": msg.role.value,
         "content": msg.content,
         "timestamp": msg.timestamp.isoformat(),
+    }
+
+
+def _serialize_edge(edge: Edge) -> dict[str, Any]:
+    """Serialize an Edge to a JSON-safe dictionary.
+
+    Args:
+        edge: Domain edge.
+
+    Returns:
+        Dictionary with all edge fields for MCP transport.
+    """
+    return {
+        "id": edge.id,
+        "source_revision_id": edge.source_revision_id,
+        "target_revision_id": edge.target_revision_id,
+        "edge_type": edge.edge_type.value,
+        "timestamp": edge.timestamp.isoformat(),
+        "confidence": edge.confidence,
+        "reason": edge.reason,
+        "context": edge.context,
+    }
+
+
+def _serialize_revision(revision: Revision) -> dict[str, Any]:
+    """Serialize a Revision to a JSON-safe dictionary.
+
+    Args:
+        revision: Domain revision.
+
+    Returns:
+        Dictionary with key revision fields for MCP transport.
+    """
+    return {
+        "id": revision.id,
+        "item_id": revision.item_id,
+        "revision_number": revision.revision_number,
+        "content": revision.content,
+        "summary": revision.summary,
+        "search_text": revision.search_text,
+        "created_at": revision.created_at.isoformat(),
+    }
+
+
+def _serialize_item(item: Item) -> dict[str, Any]:
+    """Serialize an Item to a JSON-safe dictionary.
+
+    Args:
+        item: Domain item.
+
+    Returns:
+        Dictionary with key item fields for MCP transport.
+    """
+    return {
+        "id": item.id,
+        "name": item.name,
+        "kind": item.kind.value,
+        "space_id": item.space_id,
+        "deprecated": item.deprecated,
+        "created_at": item.created_at.isoformat(),
+    }
+
+
+def _serialize_tag_assignment(assignment: TagAssignment) -> dict[str, Any]:
+    """Serialize a TagAssignment to a JSON-safe dictionary.
+
+    Args:
+        assignment: Tag assignment history record.
+
+    Returns:
+        Dictionary with all assignment fields for MCP transport.
+    """
+    return {
+        "id": assignment.id,
+        "tag_id": assignment.tag_id,
+        "item_id": assignment.item_id,
+        "revision_id": assignment.revision_id,
+        "assigned_at": assignment.assigned_at.isoformat(),
     }
 
 
@@ -367,6 +566,209 @@ class MemexToolService:
             "keys_deleted": deleted,
             "project_id": inp.project_id,
             "session_id": inp.session_id,
+        }
+
+    # -- Graph navigation methods ------------------------------------------
+
+    async def get_edges(self, inp: GetEdgesInput) -> dict[str, Any]:
+        """Query edges with optional filters.
+
+        Args:
+            inp: Edge query filters.
+
+        Returns:
+            Dictionary with matched edges and count.
+        """
+        edge_type = EdgeType(inp.edge_type) if inp.edge_type else None
+        edges = await self._store.get_edges(
+            source_revision_id=inp.source_revision_id,
+            target_revision_id=inp.target_revision_id,
+            edge_type=edge_type,
+            min_confidence=inp.min_confidence,
+            max_confidence=inp.max_confidence,
+        )
+        return {
+            "edges": [_serialize_edge(e) for e in edges],
+            "count": len(edges),
+        }
+
+    async def list_items(self, inp: ListItemsInput) -> dict[str, Any]:
+        """List items in a space.
+
+        Args:
+            inp: Space identifier and deprecation filter.
+
+        Returns:
+            Dictionary with items, count, and space_id.
+        """
+        items = await self._store.get_items_for_space(
+            inp.space_id,
+            include_deprecated=inp.include_deprecated,
+        )
+        return {
+            "items": [_serialize_item(i) for i in items],
+            "count": len(items),
+            "space_id": inp.space_id,
+        }
+
+    async def get_revisions(self, inp: GetRevisionsInput) -> dict[str, Any]:
+        """Retrieve full revision history for an item.
+
+        Args:
+            inp: Item identifier.
+
+        Returns:
+            Dictionary with revisions ordered by revision_number.
+        """
+        revisions = await self._store.get_revisions_for_item(inp.item_id)
+        return {
+            "revisions": [_serialize_revision(r) for r in revisions],
+            "count": len(revisions),
+            "item_id": inp.item_id,
+        }
+
+    # -- Provenance and impact methods -------------------------------------
+
+    async def provenance(self, inp: ProvenanceInput) -> dict[str, Any]:
+        """Get structured provenance summary for a revision.
+
+        Separates edges into incoming and outgoing for agent-side
+        reasoning about dependency direction.
+
+        Args:
+            inp: Revision identifier.
+
+        Returns:
+            Dictionary with incoming/outgoing edges and totals.
+        """
+        edges = await self._store.get_provenance_summary(inp.revision_id)
+        incoming = [e for e in edges if e.target_revision_id == inp.revision_id]
+        outgoing = [e for e in edges if e.source_revision_id == inp.revision_id]
+        return {
+            "revision_id": inp.revision_id,
+            "incoming": [_serialize_edge(e) for e in incoming],
+            "outgoing": [_serialize_edge(e) for e in outgoing],
+            "total_edges": len(edges),
+        }
+
+    async def dependencies(self, inp: DependenciesInput) -> dict[str, Any]:
+        """Traverse transitive dependencies from a revision.
+
+        Args:
+            inp: Root revision and traversal depth.
+
+        Returns:
+            Dictionary with dependency chain and count.
+        """
+        revisions = await self._store.get_dependencies(
+            inp.revision_id,
+            depth=inp.depth,
+        )
+        return {
+            "revision_id": inp.revision_id,
+            "depth": inp.depth,
+            "dependencies": [_serialize_revision(r) for r in revisions],
+            "count": len(revisions),
+        }
+
+    async def impact_analysis(
+        self,
+        inp: ImpactAnalysisInput,
+    ) -> dict[str, Any]:
+        """Analyze transitive impact of a revision.
+
+        Finds all revisions that depend on the given revision.
+
+        Args:
+            inp: Root revision and traversal depth.
+
+        Returns:
+            Dictionary with impacted revisions and count.
+        """
+        revisions = await self._store.analyze_impact(
+            inp.revision_id,
+            depth=inp.depth,
+        )
+        return {
+            "revision_id": inp.revision_id,
+            "depth": inp.depth,
+            "impacted": [_serialize_revision(r) for r in revisions],
+            "count": len(revisions),
+        }
+
+    # -- Temporal resolution methods ---------------------------------------
+
+    async def resolve_by_tag(
+        self,
+        inp: ResolveByTagInput,
+    ) -> dict[str, Any]:
+        """Resolve the revision a named tag currently points to.
+
+        Args:
+            inp: Item and tag name.
+
+        Returns:
+            Dictionary with resolved revision or null.
+        """
+        revision = await self._store.resolve_revision_by_tag(
+            inp.item_id,
+            inp.tag_name,
+        )
+        return {
+            "item_id": inp.item_id,
+            "tag_name": inp.tag_name,
+            "revision": (_serialize_revision(revision) if revision else None),
+            "found": revision is not None,
+        }
+
+    async def resolve_as_of(
+        self,
+        inp: ResolveAsOfInput,
+    ) -> dict[str, Any]:
+        """Resolve the latest revision at or before a timestamp.
+
+        Args:
+            inp: Item and ISO 8601 timestamp.
+
+        Returns:
+            Dictionary with resolved revision or null.
+        """
+        ts = datetime.fromisoformat(inp.timestamp)
+        revision = await self._store.resolve_revision_as_of(
+            inp.item_id,
+            ts,
+        )
+        return {
+            "item_id": inp.item_id,
+            "timestamp": inp.timestamp,
+            "revision": (_serialize_revision(revision) if revision else None),
+            "found": revision is not None,
+        }
+
+    async def resolve_tag_at_time(
+        self,
+        inp: ResolveTagAtTimeInput,
+    ) -> dict[str, Any]:
+        """Resolve what revision a tag pointed to at a historical time.
+
+        Uses tag-assignment history for point-in-time resolution.
+
+        Args:
+            inp: Tag ID and ISO 8601 timestamp.
+
+        Returns:
+            Dictionary with resolved revision or null.
+        """
+        ts = datetime.fromisoformat(inp.timestamp)
+        revision = await self._store.resolve_tag_at_time(
+            inp.tag_id,
+            ts,
+        )
+        return {
+            "tag_id": inp.tag_id,
+            "timestamp": inp.timestamp,
+            "revision": (_serialize_revision(revision) if revision else None),
+            "found": revision is not None,
         }
 
 
@@ -578,6 +980,241 @@ def create_mcp_server(
             session_id=session_id,
         )
         result = await service.working_memory_clear(inp)
+        return orjson.dumps(result).decode()
+
+    # -- Graph navigation: edges, items, revisions -------------------------
+
+    @mcp.tool(name="memex_get_edges")
+    async def memex_get_edges(
+        source_revision_id: str | None = None,
+        target_revision_id: str | None = None,
+        edge_type: str | None = None,
+        min_confidence: float | None = None,
+        max_confidence: float | None = None,
+    ) -> str:
+        """Query typed edges between revisions with optional filters.
+
+        Supports filtering by source, target, edge type, and confidence
+        range. Returns all matching edges with full metadata.
+        """
+        inp = GetEdgesInput(
+            source_revision_id=source_revision_id,
+            target_revision_id=target_revision_id,
+            edge_type=edge_type,
+            min_confidence=min_confidence,
+            max_confidence=max_confidence,
+        )
+        result = await service.get_edges(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="graph_get_edges")
+    async def graph_get_edges_alias(
+        source_revision_id: str | None = None,
+        target_revision_id: str | None = None,
+        edge_type: str | None = None,
+        min_confidence: float | None = None,
+        max_confidence: float | None = None,
+    ) -> str:
+        """Query edges (paper taxonomy alias for memex_get_edges)."""
+        inp = GetEdgesInput(
+            source_revision_id=source_revision_id,
+            target_revision_id=target_revision_id,
+            edge_type=edge_type,
+            min_confidence=min_confidence,
+            max_confidence=max_confidence,
+        )
+        result = await service.get_edges(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_list_items")
+    async def memex_list_items(
+        space_id: str,
+        include_deprecated: bool = False,
+    ) -> str:
+        """List items in a space with optional deprecation filter.
+
+        Returns items ordered by creation time. Deprecated items are
+        excluded by default per FR-4 contraction semantics.
+        """
+        inp = ListItemsInput(
+            space_id=space_id,
+            include_deprecated=include_deprecated,
+        )
+        result = await service.list_items(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="graph_list_items")
+    async def graph_list_items_alias(
+        space_id: str,
+        include_deprecated: bool = False,
+    ) -> str:
+        """List items in a space (paper taxonomy alias)."""
+        inp = ListItemsInput(
+            space_id=space_id,
+            include_deprecated=include_deprecated,
+        )
+        result = await service.list_items(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_get_revisions")
+    async def memex_get_revisions(item_id: str) -> str:
+        """Retrieve the full revision history for an item.
+
+        Returns all revisions ordered by revision number ascending,
+        enabling inspection of the complete versioning chain.
+        """
+        inp = GetRevisionsInput(item_id=item_id)
+        result = await service.get_revisions(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="graph_get_revisions")
+    async def graph_get_revisions_alias(item_id: str) -> str:
+        """Get revision history (paper taxonomy alias)."""
+        inp = GetRevisionsInput(item_id=item_id)
+        result = await service.get_revisions(inp)
+        return orjson.dumps(result).decode()
+
+    # -- Provenance and impact analysis ------------------------------------
+
+    @mcp.tool(name="memex_provenance")
+    async def memex_provenance(revision_id: str) -> str:
+        """Get the provenance summary for a revision.
+
+        Returns all edges connected to the revision, separated into
+        incoming and outgoing for agent-side reasoning about dependency
+        direction and causal chains.
+        """
+        inp = ProvenanceInput(revision_id=revision_id)
+        result = await service.provenance(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="graph_provenance")
+    async def graph_provenance_alias(revision_id: str) -> str:
+        """Provenance summary (paper taxonomy alias)."""
+        inp = ProvenanceInput(revision_id=revision_id)
+        result = await service.provenance(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_dependencies")
+    async def memex_dependencies(
+        revision_id: str,
+        depth: int = 10,
+    ) -> str:
+        """Traverse transitive dependencies from a revision.
+
+        Follows outgoing DEPENDS_ON and DERIVED_FROM edges up to the
+        specified depth (1-20, default 10).
+        """
+        inp = DependenciesInput(revision_id=revision_id, depth=depth)
+        result = await service.dependencies(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="graph_dependencies")
+    async def graph_dependencies_alias(
+        revision_id: str,
+        depth: int = 10,
+    ) -> str:
+        """Dependency traversal (paper taxonomy alias)."""
+        inp = DependenciesInput(revision_id=revision_id, depth=depth)
+        result = await service.dependencies(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_impact_analysis")
+    async def memex_impact_analysis(
+        revision_id: str,
+        depth: int = 10,
+    ) -> str:
+        """Analyze transitive impact of a revision.
+
+        Finds all revisions that depend on the given revision via
+        incoming DEPENDS_ON and DERIVED_FROM edges. Depth range 1-20.
+        """
+        inp = ImpactAnalysisInput(revision_id=revision_id, depth=depth)
+        result = await service.impact_analysis(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="graph_impact_analysis")
+    async def graph_impact_analysis_alias(
+        revision_id: str,
+        depth: int = 10,
+    ) -> str:
+        """Impact analysis (paper taxonomy alias)."""
+        inp = ImpactAnalysisInput(revision_id=revision_id, depth=depth)
+        result = await service.impact_analysis(inp)
+        return orjson.dumps(result).decode()
+
+    # -- Temporal resolution -----------------------------------------------
+
+    @mcp.tool(name="memex_resolve_by_tag")
+    async def memex_resolve_by_tag(
+        item_id: str,
+        tag_name: str,
+    ) -> str:
+        """Resolve the revision a named tag currently points to.
+
+        Follows the live POINTS_TO edge from a tag with the given name
+        on the specified item.
+        """
+        inp = ResolveByTagInput(item_id=item_id, tag_name=tag_name)
+        result = await service.resolve_by_tag(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="temporal_resolve_by_tag")
+    async def temporal_resolve_by_tag_alias(
+        item_id: str,
+        tag_name: str,
+    ) -> str:
+        """Resolve by tag (paper taxonomy alias)."""
+        inp = ResolveByTagInput(item_id=item_id, tag_name=tag_name)
+        result = await service.resolve_by_tag(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_resolve_as_of")
+    async def memex_resolve_as_of(
+        item_id: str,
+        timestamp: str,
+    ) -> str:
+        """Resolve the latest revision of an item at or before a timestamp.
+
+        Accepts an ISO 8601 timestamp string. Returns the most recent
+        revision created at or before that time.
+        """
+        inp = ResolveAsOfInput(item_id=item_id, timestamp=timestamp)
+        result = await service.resolve_as_of(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="temporal_resolve_as_of")
+    async def temporal_resolve_as_of_alias(
+        item_id: str,
+        timestamp: str,
+    ) -> str:
+        """Resolve as-of time (paper taxonomy alias)."""
+        inp = ResolveAsOfInput(item_id=item_id, timestamp=timestamp)
+        result = await service.resolve_as_of(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_resolve_tag_at_time")
+    async def memex_resolve_tag_at_time(
+        tag_id: str,
+        timestamp: str,
+    ) -> str:
+        """Resolve what revision a tag pointed to at a historical time.
+
+        Uses tag-assignment history for point-in-time resolution per FR-5.
+        Accepts an ISO 8601 timestamp string.
+        """
+        inp = ResolveTagAtTimeInput(tag_id=tag_id, timestamp=timestamp)
+        result = await service.resolve_tag_at_time(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="temporal_resolve_tag_at_time")
+    async def temporal_resolve_tag_at_time_alias(
+        tag_id: str,
+        timestamp: str,
+    ) -> str:
+        """Resolve tag at time (paper taxonomy alias)."""
+        inp = ResolveTagAtTimeInput(tag_id=tag_id, timestamp=timestamp)
+        result = await service.resolve_tag_at_time(inp)
         return orjson.dumps(result).decode()
 
     return mcp

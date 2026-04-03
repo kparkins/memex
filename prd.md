@@ -770,7 +770,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Serialize structured provenance payloads for agent-side reasoning",
       "Add tests: each tool returns correct structured responses for representative queries"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

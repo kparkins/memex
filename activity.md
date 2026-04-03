@@ -745,3 +745,38 @@
 - `uv run ruff format --check src/ tests/` -- 56 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 31 source files
 - `uv run pytest tests/ -v` -- 548 passed (27 new MCP tool tests + 521 existing)
+
+## T26: Implement MCP tools: graph navigation, provenance, and temporal queries (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/mcp/tools.py` with 9 new tool capabilities (18 tool registrations including paper taxonomy aliases):
+  - **Graph navigation input models**: `GetEdgesInput`, `ListItemsInput`, `GetRevisionsInput` for edge queries, space listing, and revision history
+  - **Provenance/impact input models**: `ProvenanceInput`, `DependenciesInput`, `ImpactAnalysisInput` for provenance summary, dependency traversal, and impact analysis
+  - **Temporal input models**: `ResolveByTagInput`, `ResolveAsOfInput`, `ResolveTagAtTimeInput` for tag resolution, as-of-time queries, and point-in-time tag resolution
+  - **Serialization helpers**: `_serialize_edge`, `_serialize_revision`, `_serialize_item`, `_serialize_tag_assignment` for structured MCP transport payloads
+  - **MemexToolService methods**: `get_edges()`, `list_items()`, `get_revisions()`, `provenance()`, `dependencies()`, `impact_analysis()`, `resolve_by_tag()`, `resolve_as_of()`, `resolve_tag_at_time()`
+  - **Provenance payload structure**: Separates edges into `incoming` and `outgoing` for agent-side reasoning about dependency direction
+  - **Tool registration pairs**: Each capability registered under both `memex_*` repo-local alias and paper taxonomy canonical name (`graph_*`, `temporal_*`)
+  - Total tools: 26 (8 original lifecycle/recall/working-memory + 18 new graph/provenance/temporal)
+- Updated `src/memex/mcp/__init__.py` to re-export all 9 new input models
+- Updated `tests/test_mcp_tools.py`: Adjusted `test_tool_count` from 8 to 26 tools
+- Created `tests/test_mcp_graph_tools.py` with 37 tests across 12 test classes:
+  - `TestGetEdges`: 4 tests (filter by source, filter by type, no edges empty, metadata serialized)
+  - `TestListItems`: 4 tests (lists items, excludes deprecated, includes deprecated when flagged, item fields complete)
+  - `TestGetRevisions`: 3 tests (revision history ordered, nonexistent item empty, revision fields complete)
+  - `TestProvenance`: 3 tests (incoming/outgoing separation, no edges empty, JSON serializable)
+  - `TestDependencies`: 3 tests (transitive DEPENDS_ON traversal, depth limit, no deps empty)
+  - `TestImpactAnalysis`: 3 tests (finds impacted revisions, no impact empty, default depth 10)
+  - `TestResolveByTag`: 3 tests (resolves active tag, missing tag not found, resolves after revision)
+  - `TestResolveAsOf`: 3 tests (latest before timestamp, no match returns not found, echoes timestamp)
+  - `TestResolveTagAtTime`: 3 tests (historical resolution, no assignment before timestamp, resolves after tag move)
+  - `TestGraphToolRegistration`: 5 tests (graph nav tools, provenance tools, temporal tools, total count 26, all have descriptions)
+  - `TestGraphToolSerialization`: 3 tests (provenance JSON, temporal JSON, edges JSON)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 57 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 31 source files
+- `uv run pytest tests/ -v` -- 585 passed (37 new graph tool tests + 548 existing)
