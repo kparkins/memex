@@ -656,6 +656,90 @@ class Neo4jStore:
             )
             return [_to_revision(dict(rec["r"])) async for rec in result]
 
+    # -- Temporal query operations -----------------------------------------
+
+    async def resolve_revision_by_tag(
+        self,
+        item_id: str,
+        tag_name: str,
+    ) -> Revision | None:
+        """Resolve the revision a named tag currently points to.
+
+        Args:
+            item_id: ID of the item owning the tag.
+            tag_name: Name of the tag (e.g. ``"active"``).
+
+        Returns:
+            The Revision the tag points to, or None if the tag
+            does not exist on this item.
+        """
+        query = (
+            f"MATCH (t:{NodeLabel.TAG} "
+            f"{{item_id: $iid, name: $tname}})"
+            f"-[:{RelType.POINTS_TO}]->"
+            f"(r:{NodeLabel.REVISION}) RETURN r"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, iid=item_id, tname=tag_name)
+            rec = await result.single()
+            return _to_revision(dict(rec["r"])) if rec else None
+
+    async def resolve_revision_as_of(
+        self,
+        item_id: str,
+        timestamp: datetime,
+    ) -> Revision | None:
+        """Resolve the latest revision of an item at or before a timestamp.
+
+        Args:
+            item_id: ID of the item.
+            timestamp: Point in time to resolve against.
+
+        Returns:
+            The most recent Revision created at or before the timestamp,
+            or None if no revision exists before that time.
+        """
+        query = (
+            f"MATCH (r:{NodeLabel.REVISION} {{item_id: $iid}}) "
+            f"WHERE r.created_at <= $ts "
+            f"RETURN r ORDER BY r.created_at DESC LIMIT 1"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, iid=item_id, ts=_dt(timestamp))
+            rec = await result.single()
+            return _to_revision(dict(rec["r"])) if rec else None
+
+    async def resolve_tag_at_time(
+        self,
+        tag_id: str,
+        timestamp: datetime,
+    ) -> Revision | None:
+        """Resolve which revision a tag pointed to at a given time.
+
+        Uses tag-assignment history to find the most recent assignment
+        at or before the timestamp, then returns the referenced revision.
+
+        Args:
+            tag_id: ID of the tag.
+            timestamp: Point in time to resolve against.
+
+        Returns:
+            The Revision the tag pointed to at that time, or None if
+            no assignment existed before the timestamp.
+        """
+        query = (
+            f"MATCH (ta:{NodeLabel.TAG_ASSIGNMENT} {{tag_id: $tid}}) "
+            f"WHERE ta.assigned_at <= $ts "
+            f"ORDER BY ta.assigned_at DESC LIMIT 1 "
+            f"WITH ta "
+            f"MATCH (r:{NodeLabel.REVISION} {{id: ta.revision_id}}) "
+            f"RETURN r"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, tid=tag_id, ts=_dt(timestamp))
+            rec = await result.single()
+            return _to_revision(dict(rec["r"])) if rec else None
+
     # -- Belief revision operations ----------------------------------------
 
     async def revise_item(

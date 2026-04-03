@@ -537,7 +537,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Implement revision history for an item",
       "Add tests for each temporal query path including edge cases (no match, boundary timestamps)"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

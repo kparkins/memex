@@ -201,3 +201,25 @@
 - `uv run ruff format --check src/ tests/` -- 22 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 13 source files
 - `uv run pytest tests/ -v` -- 163 passed (11 new edge metadata tests + 152 existing)
+
+## T09: Implement temporal query operations (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/stores/neo4j_store.py` with 3 new temporal query methods on `Neo4jStore`:
+  - `resolve_revision_by_tag`: Looks up the revision a named tag currently points to on an item via TAG->POINTS_TO->REVISION traversal
+  - `resolve_revision_as_of`: Finds the latest revision of an item created at or before a given timestamp using ISO 8601 string comparison
+  - `resolve_tag_at_time`: Uses tag-assignment history to determine which revision a tag pointed to at a given point in time
+- Existing `get_revisions_for_item` already satisfies the "revision history for an item" requirement
+- Created `tests/test_temporal_queries.py` with 18 integration tests across 4 test classes:
+  - `TestResolveRevisionByTag`: 4 tests (current pointer, after rollback, nonexistent tag, nonexistent item)
+  - `TestResolveRevisionAsOf`: 5 tests (exact timestamp, between revisions, after all, before any, nonexistent item)
+  - `TestResolveTagAtTime`: 5 tests (initial assignment, after second move, latest assignment, before any assignment, nonexistent tag)
+  - `TestRevisionHistory`: 4 tests (ordered history, single revision, nonexistent item, superseded accessible)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 23 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 13 source files
+- `uv run pytest tests/ -v` -- 181 passed (18 new temporal query tests + 163 existing)
