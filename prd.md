@@ -660,7 +660,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Ensure atomicity at the memory-unit level",
       "Add tests: full ingest round-trip, recall context present in response, PII redacted before persistence, atomicity on partial failure"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

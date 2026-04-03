@@ -437,3 +437,30 @@
 - `uv run ruff format --check src/ tests/` -- 37 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 19 source files
 - `uv run pytest tests/ -v` -- 375 passed (39 new privacy tests + 336 existing)
+
+## T18: Implement atomic memory ingest operation (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/stores/neo4j_store.py` with 2 new methods on `Neo4jStore`:
+  - `resolve_space`: Finds an existing space by name within a project (with optional parent_space_id), or creates a new one if no match exists; root spaces matched by absence of CHILD_OF edge
+  - `ingest_memory_unit`: Atomically creates a complete memory unit in a single Neo4j transaction -- item + IN_SPACE, revision + REVISION_OF, tags + TAG_OF + POINTS_TO + TagAssignment + ASSIGNMENT_OF + ASSIGNED_TO, artifacts + ATTACHED_TO, domain edges, and optional BUNDLES edge to a bundle item's latest revision
+- Created `src/memex/orchestration/ingest.py` with atomic ingest orchestration:
+  - `ArtifactSpec`: Input model for artifact pointer specifications
+  - `EdgeSpec`: Input model for domain edge specifications
+  - `IngestParams`: Comprehensive input parameters for the ingest operation (project, space, item, revision content, tags, artifacts, edges, bundle, session, role)
+  - `IngestResult`: Output model with space, item, revision, tags, tag_assignments, artifacts, edges, and recall_context
+  - `memory_ingest`: Canonical dual-action ingest function -- applies PII redaction and credential rejection before any persistence, resolves/creates space, commits the full memory unit atomically, buffers the working-memory turn in Redis, and returns immediate recall context via hybrid retrieval
+- Updated `src/memex/orchestration/__init__.py` to re-export ArtifactSpec, EdgeSpec, IngestParams, IngestResult, memory_ingest
+- Created `tests/test_ingest.py` with 16 integration tests across 4 test classes:
+  - `TestFullIngestRoundTrip`: 6 tests (basic ingest with read-back, artifact attachment, edge creation, bundle membership, space resolution reuses existing, multiple tags)
+  - `TestRecallContext`: 2 tests (recall returns matching pre-existing items, empty recall when no prior data)
+  - `TestPIIRedaction`: 3 tests (content redacted before persistence, search_text redacted, clean content unchanged)
+  - `TestAtomicity`: 5 tests (credential rejection prevents all persistence, credential in search_text rejected, working memory buffered with correct role, no Redis skips working memory, PII redacted in working memory turn)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 39 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 20 source files
+- `uv run pytest tests/ -v` -- 391 passed (16 new ingest tests + 375 existing)

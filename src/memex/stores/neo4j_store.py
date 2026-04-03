@@ -346,6 +346,64 @@ class Neo4jStore:
         node = await self._get_node(NodeLabel.SPACE, space_id)
         return _to_space(node) if node else None
 
+    async def resolve_space(
+        self,
+        project_id: str,
+        space_name: str,
+        parent_space_id: str | None = None,
+    ) -> Space:
+        """Find an existing space by name or create a new one.
+
+        Matches a space with the given name within the project. If
+        ``parent_space_id`` is ``None``, only root spaces (no
+        ``CHILD_OF`` edge) are matched. Creates a new space when no
+        match is found.
+
+        Args:
+            project_id: Project the space belongs to.
+            space_name: Name to resolve.
+            parent_space_id: Parent space for nested hierarchy.
+
+        Returns:
+            Resolved or newly created Space.
+        """
+        if parent_space_id is not None:
+            query = (
+                f"MATCH (s:{NodeLabel.SPACE} {{name: $name}})"
+                f"-[:{RelType.IN_PROJECT}]->"
+                f"(:{NodeLabel.PROJECT} {{id: $pid}}), "
+                f"(s)-[:{RelType.CHILD_OF}]->"
+                f"(:{NodeLabel.SPACE} {{id: $parent_id}}) "
+                f"RETURN s LIMIT 1"
+            )
+            params: dict[str, Any] = {
+                "name": space_name,
+                "pid": project_id,
+                "parent_id": parent_space_id,
+            }
+        else:
+            query = (
+                f"MATCH (s:{NodeLabel.SPACE} {{name: $name}})"
+                f"-[:{RelType.IN_PROJECT}]->"
+                f"(:{NodeLabel.PROJECT} {{id: $pid}}) "
+                f"WHERE NOT EXISTS {{ (s)-[:{RelType.CHILD_OF}]->() }} "
+                f"RETURN s LIMIT 1"
+            )
+            params = {"name": space_name, "pid": project_id}
+
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, **params)
+            rec = await result.single()
+            if rec is not None:
+                return _to_space(dict(rec["s"]))
+
+        space = Space(
+            project_id=project_id,
+            name=space_name,
+            parent_space_id=parent_space_id,
+        )
+        return await self.create_space(space)
+
     # -- Item + Revision + Tags (atomic) ----------------------------------
 
     async def create_item_with_revision(
@@ -416,6 +474,142 @@ class Neo4jStore:
         async with self._driver.session(database=self._database) as session:
             tag_assignments = await session.execute_write(_work)
         return item, revision, tags, tag_assignments
+
+    # -- Atomic ingest ----------------------------------------------------
+
+    async def ingest_memory_unit(
+        self,
+        *,
+        item: Item,
+        revision: Revision,
+        tags: list[Tag],
+        artifacts: list[Artifact] | None = None,
+        edges: list[Edge] | None = None,
+        bundle_item_id: str | None = None,
+    ) -> tuple[list[TagAssignment], Edge | None]:
+        """Atomically create a full memory unit in one transaction.
+
+        Creates item, revision, tags with assignment history, artifacts,
+        domain edges, and optional bundle membership. All writes occur
+        in a single Neo4j transaction for atomicity.
+
+        Args:
+            item: Item domain model to persist.
+            revision: Initial revision for the item.
+            tags: Tags to apply to the revision.
+            artifacts: Artifact pointer records to attach.
+            edges: Domain edges from this revision to existing revisions.
+            bundle_item_id: Bundle item whose latest revision receives
+                a ``BUNDLES`` edge from the new revision.
+
+        Returns:
+            Tuple of (tag_assignments, bundle_edge). ``bundle_edge`` is
+            ``None`` when no ``bundle_item_id`` is provided or the
+            bundle item has no revisions.
+        """
+        artifacts = artifacts or []
+        edges = edges or []
+
+        async def _work(
+            tx: AsyncManagedTransaction,
+        ) -> tuple[list[TagAssignment], Edge | None]:
+            # Item + IN_SPACE
+            await _run(
+                tx,
+                f"MATCH (s:{NodeLabel.SPACE} {{id: $sid}}) "
+                f"CREATE (:{NodeLabel.ITEM} $props)"
+                f"-[:{RelType.IN_SPACE}]->(s)",
+                sid=item.space_id,
+                props=_item_props(item),
+            )
+            # Revision + REVISION_OF
+            await _run(
+                tx,
+                f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}) "
+                f"CREATE (:{NodeLabel.REVISION} $props)"
+                f"-[:{RelType.REVISION_OF}]->(i)",
+                iid=revision.item_id,
+                props=_revision_props(revision),
+            )
+            # Tags + TagAssignments
+            assignments: list[TagAssignment] = []
+            for tag in tags:
+                ta = TagAssignment(
+                    tag_id=tag.id,
+                    item_id=tag.item_id,
+                    revision_id=tag.revision_id,
+                )
+                await _run(
+                    tx,
+                    f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}), "
+                    f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+                    f"CREATE (t:{NodeLabel.TAG} $tp)"
+                    f"-[:{RelType.TAG_OF}]->(i) "
+                    f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
+                    f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
+                    f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
+                    f"CREATE (ta)"
+                    f"-[:{RelType.ASSIGNED_TO}]->(r)",
+                    iid=tag.item_id,
+                    rid=tag.revision_id,
+                    tp=_tag_props(tag),
+                    tap=_ta_props(ta),
+                )
+                assignments.append(ta)
+            # Artifacts + ATTACHED_TO
+            for artifact in artifacts:
+                await _run(
+                    tx,
+                    f"MATCH (r:{NodeLabel.REVISION} {{id: $rid}}) "
+                    f"CREATE (:{NodeLabel.ARTIFACT} $props)"
+                    f"-[:{RelType.ATTACHED_TO}]->(r)",
+                    rid=artifact.revision_id,
+                    props=_artifact_props(artifact),
+                )
+            # Domain edges
+            for edge in edges:
+                rel_type = _EDGE_TYPE_TO_REL[edge.edge_type]
+                await _run(
+                    tx,
+                    f"MATCH (src:{NodeLabel.REVISION} {{id: $src_id}}), "
+                    f"(tgt:{NodeLabel.REVISION} {{id: $tgt_id}}) "
+                    f"CREATE (src)-[:{rel_type} $props]->(tgt)",
+                    src_id=edge.source_revision_id,
+                    tgt_id=edge.target_revision_id,
+                    props=_edge_rel_props(edge),
+                )
+            # Bundle membership
+            bundle_edge: Edge | None = None
+            if bundle_item_id is not None:
+                result = await tx.run(
+                    f"MATCH (br:{NodeLabel.REVISION})"
+                    f"-[:{RelType.REVISION_OF}]->"
+                    f"(:{NodeLabel.ITEM} {{id: $bid}}) "
+                    f"RETURN br.id AS br_id "
+                    f"ORDER BY br.revision_number DESC LIMIT 1",
+                    bid=bundle_item_id,
+                )
+                rec = await result.single()
+                if rec is not None:
+                    bundle_rev_id = str(rec["br_id"])
+                    bundle_edge = Edge(
+                        source_revision_id=revision.id,
+                        target_revision_id=bundle_rev_id,
+                        edge_type=EdgeType.BUNDLES,
+                    )
+                    await _run(
+                        tx,
+                        f"MATCH (src:{NodeLabel.REVISION} {{id: $src_id}}), "
+                        f"(tgt:{NodeLabel.REVISION} {{id: $tgt_id}}) "
+                        f"CREATE (src)-[:{RelType.BUNDLES} $props]->(tgt)",
+                        src_id=revision.id,
+                        tgt_id=bundle_rev_id,
+                        props=_edge_rel_props(bundle_edge),
+                    )
+            return assignments, bundle_edge
+
+        async with self._driver.session(database=self._database) as session:
+            return await session.execute_write(_work)
 
     # -- Standalone revision ----------------------------------------------
 
