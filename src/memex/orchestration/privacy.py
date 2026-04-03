@@ -79,12 +79,12 @@ _BEARER_RE: Final = re.compile(
     r"(?i)bearer\s+[A-Za-z0-9\-._~+/]{20,}=*",
 )
 
-_CREDENTIAL_PATTERNS: Final[list[re.Pattern[str]]] = [
-    _AWS_KEY_RE,
-    _PEM_KEY_RE,
-    _GITHUB_TOKEN_RE,
-    _GENERIC_SECRET_RE,
-    _BEARER_RE,
+_CREDENTIAL_PATTERNS: Final[list[tuple[re.Pattern[str], str]]] = [
+    (_AWS_KEY_RE, "AWS access key"),
+    (_PEM_KEY_RE, "PEM private key"),
+    (_GITHUB_TOKEN_RE, "GitHub token"),
+    (_GENERIC_SECRET_RE, "generic secret assignment"),
+    (_BEARER_RE, "bearer token"),
 ]
 
 
@@ -114,14 +114,11 @@ def reject_credentials(text: str) -> None:
         text: Raw input text.
 
     Raises:
-        CredentialViolation: When any credential pattern matches.
+        CredentialViolationError: When any credential pattern matches.
     """
-    for pattern in _CREDENTIAL_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            raise CredentialViolationError(
-                f"Credential pattern detected: {match.group()[:20]}..."
-            )
+    for pattern, name in _CREDENTIAL_PATTERNS:
+        if pattern.search(text):
+            raise CredentialViolationError(f"Credential pattern detected: {name}")
 
 
 def apply_privacy_hooks(

@@ -108,6 +108,17 @@ class TestRejectAWSKey:
         with pytest.raises(CredentialViolationError):
             reject_credentials("config = {'key': 'AKIAIOSFODNN7EXAMPLE'}")
 
+    def test_error_message_does_not_echo_credential_text(self) -> None:
+        """Credential rejection messages should not contain matched secrets."""
+        secret = "AKIAIOSFODNN7EXAMPLE"
+
+        with pytest.raises(CredentialViolationError) as exc_info:
+            reject_credentials(f"key: {secret}")
+
+        message = str(exc_info.value)
+        assert secret not in message
+        assert "pattern" in message.lower()
+
 
 class TestRejectPEMKey:
     """PEM private key headers trigger rejection."""

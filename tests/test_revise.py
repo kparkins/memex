@@ -25,6 +25,7 @@ from memex.orchestration.ingest import (
     ReviseResult,
     memory_revise,
 )
+from memex.orchestration.privacy import CredentialViolationError
 from memex.retrieval.strategy import SearchStrategy
 from memex.stores.protocols import MemoryStore
 from memex.stores.redis_store import ConsolidationEventFeed
@@ -194,6 +195,64 @@ class TestReviseBasic:
 
         call_args = deps.store.revise_item.call_args
         assert call_args.kwargs.get("tag_name") == "latest"
+
+
+class TestRevisePrivacy:
+    """Privacy hooks in revise orchestration (fixed by R3)."""
+
+    async def test_revise_redacts_pii_before_persistence(self, deps):
+        """PII in revise content should be redacted before store writes."""
+        item_id = "item-privacy"
+        deps.store.get_revisions_for_item.return_value = []
+
+        new_rev = _make_revision(item_id, 1, content="Contact [EMAIL_REDACTED]")
+        assignment = _make_tag_assignment("tag-1", new_rev.id, item_id=item_id)
+        deps.store.revise_item.return_value = (new_rev, assignment)
+        deps.store.get_item.return_value = None
+
+        await deps.service.revise(
+            ReviseParams(item_id=item_id, content="Contact alice@example.com")
+        )
+
+        built_revision = deps.store.revise_item.call_args[0][1]
+        assert built_revision.content == "Contact [EMAIL_REDACTED]"
+        assert built_revision.search_text == "Contact [EMAIL_REDACTED]"
+
+    async def test_revise_redacts_custom_search_text_before_persistence(self, deps):
+        """Explicit search_text should be sanitized before store writes."""
+        item_id = "item-search-privacy"
+        deps.store.get_revisions_for_item.return_value = []
+
+        new_rev = _make_revision(item_id, 1, content="clean body")
+        assignment = _make_tag_assignment("tag-1", new_rev.id, item_id=item_id)
+        deps.store.revise_item.return_value = (new_rev, assignment)
+        deps.store.get_item.return_value = None
+
+        await deps.service.revise(
+            ReviseParams(
+                item_id=item_id,
+                content="clean body",
+                search_text="Contact alice@example.com",
+            )
+        )
+
+        built_revision = deps.store.revise_item.call_args[0][1]
+        assert built_revision.search_text == "Contact [EMAIL_REDACTED]"
+
+    async def test_revise_rejects_credentials_before_store_write(self, deps):
+        """Credential content should abort revise before store.revise_item."""
+        item_id = "item-secret"
+        deps.store.get_revisions_for_item.return_value = []
+
+        with pytest.raises(CredentialViolationError):
+            await deps.service.revise(
+                ReviseParams(
+                    item_id=item_id,
+                    content="api_key=sk_live_abcdefgh12345678",
+                )
+            )
+
+        deps.store.revise_item.assert_not_called()
 
 
 class TestReviseEventPublication:

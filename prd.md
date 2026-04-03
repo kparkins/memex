@@ -972,7 +972,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Add tests: revise() with PII content produces redacted output, revise() with custom search_text sanitizes that field too, and revise() rejects credentials before store.revise_item is called",
       "Verify all existing privacy and ingest tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

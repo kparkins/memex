@@ -1195,3 +1195,32 @@
 - `uv run mypy src/` -- Success: no issues found in 41 source files
 - `uv run pytest tests/test_tag_pointer_safety.py tests/test_belief_revision.py tests/test_neo4j_store.py -v` -- 51 passed
 - `uv run pytest tests/ -v` -- 771 passed (11 new tag safety tests + 3 previously-xfailing R2 tests now passing), 5 pre-existing failures unchanged (temporal timing, enrichment embedding)
+
+## R3: Fix security issues: credential leak, privacy gap in revise, password default (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Changed `_CREDENTIAL_PATTERNS` in `src/memex/orchestration/privacy.py` from `list[re.Pattern]` to `list[tuple[re.Pattern, str]]` with descriptive names for each pattern (AWS access key, PEM private key, GitHub token, generic secret assignment, bearer token)
+- Updated `reject_credentials` to report pattern name instead of matched text in `CredentialViolationError` message, preventing credential leakage via error messages
+- Fixed docstring typo (`CredentialViolation` -> `CredentialViolationError`)
+- Added privacy hooks to `IngestService.revise()` in `src/memex/orchestration/ingest.py`:
+  - New `privacy: PrivacySettings | None` keyword parameter matching `ingest()` signature
+  - Applies `apply_privacy_hooks` to both `params.content` and `params.search_text` before building the Revision
+  - Credential rejection runs before any store interaction
+- Added `model_validator` to `Neo4jSettings` in `src/memex/config.py`:
+  - Emits `UserWarning` when the default dev password (`memex_dev_password`) is in use
+  - Named constant `_DEV_PASSWORD` replaces magic string
+- Updated `tests/test_privacy.py`: removed `@pytest.mark.xfail(strict=True)` from `test_error_message_does_not_echo_credential_text` (now passes)
+- Updated `tests/test_revise.py`: removed 3 `@pytest.mark.xfail(strict=True)` markers from `TestRevisePrivacy` (all now pass)
+- Created `tests/test_r3_security.py` with 11 tests across 3 test classes:
+  - `TestCredentialErrorMessageSanitization`: 5 tests (AWS, GitHub, generic, bearer, PEM -- all verify no credential text in error message)
+  - `TestRevisePrivacyHooks`: 4 tests (PII redacted in content, PII redacted in search_text, credentials rejected before store call, credentials in search_text rejected)
+  - `TestNeo4jPasswordWarning`: 2 tests (warns on default, no warning on custom)
+
+**Verification**:
+- `uv run ruff check` on changed files -- All checks passed
+- `uv run ruff format --check` on changed files -- All files already formatted
+- `uv run mypy src/` -- Success: no issues found in 41 source files
+- `uv run pytest tests/test_r3_security.py tests/test_privacy.py tests/test_revise.py -v` -- 69 passed
+- `uv run pytest tests/ -v` -- 786 passed (11 new R3 tests + 4 previously-xfailing R3 tests now passing), 5 pre-existing failures unchanged (temporal timing, enrichment embedding)

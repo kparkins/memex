@@ -7,8 +7,15 @@ Nested models use double-underscore separators
 
 from __future__ import annotations
 
-from pydantic import Field
+import logging
+import warnings
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+_DEV_PASSWORD = "memex_dev_password"
 
 
 class Neo4jSettings(BaseSettings):
@@ -18,8 +25,19 @@ class Neo4jSettings(BaseSettings):
 
     uri: str = "bolt://localhost:7687"
     user: str = "neo4j"
-    password: str = "memex_dev_password"
+    password: str = _DEV_PASSWORD
     database: str = "neo4j"
+
+    @model_validator(mode="after")
+    def _warn_default_password(self) -> Neo4jSettings:
+        if self.password == _DEV_PASSWORD:
+            warnings.warn(
+                "Neo4j is using the default dev password; "
+                "set MEMEX_NEO4J_PASSWORD for production",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self
 
 
 class RedisSettings(BaseSettings):

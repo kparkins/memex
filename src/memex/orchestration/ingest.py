@@ -350,7 +350,12 @@ class IngestService:
             recall_context=recall_context,
         )
 
-    async def revise(self, params: ReviseParams) -> ReviseResult:
+    async def revise(
+        self,
+        params: ReviseParams,
+        *,
+        privacy: PrivacySettings | None = None,
+    ) -> ReviseResult:
         """Create a new revision, add SUPERSEDES edge, and advance tag.
 
         Queries existing revisions to compute the next revision number,
@@ -359,18 +364,40 @@ class IngestService:
 
         Args:
             params: Revise parameters with item_id, content, and tag_name.
+            privacy: Privacy hook settings.
 
         Returns:
             ReviseResult with the new revision, tag assignment, and item_id.
+
+        Raises:
+            CredentialViolationError: If content contains credential
+                patterns and rejection is enabled.
         """
+        privacy = privacy or PrivacySettings()
+
+        sanitized_content = apply_privacy_hooks(
+            params.content,
+            redact_pii_enabled=privacy.pii_redaction_enabled,
+            reject_credentials_enabled=privacy.credential_rejection_enabled,
+        )
+        sanitized_search = (
+            apply_privacy_hooks(
+                params.search_text,
+                redact_pii_enabled=privacy.pii_redaction_enabled,
+                reject_credentials_enabled=privacy.credential_rejection_enabled,
+            )
+            if params.search_text is not None
+            else sanitized_content
+        )
+
         revisions = await self._store.get_revisions_for_item(params.item_id)
         next_number = max((r.revision_number for r in revisions), default=0) + 1
 
         revision = Revision(
             item_id=params.item_id,
             revision_number=next_number,
-            content=params.content,
-            search_text=params.search_text or params.content,
+            content=sanitized_content,
+            search_text=sanitized_search,
         )
 
         persisted, assignment = await self._store.revise_item(
