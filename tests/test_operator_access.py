@@ -25,6 +25,7 @@ from memex.mcp.tools import (
     create_mcp_server,
 )
 from memex.orchestration.dream_pipeline import DreamAuditReport
+from memex.retrieval.hybrid import HybridSearch
 from memex.stores import Neo4jStore, RedisWorkingMemory, ensure_schema
 from memex.stores.redis_store import ConsolidationEventFeed
 
@@ -47,11 +48,12 @@ async def env(neo4j_driver, redis_client):
     )
     space = await store.create_space(Space(project_id=project.id, name="ops"))
 
+    search = HybridSearch(neo4j_driver)
     wm = RedisWorkingMemory(redis_client)
     feed = ConsolidationEventFeed(redis_client)
     service = MemexToolService(
         store,
-        neo4j_driver,
+        search,
         working_memory=wm,
         event_feed=feed,
     )

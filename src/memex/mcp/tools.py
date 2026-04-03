@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -32,9 +33,9 @@ from memex.orchestration.ingest import (
     IngestParams,
     IngestService,
 )
-from memex.retrieval.hybrid import HybridResult, MatchSource, hybrid_search
-from memex.retrieval.multi_query import multi_query_search
-from memex.stores.neo4j_store import Neo4jStore
+from memex.retrieval.models import MatchSource, SearchRequest, SearchResult
+from memex.retrieval.strategy import SearchStrategy
+from memex.stores.protocols import MemoryStore
 from memex.stores.redis_store import (
     ConsolidationEventFeed,
     DreamStateCursor,
@@ -407,27 +408,33 @@ class ListAuditReportsInput(BaseModel):
 # -- Serialization helpers -------------------------------------------------
 
 
-def _serialize_hybrid_result(result: HybridResult) -> dict[str, Any]:
-    """Serialize a HybridResult to a JSON-safe dictionary.
+def _serialize_search_result(result: SearchResult) -> dict[str, Any]:
+    """Serialize a SearchResult to a JSON-safe dictionary.
+
+    Includes hybrid-specific fields when the result is a
+    ``HybridResult`` subclass; falls back to defaults otherwise.
 
     Args:
-        result: Hybrid retrieval result.
+        result: Search retrieval result.
 
     Returns:
         Dictionary with all fields serialized for MCP transport.
     """
-    return {
+    data: dict[str, Any] = {
         "revision_id": result.revision.id,
         "item_id": result.item_id,
         "item_kind": result.item_kind.value,
         "content": result.revision.content,
         "summary": result.revision.summary,
         "score": result.score,
-        "lexical_score": result.lexical_score,
-        "vector_score": result.vector_score,
-        "match_source": result.match_source.value,
-        "search_mode": result.search_mode.value,
+        "lexical_score": getattr(result, "lexical_score", 0.0),
+        "vector_score": getattr(result, "vector_score", 0.0),
     }
+    match_source = getattr(result, "match_source", None)
+    data["match_source"] = match_source.value if match_source else "unknown"
+    search_mode = getattr(result, "search_mode", None)
+    data["search_mode"] = search_mode.value if search_mode else "unknown"
+    return data
 
 
 def _serialize_message(msg: WorkingMemoryMessage) -> dict[str, Any]:
@@ -534,33 +541,30 @@ class MemexToolService:
     are provided through the constructor (dependency inversion).
 
     Args:
-        store: Neo4j store for graph operations.
-        driver: Neo4j async driver for retrieval queries.
+        store: Memory store for graph operations.
+        search: Search strategy for hybrid retrieval.
         working_memory: Redis working-memory buffer (``None`` to skip).
         event_feed: Dream State consolidation feed (``None`` to skip).
         dream_pipeline: Dream State pipeline (``None`` disables invocation).
-        database: Neo4j database name.
     """
 
     def __init__(
         self,
-        store: Neo4jStore,
-        driver: AsyncDriver,
+        store: MemoryStore,
+        search: SearchStrategy,
         *,
         working_memory: RedisWorkingMemory | None = None,
         event_feed: ConsolidationEventFeed | None = None,
         dream_pipeline: DreamStatePipeline | None = None,
-        database: str = "neo4j",
     ) -> None:
         self._store = store
-        self._driver = driver
+        self._search = search
         self._working_memory = working_memory
         self._event_feed = event_feed
         self._dream_pipeline = dream_pipeline
-        self._database = database
         self._ingest_service = IngestService(
             store,
-            driver,
+            search,
             working_memory=working_memory,
             event_feed=event_feed,
         )
@@ -608,7 +612,7 @@ class MemexToolService:
             "artifact_count": len(result.artifacts),
             "edge_count": len(result.edges),
             "recall_context": [
-                _serialize_hybrid_result(r) for r in result.recall_context
+                _serialize_search_result(r) for r in result.recall_context
             ],
         }
 
@@ -627,39 +631,36 @@ class MemexToolService:
         if reranking not in _VALID_RERANKING_MODES:
             reranking = RERANKING_MODE_AUTO
 
-        type_weights = {
-            MatchSource.ITEM: 1.0,
-            MatchSource.REVISION: 0.9,
-            MatchSource.ARTIFACT: 0.8,
-        }
+        request = SearchRequest(
+            query=inp.query,
+            query_embedding=inp.query_embedding,
+            limit=inp.context_top_k,
+            memory_limit=inp.memory_limit,
+            include_deprecated=inp.include_deprecated,
+            type_weights={
+                MatchSource.ITEM: 1.0,
+                MatchSource.REVISION: 0.9,
+                MatchSource.ARTIFACT: 0.8,
+            },
+        )
 
+        results: Sequence[SearchResult]
         if inp.multi_query:
-            results = await multi_query_search(
-                self._driver,
-                query=inp.query,
-                query_embedding=inp.query_embedding,
-                memory_limit=inp.memory_limit,
-                context_top_k=inp.context_top_k,
-                type_weights=type_weights,
-                include_deprecated=inp.include_deprecated,
-                database=self._database,
-            )
-        else:
-            results = await hybrid_search(
-                self._driver,
-                query=inp.query,
-                query_embedding=inp.query_embedding,
-                memory_limit=inp.memory_limit,
-                context_top_k=inp.context_top_k,
-                type_weights=type_weights,
-                include_deprecated=inp.include_deprecated,
-                database=self._database,
-            )
+            from memex.llm.client import LiteLLMClient
+            from memex.retrieval.multi_query import MultiQuerySearch
 
-        search_mode = results[0].search_mode.value if results else "hybrid"
+            multi = MultiQuerySearch(
+                self._search, llm_client=LiteLLMClient(),
+            )
+            results = await multi.search(request)
+        else:
+            results = await self._search.search(request)
+
+        first_mode = getattr(results[0], "search_mode", None) if results else None
+        search_mode = first_mode.value if first_mode else "hybrid"
 
         return {
-            "results": [_serialize_hybrid_result(r) for r in results],
+            "results": [_serialize_search_result(r) for r in results],
             "count": len(results),
             "search_mode": search_mode,
             "reranking_mode": reranking,
@@ -1268,8 +1269,11 @@ def create_mcp_server(
 
     from memex.orchestration.dream_collector import DreamStateCollector
     from memex.orchestration.dream_executor import DreamStateExecutor
+    from memex.retrieval.hybrid import HybridSearch
+    from memex.stores.neo4j_store import Neo4jStore
 
     store = Neo4jStore(neo4j_driver, database=database)
+    search = HybridSearch(neo4j_driver, database=database)
     wm = RedisWorkingMemory(redis_client) if redis_client is not None else None
     feed = ConsolidationEventFeed(redis_client) if redis_client is not None else None
 
@@ -1282,11 +1286,10 @@ def create_mcp_server(
 
     service = MemexToolService(
         store,
-        neo4j_driver,
+        search,
         working_memory=wm,
         event_feed=feed,
         dream_pipeline=pipeline,
-        database=database,
     )
 
     mcp = FastMCP("Memex")

@@ -13,6 +13,7 @@ backward-compatible convenience wrapper.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -31,8 +32,9 @@ from memex.domain import (
 )
 from memex.orchestration.events import publish_after_ingest
 from memex.orchestration.privacy import apply_privacy_hooks
-from memex.retrieval.hybrid import HybridResult, MatchSource, hybrid_search
-from memex.stores.neo4j_store import Neo4jStore
+from memex.retrieval.models import MatchSource, SearchRequest, SearchResult
+from memex.retrieval.strategy import SearchStrategy
+from memex.stores.protocols import MemoryStore
 from memex.stores.redis_store import ConsolidationEventFeed, RedisWorkingMemory
 
 if TYPE_CHECKING:
@@ -135,7 +137,7 @@ class IngestResult(BaseModel):
     tag_assignments: list[TagAssignment]
     artifacts: list[Artifact]
     edges: list[Edge]
-    recall_context: list[HybridResult]
+    recall_context: Sequence[SearchResult]
 
 
 class IngestService:
@@ -146,22 +148,22 @@ class IngestService:
     working-memory buffering, and recall retrieval.
 
     Args:
-        store: Neo4j store for graph writes and reads.
-        driver: Neo4j driver for hybrid retrieval queries.
+        store: Memory store for graph writes and reads.
+        search: Search strategy for recall context retrieval.
         working_memory: Redis session buffer (``None`` to skip).
         event_feed: Consolidation event feed (``None`` to skip).
     """
 
     def __init__(
         self,
-        store: Neo4jStore,
-        driver: AsyncDriver,
+        store: MemoryStore,
+        search: SearchStrategy,
         *,
         working_memory: RedisWorkingMemory | None = None,
         event_feed: ConsolidationEventFeed | None = None,
     ) -> None:
         self._store = store
-        self._driver = driver
+        self._search = search
         self._working_memory = working_memory
         self._event_feed = event_feed
 
@@ -282,20 +284,22 @@ class IngestService:
                 content=sanitized_content,
             )
 
-        recall_context: list[HybridResult] = []
+        recall_context: Sequence[SearchResult] = []
         try:
-            recall_context = await hybrid_search(
-                self._driver,
-                query=sanitized_search,
-                query_embedding=(list(params.embedding) if params.embedding else None),
-                memory_limit=retrieval.memory_limit,
-                context_top_k=retrieval.context_top_k,
-                type_weights={
-                    MatchSource.ITEM: retrieval.weight_item,
-                    MatchSource.REVISION: retrieval.weight_revision,
-                    MatchSource.ARTIFACT: retrieval.weight_artifact,
-                },
-                database=self._store._database,
+            recall_context = await self._search.search(
+                SearchRequest(
+                    query=sanitized_search,
+                    query_embedding=(
+                        list(params.embedding) if params.embedding else None
+                    ),
+                    limit=retrieval.context_top_k,
+                    memory_limit=retrieval.memory_limit,
+                    type_weights={
+                        MatchSource.ITEM: retrieval.weight_item,
+                        MatchSource.REVISION: retrieval.weight_revision,
+                        MatchSource.ARTIFACT: retrieval.weight_artifact,
+                    },
+                )
             )
         except Exception:
             logger.warning(
@@ -347,11 +351,15 @@ async def memory_ingest(
         CredentialViolationError: If content contains credential
             patterns and rejection is enabled.
     """
+    from memex.retrieval.hybrid import HybridSearch
+    from memex.stores.neo4j_store import Neo4jStore
+
     store = Neo4jStore(neo4j_driver, database=database)
+    search = HybridSearch(neo4j_driver, database=database)
     wm = RedisWorkingMemory(redis_client) if redis_client is not None else None
     service = IngestService(
         store,
-        neo4j_driver,
+        search,
         working_memory=wm,
         event_feed=event_feed,
     )

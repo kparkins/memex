@@ -2,6 +2,7 @@
 
 from memex.stores.neo4j_schema import NodeLabel, RelType, ensure_schema
 from memex.stores.neo4j_store import Neo4jStore
+from memex.stores.protocols import MemoryStore
 from memex.stores.redis_store import (
     ConsolidationEvent,
     ConsolidationEventFeed,
@@ -16,6 +17,7 @@ __all__ = [
     "ConsolidationEvent",
     "ConsolidationEventFeed",
     "ConsolidationEventType",
+    "MemoryStore",
     "MessageRole",
     "Neo4jStore",
     "NodeLabel",

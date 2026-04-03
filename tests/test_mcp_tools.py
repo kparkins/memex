@@ -24,6 +24,7 @@ from memex.mcp.tools import (
     WorkingMemoryGetInput,
     create_mcp_server,
 )
+from memex.retrieval.hybrid import HybridSearch
 from memex.stores import Neo4jStore, RedisWorkingMemory, ensure_schema
 from memex.stores.redis_store import ConsolidationEventFeed
 
@@ -44,11 +45,12 @@ async def env(neo4j_driver, redis_client):
     project = Project(name="test-mcp")
     await store.create_project(project)
 
+    search = HybridSearch(neo4j_driver)
     wm = RedisWorkingMemory(redis_client)
     feed = ConsolidationEventFeed(redis_client)
     service = MemexToolService(
         store,
-        neo4j_driver,
+        search,
         working_memory=wm,
         event_feed=feed,
     )
@@ -337,7 +339,8 @@ class TestWorkingMemoryGet:
         """Get raises RuntimeError when Redis is not configured."""
         await ensure_schema(neo4j_driver)
         store = Neo4jStore(neo4j_driver)
-        service = MemexToolService(store, neo4j_driver)
+        search = HybridSearch(neo4j_driver)
+        service = MemexToolService(store, search)
 
         inp = WorkingMemoryGetInput(
             project_id="proj",
@@ -387,7 +390,8 @@ class TestWorkingMemoryClear:
         """Clear raises RuntimeError when Redis is not configured."""
         await ensure_schema(neo4j_driver)
         store = Neo4jStore(neo4j_driver)
-        service = MemexToolService(store, neo4j_driver)
+        search = HybridSearch(neo4j_driver)
+        service = MemexToolService(store, search)
 
         inp = WorkingMemoryClearInput(
             project_id="proj",

@@ -28,8 +28,7 @@ from memex.llm.client import (
 )
 from memex.llm.enrichment import EnrichmentOutput, extract_enrichments
 from memex.orchestration.privacy import apply_privacy_hooks
-from memex.retrieval.vector import generate_embedding
-from memex.stores.neo4j_store import Neo4jStore
+from memex.stores.protocols import MemoryStore
 
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
@@ -136,14 +135,14 @@ class EnrichmentService:
     enriched search text, generate embedding, persist to store.
 
     Args:
-        store: Neo4j store for revision reads and writes.
+        store: Memory store for revision reads and writes.
         llm_client: LLM client for enrichment extraction.
         embedding_client: Embedding client for vector generation.
     """
 
     def __init__(
         self,
-        store: Neo4jStore,
+        store: MemoryStore,
         *,
         llm_client: LLMClient | None = None,
         embedding_client: EmbeddingClient | None = None,
@@ -211,11 +210,10 @@ class EnrichmentService:
                 if sanitized.embedding_text_override is not None
                 else enriched_search_text
             )
-            embedding = await generate_embedding(
+            embedding = await self._embedding_client.embed(
                 embed_text,
                 model=embed_cfg.model,
                 dimensions=embed_cfg.dimensions,
-                embedding_client=self._embedding_client,
             )
 
             await self._store.update_revision_enrichment(
@@ -269,6 +267,8 @@ async def enrich_revision(
     Returns:
         EnrichmentResult indicating success or failure.
     """
+    from memex.stores.neo4j_store import Neo4jStore
+
     store = Neo4jStore(neo4j_driver, database=database)
     service = EnrichmentService(store)
     return await service.enrich(

@@ -11,7 +11,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from memex.domain.models import Revision
-from memex.stores.neo4j_store import Neo4jStore
+from memex.stores.protocols import MemoryStore
 from memex.stores.redis_store import (
     ConsolidationEvent,
     ConsolidationEventFeed,
@@ -63,14 +63,14 @@ class DreamStateCollector:
     Dependencies are constructor-injected for testability.
 
     Args:
-        store: Neo4j store for revision and bundle lookups.
+        store: Memory store for revision and bundle lookups.
         feed: Consolidation event feed reader.
         cursor: Dream State cursor for position tracking.
     """
 
     def __init__(
         self,
-        store: Neo4jStore,
+        store: MemoryStore,
         feed: ConsolidationEventFeed,
         cursor: DreamStateCursor,
     ) -> None:

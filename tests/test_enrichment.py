@@ -34,7 +34,8 @@ from memex.orchestration.enrichment import (
     enrich_revision,
     schedule_enrichment,
 )
-from memex.retrieval.bm25 import bm25_search
+from memex.retrieval.bm25 import BM25Search
+from memex.retrieval.models import SearchRequest
 from memex.stores.neo4j_schema import ensure_schema
 from memex.stores.neo4j_store import Neo4jStore
 
@@ -375,7 +376,7 @@ class TestEnrichRevision:
                 return_value=_mock_completion(json_resp),
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 return_value=fake_embed,
             ),
         ):
@@ -426,7 +427,7 @@ class TestEnrichRevision:
                 return_value=_mock_completion(json_resp),
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 return_value=fake_embed,
             ),
         ):
@@ -459,7 +460,7 @@ class TestEnrichRevision:
                 return_value=_mock_completion(json_resp),
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 return_value=fake_embed,
             ),
         ):
@@ -468,7 +469,9 @@ class TestEnrichRevision:
         # Allow fulltext index to refresh
         await asyncio.sleep(1)
 
-        results = await bm25_search(driver, "xylophoneuniquekw", limit=5)
+        results = await BM25Search(driver).search(
+            SearchRequest(query="xylophoneuniquekw", limit=5),
+        )
         assert len(results) >= 1
         assert any(r.revision.id == rev_id for r in results)
 
@@ -490,15 +493,15 @@ class TestEnrichRevision:
                 return_value=_mock_completion(json_resp),
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 return_value=fake_embed,
             ) as mock_gen,
         ):
             await enrich_revision(driver, rev_id)
 
-        # Verify generate_embedding was called with the override text
+        # Verify embed was called with the override text
         call_args = mock_gen.call_args
-        assert call_args.args[0] == "custom embedding text"
+        assert call_args.args[1] == "custom embedding text"
 
     async def test_embedding_uses_search_text_without_override(
         self, enrichment_env: dict[str, Any]
@@ -516,15 +519,15 @@ class TestEnrichRevision:
                 return_value=_mock_completion(json_resp),
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 return_value=fake_embed,
             ) as mock_gen,
         ):
             await enrich_revision(driver, rev_id)
 
-        # Verify generate_embedding was called with enriched search text
+        # Verify embed was called with enriched search text
         call_args = mock_gen.call_args
-        embed_input = call_args.args[0]
+        embed_input = call_args.args[1]
         assert "quick brown fox" in embed_input
         assert "testing" in embed_input  # from default mock topics
 
@@ -576,7 +579,7 @@ class TestEnrichmentFailureResilience:
                 return_value=_mock_completion(json_resp),
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 side_effect=RuntimeError("embedding service down"),
             ),
         ):
@@ -617,7 +620,9 @@ class TestEnrichmentFailureResilience:
         # Allow fulltext index to be ready
         await asyncio.sleep(1)
 
-        results = await bm25_search(driver, "fox", limit=5)
+        results = await BM25Search(driver).search(
+            SearchRequest(query="fox", limit=5),
+        )
         assert any(r.revision.id == rev.id for r in results)
 
 
@@ -643,7 +648,7 @@ class TestAsyncNonBlocking:
                 return_value=_mock_completion(json_resp),
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 return_value=fake_embed,
             ),
         ):
@@ -673,7 +678,7 @@ class TestAsyncNonBlocking:
                 side_effect=_slow_completion,
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 return_value=fake_embed,
             ),
         ):
@@ -716,7 +721,7 @@ class TestEnrichmentPIIRedaction:
                 return_value=_mock_completion(json_resp),
             ),
             patch(
-                "memex.orchestration.enrichment.generate_embedding",
+                "memex.llm.client.LiteLLMEmbeddingClient.embed",
                 return_value=fake_embed,
             ),
         ):

@@ -8,9 +8,9 @@ by :func:`memex.stores.neo4j_schema.ensure_schema`.
 from __future__ import annotations
 
 from neo4j import AsyncDriver
-from pydantic import BaseModel
 
 from memex.domain.models import ItemKind, Revision
+from memex.retrieval.models import BM25Result, SearchRequest
 from memex.stores.neo4j_schema import NodeLabel, RelType
 
 _FULLTEXT_INDEX_NAME = "revision_search_text"
@@ -65,70 +65,65 @@ def build_search_query(raw: str) -> str:
     return " ".join(parts)
 
 
-class BM25Result(BaseModel, frozen=True):
-    """A single BM25 fulltext search result.
+class BM25Search:
+    """BM25 fulltext search strategy over Neo4j revision index.
 
-    Args:
-        revision: The matched Revision domain model.
-        score: BM25 relevance score from the fulltext index.
-        item_id: ID of the owning Item.
-        item_kind: Kind of the owning Item.
-    """
-
-    revision: Revision
-    score: float
-    item_id: str
-    item_kind: ItemKind
-
-
-async def bm25_search(
-    driver: AsyncDriver,
-    query: str,
-    *,
-    limit: int = 10,
-    include_deprecated: bool = False,
-    database: str = "neo4j",
-) -> list[BM25Result]:
-    """Execute a BM25 fulltext search over revision search_text.
-
-    Sanitizes the query, applies fuzzy matching for terms longer than
-    2 characters, queries the ``revision_search_text`` fulltext index,
-    and filters deprecated items in Cypher before returning results.
+    Satisfies :class:`~memex.retrieval.strategy.SearchStrategy`.
 
     Args:
         driver: Async Neo4j driver instance.
-        query: Raw user-provided search string.
-        limit: Maximum number of results to return.
-        include_deprecated: If True, include results from deprecated items.
         database: Neo4j database name.
-
-    Returns:
-        BM25Results ordered by descending score.
     """
-    search_query = build_search_query(query)
-    if not search_query:
-        return []
 
-    deprecation_filter = "" if include_deprecated else "WHERE i.deprecated = false "
+    def __init__(
+        self,
+        driver: AsyncDriver,
+        *,
+        database: str = "neo4j",
+    ) -> None:
+        self._driver = driver
+        self._database = database
 
-    cypher = (
-        f"CALL db.index.fulltext.queryNodes("
-        f"'{_FULLTEXT_INDEX_NAME}', $q) "
-        f"YIELD node AS r, score "
-        f"MATCH (r)-[:{RelType.REVISION_OF}]->(i:{NodeLabel.ITEM}) "
-        f"{deprecation_filter}"
-        f"RETURN r, score, i.id AS item_id, i.kind AS item_kind "
-        f"ORDER BY score DESC LIMIT $lim"
-    )
+    async def search(self, request: SearchRequest) -> list[BM25Result]:
+        """Execute a BM25 fulltext search over revision search_text.
 
-    async with driver.session(database=database) as session:
-        result = await session.run(cypher, q=search_query, lim=limit)
-        return [
-            BM25Result(
-                revision=Revision.model_validate(dict(rec["r"])),
-                score=float(rec["score"]),
-                item_id=str(rec["item_id"]),
-                item_kind=ItemKind(str(rec["item_kind"])),
-            )
-            async for rec in result
-        ]
+        Sanitizes the query, applies fuzzy matching for terms longer than
+        2 characters, queries the ``revision_search_text`` fulltext index,
+        and filters deprecated items in Cypher before returning results.
+
+        Args:
+            request: Search parameters (uses ``query``, ``limit``,
+                ``include_deprecated``).
+
+        Returns:
+            BM25Results ordered by descending score.
+        """
+        search_query = build_search_query(request.query)
+        if not search_query:
+            return []
+
+        dep_filter = (
+            "" if request.include_deprecated else "WHERE i.deprecated = false "
+        )
+
+        cypher = (
+            f"CALL db.index.fulltext.queryNodes("
+            f"'{_FULLTEXT_INDEX_NAME}', $q) "
+            f"YIELD node AS r, score "
+            f"MATCH (r)-[:{RelType.REVISION_OF}]->(i:{NodeLabel.ITEM}) "
+            f"{dep_filter}"
+            f"RETURN r, score, i.id AS item_id, i.kind AS item_kind "
+            f"ORDER BY score DESC LIMIT $lim"
+        )
+
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, q=search_query, lim=request.limit)
+            return [
+                BM25Result(
+                    revision=Revision.model_validate(dict(rec["r"])),
+                    score=float(rec["score"]),
+                    item_id=str(rec["item_id"]),
+                    item_kind=ItemKind(str(rec["item_kind"])),
+                )
+                async for rec in result
+            ]

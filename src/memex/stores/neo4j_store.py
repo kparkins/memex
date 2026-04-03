@@ -21,16 +21,6 @@ from memex.stores.neo4j_schema import NodeLabel, RelType
 # -- Serialization helpers ------------------------------------------------
 
 
-def _dt(val: datetime) -> str:
-    """Serialize datetime to ISO 8601 for Neo4j storage."""
-    return val.isoformat()
-
-
-def _compact(props: dict[str, object]) -> dict[str, object]:
-    """Strip None values from a property map for Neo4j."""
-    return {k: v for k, v in props.items() if v is not None}
-
-
 def _encode_meta(
     meta: dict[str, str | int | float | bool],
 ) -> str | None:
@@ -56,194 +46,13 @@ _EDGE_TYPE_TO_REL: dict[EdgeType, RelType] = {
 _DOMAIN_REL_TYPES: list[str] = [rt.value for rt in _EDGE_TYPE_TO_REL.values()]
 
 
-# -- Property builders for Neo4j node creation ----------------------------
+# -- Serialization constants -----------------------------------------------
 
-
-def _project_props(p: Project) -> dict[str, object]:
-    """Build Neo4j property map for a Project node."""
-    return _compact(
-        {
-            "id": p.id,
-            "name": p.name,
-            "created_at": _dt(p.created_at),
-            "metadata": _encode_meta(p.metadata),
-        }
-    )
-
-
-def _space_props(s: Space) -> dict[str, object]:
-    """Build Neo4j property map for a Space node."""
-    return _compact(
-        {
-            "id": s.id,
-            "project_id": s.project_id,
-            "name": s.name,
-            "parent_space_id": s.parent_space_id,
-            "created_at": _dt(s.created_at),
-        }
-    )
-
-
-def _item_props(item: Item) -> dict[str, object]:
-    """Build Neo4j property map for an Item node."""
-    return _compact(
-        {
-            "id": item.id,
-            "space_id": item.space_id,
-            "name": item.name,
-            "kind": str(item.kind),
-            "deprecated": item.deprecated,
-            "deprecated_at": (_dt(item.deprecated_at) if item.deprecated_at else None),
-            "created_at": _dt(item.created_at),
-        }
-    )
-
-
-def _revision_props(r: Revision) -> dict[str, object]:
-    """Build Neo4j property map for a Revision node."""
-    return _compact(
-        {
-            "id": r.id,
-            "item_id": r.item_id,
-            "revision_number": r.revision_number,
-            "content": r.content,
-            "search_text": r.search_text,
-            "embedding": list(r.embedding) if r.embedding else None,
-            "created_at": _dt(r.created_at),
-            "summary": r.summary,
-            "topics": list(r.topics) if r.topics else None,
-            "keywords": list(r.keywords) if r.keywords else None,
-            "facts": list(r.facts) if r.facts else None,
-            "events": list(r.events) if r.events else None,
-            "implications": (list(r.implications) if r.implications else None),
-            "embedding_text_override": r.embedding_text_override,
-        }
-    )
-
-
-def _tag_props(t: Tag) -> dict[str, object]:
-    """Build Neo4j property map for a Tag node."""
-    return {
-        "id": t.id,
-        "item_id": t.item_id,
-        "name": t.name,
-        "revision_id": t.revision_id,
-        "created_at": _dt(t.created_at),
-        "updated_at": _dt(t.updated_at),
-    }
-
-
-def _ta_props(ta: TagAssignment) -> dict[str, object]:
-    """Build Neo4j property map for a TagAssignment node."""
-    return {
-        "id": ta.id,
-        "tag_id": ta.tag_id,
-        "item_id": ta.item_id,
-        "revision_id": ta.revision_id,
-        "assigned_at": _dt(ta.assigned_at),
-    }
-
-
-def _artifact_props(a: Artifact) -> dict[str, object]:
-    """Build Neo4j property map for an Artifact node."""
-    return _compact(
-        {
-            "id": a.id,
-            "revision_id": a.revision_id,
-            "name": a.name,
-            "location": a.location,
-            "media_type": a.media_type,
-            "size_bytes": a.size_bytes,
-            "metadata": _encode_meta(a.metadata),
-            "created_at": _dt(a.created_at),
-        }
-    )
-
-
-def _edge_rel_props(e: Edge) -> dict[str, object]:
-    """Build Neo4j relationship properties for a domain edge.
-
-    Args:
-        e: Edge domain model.
-
-    Returns:
-        Property map for the Neo4j relationship.
-    """
-    return _compact(
-        {
-            "id": e.id,
-            "timestamp": _dt(e.timestamp),
-            "confidence": e.confidence,
-            "reason": e.reason,
-            "context": e.context,
-        }
-    )
-
-
-# -- Node-to-model converters --------------------------------------------
-
-
-def _to_project(props: dict[str, object]) -> Project:
-    """Reconstruct a Project from Neo4j node properties."""
-    data = dict(props)
-    data["metadata"] = _decode_meta(data.get("metadata", ""))
-    return Project.model_validate(data)
-
-
-def _to_space(props: dict[str, object]) -> Space:
-    """Reconstruct a Space from Neo4j node properties."""
-    return Space.model_validate(dict(props))
-
-
-def _to_item(props: dict[str, object]) -> Item:
-    """Reconstruct an Item from Neo4j node properties."""
-    return Item.model_validate(dict(props))
-
-
-def _to_revision(props: dict[str, object]) -> Revision:
-    """Reconstruct a Revision from Neo4j node properties."""
-    return Revision.model_validate(dict(props))
-
-
-def _to_tag(props: dict[str, object]) -> Tag:
-    """Reconstruct a Tag from Neo4j node properties."""
-    return Tag.model_validate(dict(props))
-
-
-def _to_artifact(props: dict[str, object]) -> Artifact:
-    """Reconstruct an Artifact from Neo4j node properties."""
-    data = dict(props)
-    data["metadata"] = _decode_meta(data.get("metadata", ""))
-    return Artifact.model_validate(data)
-
-
-def _to_ta(props: dict[str, object]) -> TagAssignment:
-    """Reconstruct a TagAssignment from Neo4j node properties."""
-    return TagAssignment.model_validate(dict(props))
-
-
-def _to_edge(
-    props: dict[str, object],
-    rel_type: str,
-    src_id: str,
-    tgt_id: str,
-) -> Edge:
-    """Reconstruct an Edge from Neo4j relationship properties.
-
-    Args:
-        props: Relationship property map from ``properties(r)``.
-        rel_type: Neo4j relationship type string from ``type(r)``.
-        src_id: Source revision ID.
-        tgt_id: Target revision ID.
-
-    Returns:
-        Reconstructed Edge domain model.
-    """
-    data = dict(props)
-    data["source_revision_id"] = src_id
-    data["target_revision_id"] = tgt_id
-    data["edge_type"] = rel_type.lower()
-    return Edge.model_validate(data)
+_EDGE_PROPS_EXCLUDE: set[str] = {
+    "source_revision_id",
+    "target_revision_id",
+    "edge_type",
+}
 
 
 # -- Transaction helper ---------------------------------------------------
@@ -284,7 +93,8 @@ class Neo4jStore:
             await session.execute_write(
                 _run,
                 f"CREATE (:{NodeLabel.PROJECT} $props)",
-                props=_project_props(project),
+                props=project.model_dump(mode="json", exclude_none=True)
+                | {"metadata": _encode_meta(project.metadata)},
             )
         return project
 
@@ -298,7 +108,11 @@ class Neo4jStore:
             Project if found, None otherwise.
         """
         node = await self._get_node(NodeLabel.PROJECT, project_id)
-        return _to_project(node) if node else None
+        if node is None:
+            return None
+        data = dict(node)
+        data["metadata"] = _decode_meta(data.get("metadata", ""))
+        return Project.model_validate(data)
 
     # -- Space ------------------------------------------------------------
 
@@ -319,7 +133,7 @@ class Neo4jStore:
                 f"CREATE (:{NodeLabel.SPACE} $props)"
                 f"-[:{RelType.IN_PROJECT}]->(p)",
                 pid=space.project_id,
-                props=_space_props(space),
+                props=space.model_dump(mode="json", exclude_none=True),
             )
             if space.parent_space_id is not None:
                 await _run(
@@ -345,7 +159,7 @@ class Neo4jStore:
             Space if found, None otherwise.
         """
         node = await self._get_node(NodeLabel.SPACE, space_id)
-        return _to_space(node) if node else None
+        return Space.model_validate(dict(node)) if node else None
 
     async def resolve_space(
         self,
@@ -396,7 +210,7 @@ class Neo4jStore:
             result = await session.run(query, **params)
             rec = await result.single()
             if rec is not None:
-                return _to_space(dict(rec["s"]))
+                return Space.model_validate(dict(rec["s"]))
 
         space = Space(
             project_id=project_id,
@@ -436,7 +250,7 @@ class Neo4jStore:
                 f"CREATE (:{NodeLabel.ITEM} $props)"
                 f"-[:{RelType.IN_SPACE}]->(s)",
                 sid=item.space_id,
-                props=_item_props(item),
+                props=item.model_dump(mode="json", exclude_none=True),
             )
             await _run(
                 tx,
@@ -444,7 +258,7 @@ class Neo4jStore:
                 f"CREATE (:{NodeLabel.REVISION} $props)"
                 f"-[:{RelType.REVISION_OF}]->(i)",
                 iid=revision.item_id,
-                props=_revision_props(revision),
+                props=revision.model_dump(mode="json", exclude_none=True),
             )
             assignments: list[TagAssignment] = []
             for tag in tags:
@@ -466,8 +280,8 @@ class Neo4jStore:
                     f"-[:{RelType.ASSIGNED_TO}]->(r)",
                     iid=tag.item_id,
                     rid=tag.revision_id,
-                    tp=_tag_props(tag),
-                    tap=_ta_props(ta),
+                    tp=tag.model_dump(mode="json", exclude_none=True),
+                    tap=ta.model_dump(mode="json", exclude_none=True),
                 )
                 assignments.append(ta)
             return assignments
@@ -521,7 +335,7 @@ class Neo4jStore:
                 f"CREATE (:{NodeLabel.ITEM} $props)"
                 f"-[:{RelType.IN_SPACE}]->(s)",
                 sid=item.space_id,
-                props=_item_props(item),
+                props=item.model_dump(mode="json", exclude_none=True),
             )
             # Revision + REVISION_OF
             await _run(
@@ -530,7 +344,7 @@ class Neo4jStore:
                 f"CREATE (:{NodeLabel.REVISION} $props)"
                 f"-[:{RelType.REVISION_OF}]->(i)",
                 iid=revision.item_id,
-                props=_revision_props(revision),
+                props=revision.model_dump(mode="json", exclude_none=True),
             )
             # Tags + TagAssignments
             assignments: list[TagAssignment] = []
@@ -553,8 +367,8 @@ class Neo4jStore:
                     f"-[:{RelType.ASSIGNED_TO}]->(r)",
                     iid=tag.item_id,
                     rid=tag.revision_id,
-                    tp=_tag_props(tag),
-                    tap=_ta_props(ta),
+                    tp=tag.model_dump(mode="json", exclude_none=True),
+                    tap=ta.model_dump(mode="json", exclude_none=True),
                 )
                 assignments.append(ta)
             # Artifacts + ATTACHED_TO
@@ -565,7 +379,8 @@ class Neo4jStore:
                     f"CREATE (:{NodeLabel.ARTIFACT} $props)"
                     f"-[:{RelType.ATTACHED_TO}]->(r)",
                     rid=artifact.revision_id,
-                    props=_artifact_props(artifact),
+                    props=artifact.model_dump(mode="json", exclude_none=True)
+                | {"metadata": _encode_meta(artifact.metadata)},
                 )
             # Domain edges
             for edge in edges:
@@ -577,7 +392,11 @@ class Neo4jStore:
                     f"CREATE (src)-[:{rel_type} $props]->(tgt)",
                     src_id=edge.source_revision_id,
                     tgt_id=edge.target_revision_id,
-                    props=_edge_rel_props(edge),
+                    props=edge.model_dump(
+                        mode="json",
+                        exclude_none=True,
+                        exclude=_EDGE_PROPS_EXCLUDE,
+                    ),
                 )
             # Bundle membership
             bundle_edge: Edge | None = None
@@ -605,7 +424,11 @@ class Neo4jStore:
                         f"CREATE (src)-[:{RelType.BUNDLES} $props]->(tgt)",
                         src_id=revision.id,
                         tgt_id=bundle_rev_id,
-                        props=_edge_rel_props(bundle_edge),
+                        props=bundle_edge.model_dump(
+                            mode="json",
+                            exclude_none=True,
+                            exclude=_EDGE_PROPS_EXCLUDE,
+                        ),
                     )
             return assignments, bundle_edge
 
@@ -631,7 +454,7 @@ class Neo4jStore:
                 f"CREATE (:{NodeLabel.REVISION} $props)"
                 f"-[:{RelType.REVISION_OF}]->(i)",
                 iid=revision.item_id,
-                props=_revision_props(revision),
+                props=revision.model_dump(mode="json", exclude_none=True),
             )
         return revision
 
@@ -664,8 +487,8 @@ class Neo4jStore:
                 f"CREATE (ta)-[:{RelType.ASSIGNED_TO}]->(r)",
                 iid=tag.item_id,
                 rid=tag.revision_id,
-                tp=_tag_props(tag),
-                tap=_ta_props(ta),
+                tp=tag.model_dump(mode="json", exclude_none=True),
+                tap=ta.model_dump(mode="json", exclude_none=True),
             )
         return ta
 
@@ -717,7 +540,7 @@ class Neo4jStore:
                 f"t.updated_at = $ts",
                 tid=tag_id,
                 rid=new_revision_id,
-                ts=_dt(now),
+                ts=now.isoformat(),
             )
             # Record assignment history
             ta = TagAssignment(
@@ -736,7 +559,7 @@ class Neo4jStore:
                 f"-[:{RelType.ASSIGNED_TO}]->(r)",
                 tid=tag_id,
                 rid=new_revision_id,
-                tap=_ta_props(ta),
+                tap=ta.model_dump(mode="json", exclude_none=True),
             )
             return ta
 
@@ -761,7 +584,8 @@ class Neo4jStore:
                 f"CREATE (:{NodeLabel.ARTIFACT} $props)"
                 f"-[:{RelType.ATTACHED_TO}]->(r)",
                 rid=artifact.revision_id,
-                props=_artifact_props(artifact),
+                props=artifact.model_dump(mode="json", exclude_none=True)
+                | {"metadata": _encode_meta(artifact.metadata)},
             )
         return artifact
 
@@ -777,7 +601,7 @@ class Neo4jStore:
             Item if found, None otherwise.
         """
         node = await self._get_node(NodeLabel.ITEM, item_id)
-        return _to_item(node) if node else None
+        return Item.model_validate(dict(node)) if node else None
 
     async def get_revision(self, revision_id: str) -> Revision | None:
         """Retrieve a Revision by ID.
@@ -789,7 +613,7 @@ class Neo4jStore:
             Revision if found, None otherwise.
         """
         node = await self._get_node(NodeLabel.REVISION, revision_id)
-        return _to_revision(node) if node else None
+        return Revision.model_validate(dict(node)) if node else None
 
     async def get_tag(self, tag_id: str) -> Tag | None:
         """Retrieve a Tag by ID.
@@ -801,7 +625,7 @@ class Neo4jStore:
             Tag if found, None otherwise.
         """
         node = await self._get_node(NodeLabel.TAG, tag_id)
-        return _to_tag(node) if node else None
+        return Tag.model_validate(dict(node)) if node else None
 
     async def get_artifact(self, artifact_id: str) -> Artifact | None:
         """Retrieve an Artifact by ID.
@@ -813,7 +637,11 @@ class Neo4jStore:
             Artifact if found, None otherwise.
         """
         node = await self._get_node(NodeLabel.ARTIFACT, artifact_id)
-        return _to_artifact(node) if node else None
+        if node is None:
+            return None
+        data = dict(node)
+        data["metadata"] = _decode_meta(data.get("metadata", ""))
+        return Artifact.model_validate(data)
 
     async def get_tag_assignments(self, tag_id: str) -> list[TagAssignment]:
         """Retrieve all TagAssignment history for a tag.
@@ -831,7 +659,7 @@ class Neo4jStore:
                 f"RETURN ta ORDER BY ta.assigned_at",
                 tid=tag_id,
             )
-            return [_to_ta(dict(rec["ta"])) async for rec in result]
+            return [TagAssignment.model_validate(dict(rec["ta"])) async for rec in result]
 
     async def get_revisions_for_item(self, item_id: str) -> list[Revision]:
         """Retrieve all revisions for an item.
@@ -849,7 +677,7 @@ class Neo4jStore:
                 f"RETURN r ORDER BY r.revision_number",
                 iid=item_id,
             )
-            return [_to_revision(dict(rec["r"])) async for rec in result]
+            return [Revision.model_validate(dict(rec["r"])) async for rec in result]
 
     # -- Temporal query operations -----------------------------------------
 
@@ -877,7 +705,7 @@ class Neo4jStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, iid=item_id, tname=tag_name)
             rec = await result.single()
-            return _to_revision(dict(rec["r"])) if rec else None
+            return Revision.model_validate(dict(rec["r"])) if rec else None
 
     async def resolve_revision_as_of(
         self,
@@ -900,9 +728,9 @@ class Neo4jStore:
             f"RETURN r ORDER BY r.created_at DESC LIMIT 1"
         )
         async with self._driver.session(database=self._database) as session:
-            result = await session.run(query, iid=item_id, ts=_dt(timestamp))
+            result = await session.run(query, iid=item_id, ts=timestamp.isoformat())
             rec = await result.single()
-            return _to_revision(dict(rec["r"])) if rec else None
+            return Revision.model_validate(dict(rec["r"])) if rec else None
 
     async def resolve_tag_at_time(
         self,
@@ -931,9 +759,9 @@ class Neo4jStore:
             f"RETURN r"
         )
         async with self._driver.session(database=self._database) as session:
-            result = await session.run(query, tid=tag_id, ts=_dt(timestamp))
+            result = await session.run(query, tid=tag_id, ts=timestamp.isoformat())
             rec = await result.single()
-            return _to_revision(dict(rec["r"])) if rec else None
+            return Revision.model_validate(dict(rec["r"])) if rec else None
 
     # -- Belief revision operations ----------------------------------------
 
@@ -985,7 +813,7 @@ class Neo4jStore:
                 f"CREATE (:{NodeLabel.REVISION} $props)"
                 f"-[:{RelType.REVISION_OF}]->(i)",
                 iid=item_id,
-                props=_revision_props(revision),
+                props=revision.model_dump(mode="json", exclude_none=True),
             )
             await _run(
                 tx,
@@ -1009,7 +837,7 @@ class Neo4jStore:
                 f"SET t.revision_id = $rid, t.updated_at = $ts",
                 tid=tag_id,
                 rid=revision.id,
-                ts=_dt(now),
+                ts=now.isoformat(),
             )
             ta = TagAssignment(
                 tag_id=tag_id,
@@ -1027,7 +855,7 @@ class Neo4jStore:
                 f"-[:{RelType.ASSIGNED_TO}]->(r)",
                 tid=tag_id,
                 rid=revision.id,
-                tap=_ta_props(ta),
+                tap=ta.model_dump(mode="json", exclude_none=True),
             )
             return ta
 
@@ -1107,7 +935,7 @@ class Neo4jStore:
                 f"SET t.revision_id = $rid, t.updated_at = $ts",
                 tid=tag_id,
                 rid=target_revision_id,
-                ts=_dt(now),
+                ts=now.isoformat(),
             )
             ta = TagAssignment(
                 tag_id=tag_id,
@@ -1125,7 +953,7 @@ class Neo4jStore:
                 f"-[:{RelType.ASSIGNED_TO}]->(r)",
                 tid=tag_id,
                 rid=target_revision_id,
-                tap=_ta_props(ta),
+                tap=ta.model_dump(mode="json", exclude_none=True),
             )
             return ta
 
@@ -1154,7 +982,7 @@ class Neo4jStore:
                 f"SET i.deprecated = true, "
                 f"i.deprecated_at = $ts RETURN i",
                 iid=item_id,
-                ts=_dt(now),
+                ts=now.isoformat(),
             )
             rec = await result.single()
             if rec is None:
@@ -1163,7 +991,7 @@ class Neo4jStore:
 
         async with self._driver.session(database=self._database) as session:
             props = await session.execute_write(_work)
-        return _to_item(props)
+        return Item.model_validate(props)
 
     async def undeprecate_item(self, item_id: str) -> Item:
         """Remove deprecation, restoring default visibility.
@@ -1194,7 +1022,7 @@ class Neo4jStore:
 
         async with self._driver.session(database=self._database) as session:
             props = await session.execute_write(_work)
-        return _to_item(props)
+        return Item.model_validate(props)
 
     # -- Query operations --------------------------------------------------
 
@@ -1224,7 +1052,7 @@ class Neo4jStore:
         )
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, sid=space_id)
-            return [_to_item(dict(rec["i"])) async for rec in result]
+            return [Item.model_validate(dict(rec["i"])) async for rec in result]
 
     async def get_supersedes_target(self, revision_id: str) -> Revision | None:
         """Get the revision that the given revision supersedes.
@@ -1243,7 +1071,7 @@ class Neo4jStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, rid=revision_id)
             rec = await result.single()
-            return _to_revision(dict(rec["t"])) if rec else None
+            return Revision.model_validate(dict(rec["t"])) if rec else None
 
     async def get_supersession_map(
         self, item_id: str
@@ -1303,7 +1131,11 @@ class Neo4jStore:
                 f"CREATE (src)-[:{rel_type} $props]->(tgt)",
                 src_id=edge.source_revision_id,
                 tgt_id=edge.target_revision_id,
-                props=_edge_rel_props(edge),
+                props=edge.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                    exclude=_EDGE_PROPS_EXCLUDE,
+                ),
             )
         return edge
 
@@ -1332,11 +1164,13 @@ class Neo4jStore:
             rec = await result.single()
             if rec is None:
                 return None
-            return _to_edge(
-                dict(rec["props"]),
-                str(rec["rel_type"]),
-                str(rec["src_id"]),
-                str(rec["tgt_id"]),
+            return Edge.model_validate(
+                dict(rec["props"])
+                | {
+                    "source_revision_id": str(rec["src_id"]),
+                    "target_revision_id": str(rec["tgt_id"]),
+                    "edge_type": str(rec["rel_type"]).lower(),
+                }
             )
 
     async def get_edges(
@@ -1410,11 +1244,13 @@ class Neo4jStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, **params)
             return [
-                _to_edge(
-                    dict(rec["props"]),
-                    str(rec["rel_type"]),
-                    str(rec["src_id"]),
-                    str(rec["tgt_id"]),
+                Edge.model_validate(
+                    dict(rec["props"])
+                    | {
+                        "source_revision_id": str(rec["src_id"]),
+                        "target_revision_id": str(rec["tgt_id"]),
+                        "edge_type": str(rec["rel_type"]).lower(),
+                    }
                 )
                 async for rec in result
             ]
@@ -1477,11 +1313,13 @@ class Neo4jStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, rid=revision_id, types=_DOMAIN_REL_TYPES)
             return [
-                _to_edge(
-                    dict(rec["props"]),
-                    str(rec["rel_type"]),
-                    str(rec["src_id"]),
-                    str(rec["tgt_id"]),
+                Edge.model_validate(
+                    dict(rec["props"])
+                    | {
+                        "source_revision_id": str(rec["src_id"]),
+                        "target_revision_id": str(rec["tgt_id"]),
+                        "edge_type": str(rec["rel_type"]).lower(),
+                    }
                 )
                 async for rec in result
             ]
@@ -1518,7 +1356,7 @@ class Neo4jStore:
         )
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, rid=revision_id)
-            return [_to_revision(dict(rec["dep"])) async for rec in result]
+            return [Revision.model_validate(dict(rec["dep"])) async for rec in result]
 
     async def analyze_impact(
         self,
@@ -1554,7 +1392,7 @@ class Neo4jStore:
         )
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, rid=revision_id)
-            return [_to_revision(dict(rec["impacted"])) async for rec in result]
+            return [Revision.model_validate(dict(rec["impacted"])) async for rec in result]
 
     # -- Enrichment update ------------------------------------------------
 
@@ -1631,7 +1469,7 @@ class Neo4jStore:
                 record = await result.single()
                 if record is None:
                     return None
-                return _to_revision(dict(record["r"]))
+                return Revision.model_validate(dict(record["r"]))
 
             return await session.execute_write(_run)
 

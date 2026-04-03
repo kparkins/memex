@@ -9,15 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 
-import litellm
-from neo4j import AsyncDriver
-
-from memex.retrieval.hybrid import (
-    HybridResult,
-    MatchSource,
-    hybrid_search,
-)
+from memex.llm.client import LLMClient
+from memex.retrieval.models import SearchRequest, SearchResult
+from memex.retrieval.strategy import SearchStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -25,155 +21,143 @@ _DEFAULT_NUM_VARIANTS = 3
 _MAX_VARIANTS = 4
 
 
-async def generate_query_variants(
-    query: str,
-    *,
-    num_variants: int = _DEFAULT_NUM_VARIANTS,
-    model: str = "gpt-4o-mini",
-) -> list[str]:
-    """Generate semantic query variants via LLM for improved recall.
+class MultiQuerySearch:
+    """Multi-query reformulation strategy composing any search strategy.
 
-    Asks an LLM to rephrase the original query using different words
-    or phrasing to surface results that lexical or single-embedding
-    search might miss.
+    Satisfies :class:`~memex.retrieval.strategy.SearchStrategy`.
 
-    Args:
-        query: Original user query.
-        num_variants: Number of variants to generate (default 3, max 4).
-        model: LLM model identifier for reformulation.
-
-    Returns:
-        List of reformulated query strings (excludes the original).
-
-    Raises:
-        RuntimeError: If the LLM provider returns an error.
-    """
-    num_variants = min(num_variants, _MAX_VARIANTS)
-    prompt = (
-        f"Generate exactly {num_variants} alternative search queries that "
-        f"are semantically similar to the following query but use different "
-        f"words or phrasing to improve recall. Output one query per line, "
-        f"with no numbering, bullets, or extra text.\n\n"
-        f"Original query: {query}"
-    )
-
-    try:
-        response = await litellm.acompletion(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-        )
-        text: str = response.choices[0].message.content.strip()
-        variants = [line.strip() for line in text.splitlines() if line.strip()]
-        return variants[:num_variants]
-    except Exception as e:
-        logger.error("Query variant generation failed: %s", e)
-        raise RuntimeError(f"Query variant generation failed: {e}") from e
-
-
-def _deduplicate_results(
-    result_batches: list[list[HybridResult]],
-) -> dict[str, HybridResult]:
-    """Merge results across query variants, keeping highest score per revision.
-
-    Args:
-        result_batches: Lists of HybridResults from each query variant.
-
-    Returns:
-        Dict keyed by revision ID with the highest-scoring result.
-    """
-    merged: dict[str, HybridResult] = {}
-    for batch in result_batches:
-        for r in batch:
-            rev_id = r.revision.id
-            if rev_id not in merged or r.score > merged[rev_id].score:
-                merged[rev_id] = r
-    return merged
-
-
-def _apply_memory_limit(
-    candidates: dict[str, HybridResult],
-    memory_limit: int,
-) -> list[HybridResult]:
-    """Sort by score and enforce memory_limit on unique items.
-
-    Args:
-        candidates: Deduplicated candidates keyed by revision ID.
-        memory_limit: Max unique items in the output.
-
-    Returns:
-        Sorted, limited list of HybridResults.
-    """
-    sorted_results = sorted(candidates.values(), key=lambda r: r.score, reverse=True)
-    seen_items: set[str] = set()
-    limited: list[HybridResult] = []
-    for r in sorted_results:
-        if r.item_id not in seen_items:
-            if len(seen_items) >= memory_limit:
-                break
-            seen_items.add(r.item_id)
-        limited.append(r)
-    return limited
-
-
-async def multi_query_search(
-    driver: AsyncDriver,
-    query: str,
-    *,
-    query_embedding: list[float] | None = None,
-    num_variants: int = _DEFAULT_NUM_VARIANTS,
-    variant_model: str = "gpt-4o-mini",
-    beta: float = 0.85,
-    memory_limit: int = 3,
-    context_top_k: int = 7,
-    type_weights: dict[MatchSource, float] | None = None,
-    include_deprecated: bool = False,
-    database: str = "neo4j",
-) -> list[HybridResult]:
-    """Execute multi-query reformulation with hybrid retrieval.
-
-    Generates semantic query variants via LLM, runs each variant
-    (plus the original) through the hybrid search pipeline in
+    Generates semantic query variants via an LLM, runs each variant
+    (plus the original) through the provided search strategy in
     parallel, then deduplicates and merges results.
 
     Args:
-        driver: Async Neo4j driver.
-        query: Original search query.
-        query_embedding: Pre-computed embedding for vector branch.
-        num_variants: Number of LLM-generated variants (default 3).
-        variant_model: LLM model for variant generation.
-        beta: Vector score calibration factor.
-        memory_limit: Max unique items in the result set.
-        context_top_k: Candidates per search branch.
-        type_weights: Per-source type weights.
-        include_deprecated: If True, include deprecated items.
-        database: Neo4j database name.
-
-    Returns:
-        Deduplicated HybridResults ordered by descending score,
-        limited to memory_limit unique items.
+        delegate: Search strategy to delegate per-variant searches to.
+        llm_client: LLM client for generating query reformulations.
+        num_variants: Number of variants to generate (default 3, max 4).
+        variant_model: LLM model identifier for reformulation.
     """
-    variants = await generate_query_variants(
-        query, num_variants=num_variants, model=variant_model
-    )
-    all_queries = [query] + variants
 
-    search_kwargs: dict[str, object] = {
-        "query_embedding": query_embedding,
-        "beta": beta,
-        "memory_limit": memory_limit * 2,
-        "context_top_k": context_top_k,
-        "type_weights": type_weights,
-        "include_deprecated": include_deprecated,
-        "database": database,
-    }
+    def __init__(
+        self,
+        delegate: SearchStrategy,
+        *,
+        llm_client: LLMClient,
+        num_variants: int = _DEFAULT_NUM_VARIANTS,
+        variant_model: str = "gpt-4o-mini",
+    ) -> None:
+        self._delegate = delegate
+        self._llm_client = llm_client
+        self._num_variants = min(num_variants, _MAX_VARIANTS)
+        self._variant_model = variant_model
 
-    result_batches = await asyncio.gather(
-        *(
-            hybrid_search(driver, q, **search_kwargs)  # type: ignore[arg-type]
-            for q in all_queries
+    async def search(self, request: SearchRequest) -> list[SearchResult]:
+        """Execute multi-query reformulation with delegated retrieval.
+
+        Args:
+            request: Search parameters.
+
+        Returns:
+            Deduplicated results ordered by descending score,
+            limited to ``request.memory_limit`` unique items.
+        """
+        variants = await self._generate_variants(request.query)
+        all_queries = [request.query] + variants
+
+        expanded = request.model_copy(
+            update={"memory_limit": request.memory_limit * 2}
         )
-    )
 
-    merged = _deduplicate_results(list(result_batches))
-    return _apply_memory_limit(merged, memory_limit)
+        result_batches: list[Sequence[SearchResult]] = list(
+            await asyncio.gather(
+                *(
+                    self._delegate.search(
+                        expanded.model_copy(update={"query": q})
+                    )
+                    for q in all_queries
+                )
+            )
+        )
+
+        merged = self._deduplicate(result_batches)
+        return self._apply_memory_limit(merged, request.memory_limit)
+
+    async def _generate_variants(self, query: str) -> list[str]:
+        """Generate semantic query variants via LLM.
+
+        Args:
+            query: Original user query.
+
+        Returns:
+            List of reformulated query strings.
+
+        Raises:
+            RuntimeError: If the LLM provider returns an error.
+        """
+        prompt = (
+            f"Generate exactly {self._num_variants} alternative search "
+            f"queries that are semantically similar to the following query "
+            f"but use different words or phrasing to improve recall. Output "
+            f"one query per line, with no numbering, bullets, or extra "
+            f"text.\n\nOriginal query: {query}"
+        )
+
+        try:
+            text = await self._llm_client.complete(
+                [{"role": "user", "content": prompt}],
+                model=self._variant_model,
+                temperature=0.7,
+            )
+            variants = [line.strip() for line in text.splitlines() if line.strip()]
+            return variants[: self._num_variants]
+        except Exception as exc:
+            logger.error("Query variant generation failed: %s", exc)
+            raise RuntimeError(
+                f"Query variant generation failed: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _deduplicate(
+        result_batches: list[Sequence[SearchResult]],
+    ) -> dict[str, SearchResult]:
+        """Merge results across variants, keeping highest score per revision.
+
+        Args:
+            result_batches: Sequences of results from each query variant.
+
+        Returns:
+            Dict keyed by revision ID with the highest-scoring result.
+        """
+        merged: dict[str, SearchResult] = {}
+        for batch in result_batches:
+            for r in batch:
+                rev_id = r.revision.id
+                if rev_id not in merged or r.score > merged[rev_id].score:
+                    merged[rev_id] = r
+        return merged
+
+    @staticmethod
+    def _apply_memory_limit(
+        candidates: dict[str, SearchResult],
+        memory_limit: int,
+    ) -> list[SearchResult]:
+        """Sort by score and enforce memory_limit on unique items.
+
+        Args:
+            candidates: Deduplicated candidates keyed by revision ID.
+            memory_limit: Max unique items in the output.
+
+        Returns:
+            Sorted, limited list of results.
+        """
+        sorted_results = sorted(
+            candidates.values(), key=lambda r: r.score, reverse=True
+        )
+        seen_items: set[str] = set()
+        limited: list[SearchResult] = []
+        for r in sorted_results:
+            if r.item_id not in seen_items:
+                if len(seen_items) >= memory_limit:
+                    break
+                seen_items.add(r.item_id)
+            limited.append(r)
+        return limited

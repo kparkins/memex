@@ -29,6 +29,7 @@ from memex.mcp.tools import (
     create_mcp_server,
 )
 from memex.orchestration.dream_pipeline import DreamAuditReport, DreamStatePipeline
+from memex.retrieval.hybrid import HybridSearch
 from memex.stores import Neo4jStore, RedisWorkingMemory, ensure_schema
 from memex.stores.redis_store import ConsolidationEventFeed
 
@@ -53,11 +54,12 @@ async def env(neo4j_driver, redis_client):
     )
     space = await store.create_space(Space(project_id=project.id, name="knowledge"))
 
+    search = HybridSearch(neo4j_driver)
     wm = RedisWorkingMemory(redis_client)
     feed = ConsolidationEventFeed(redis_client)
     service = MemexToolService(
         store,
-        neo4j_driver,
+        search,
         working_memory=wm,
         event_feed=feed,
     )
@@ -66,6 +68,7 @@ async def env(neo4j_driver, redis_client):
         driver=neo4j_driver,
         redis=redis_client,
         store=store,
+        search=search,
         project=project,
         space=space,
         service=service,
@@ -380,7 +383,7 @@ class TestDreamStateInvoke:
     async def test_dream_state_not_configured_raises(self, env):
         """RuntimeError when Dream State pipeline is not injected."""
         service_no_dream = MemexToolService(
-            env.store, env.driver, working_memory=None, event_feed=None
+            env.store, env.search, working_memory=None, event_feed=None
         )
 
         with pytest.raises(RuntimeError, match="Dream State pipeline"):
@@ -406,7 +409,7 @@ class TestDreamStateInvoke:
 
         service = MemexToolService(
             env.store,
-            env.driver,
+            env.search,
             dream_pipeline=mock_pipeline,
         )
 
@@ -437,7 +440,7 @@ class TestDreamStateInvoke:
 
         service = MemexToolService(
             env.store,
-            env.driver,
+            env.search,
             dream_pipeline=mock_pipeline,
         )
 
@@ -467,7 +470,7 @@ class TestDreamStateInvoke:
 
         service = MemexToolService(
             env.store,
-            env.driver,
+            env.search,
             dream_pipeline=mock_pipeline,
         )
 
@@ -500,7 +503,7 @@ class TestDreamStateInvoke:
 
         service = MemexToolService(
             env.store,
-            env.driver,
+            env.search,
             dream_pipeline=mock_pipeline,
         )
 

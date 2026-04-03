@@ -31,7 +31,7 @@ from memex.orchestration.dream_executor import (
     DreamStateExecutor,
     ExecutionReport,
 )
-from memex.stores.neo4j_store import Neo4jStore
+from memex.stores.protocols import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -142,13 +142,13 @@ def _to_revision_summaries(
 
 
 async def _resolve_item_kinds(
-    store: Neo4jStore,
+    store: MemoryStore,
     revisions: dict[str, CollectedRevision],
 ) -> dict[str, str]:
     """Look up item kinds for all unique items in a revision batch.
 
     Args:
-        store: Neo4j store for item lookups.
+        store: Memory store for item lookups.
         revisions: Collected revisions containing item_id references.
 
     Returns:
@@ -173,7 +173,7 @@ class DreamStatePipeline:
     Args:
         collector: Dream State event collector.
         executor: Dream State action executor.
-        store: Neo4j store for item lookups and report persistence.
+        store: Memory store for item lookups and report persistence.
         settings: Dream State configuration (batch size, thresholds).
         llm_client: Injectable LLM client for assessment. ``None``
             falls back to ``LiteLLMClient`` inside ``assess_batch``.
@@ -183,7 +183,7 @@ class DreamStatePipeline:
         self,
         collector: DreamStateCollector,
         executor: DreamStateExecutor,
-        store: Neo4jStore,
+        store: MemoryStore,
         *,
         settings: DreamStateSettings | None = None,
         llm_client: LLMClient | None = None,

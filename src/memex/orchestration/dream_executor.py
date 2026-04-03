@@ -16,7 +16,7 @@ from memex.llm.dream_assessment import (
     DreamAction,
     DreamActionType,
 )
-from memex.stores.neo4j_store import Neo4jStore
+from memex.stores.protocols import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +58,10 @@ class DreamStateExecutor:
     does not prevent execution of subsequent actions.
 
     Args:
-        store: Neo4j store for graph mutations.
+        store: Memory store for graph mutations.
     """
 
-    def __init__(self, store: Neo4jStore) -> None:
+    def __init__(self, store: MemoryStore) -> None:
         self._store = store
 
     async def execute_actions(

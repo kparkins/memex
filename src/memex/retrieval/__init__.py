@@ -1,43 +1,47 @@
-"""Hybrid retrieval: BM25, vector, graph navigation, and multi-query."""
+"""Hybrid retrieval: BM25, vector, graph navigation, and multi-query.
+
+Exports the Strategy-pattern search classes, shared value objects,
+and pure utility functions (query sanitization, fusion scoring).
+"""
 
 from memex.retrieval.bm25 import (
-    BM25Result,
-    bm25_search,
+    BM25Search,
     build_search_query,
     sanitize_query,
 )
 from memex.retrieval.hybrid import (
+    HybridSearch,
+    compute_fused_score,
+)
+from memex.retrieval.models import (
+    BM25Result,
     DEFAULT_TYPE_WEIGHTS,
     HybridResult,
     MatchSource,
     SearchMode,
-    compute_fused_score,
-    hybrid_search,
-)
-from memex.retrieval.multi_query import (
-    generate_query_variants,
-    multi_query_search,
-)
-from memex.retrieval.vector import (
+    SearchRequest,
+    SearchResult,
     VectorResult,
-    generate_embedding,
-    vector_search,
 )
+from memex.retrieval.multi_query import MultiQuerySearch
+from memex.retrieval.strategy import SearchStrategy
+from memex.retrieval.vector import VectorSearch
 
 __all__ = [
     "BM25Result",
+    "BM25Search",
     "DEFAULT_TYPE_WEIGHTS",
     "HybridResult",
+    "HybridSearch",
     "MatchSource",
+    "MultiQuerySearch",
     "SearchMode",
+    "SearchRequest",
+    "SearchResult",
+    "SearchStrategy",
     "VectorResult",
-    "bm25_search",
+    "VectorSearch",
     "build_search_query",
     "compute_fused_score",
-    "generate_embedding",
-    "generate_query_variants",
-    "hybrid_search",
-    "multi_query_search",
     "sanitize_query",
-    "vector_search",
 ]

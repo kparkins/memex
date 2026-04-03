@@ -35,6 +35,7 @@ from memex.mcp.tools import (
 from memex.orchestration.dream_collector import DreamStateCollector
 from memex.orchestration.dream_executor import DreamStateExecutor
 from memex.orchestration.dream_pipeline import DreamStatePipeline
+from memex.retrieval.hybrid import HybridSearch
 from memex.stores import Neo4jStore, ensure_schema
 from memex.stores.redis_store import (
     ConsolidationEventFeed,
@@ -113,9 +114,10 @@ async def env(neo4j_driver, redis_client):
         llm_client=fake_llm,
     )
 
+    search = HybridSearch(neo4j_driver)
     service = MemexToolService(
         store,
-        neo4j_driver,
+        search,
         working_memory=wm,
         event_feed=feed,
         dream_pipeline=pipeline,

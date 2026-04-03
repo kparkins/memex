@@ -11,13 +11,13 @@ import pytest
 from neo4j import AsyncDriver
 
 from memex.domain.models import Item, ItemKind, Project, Revision, Space, Tag
-from memex.retrieval.hybrid import (
+from memex.retrieval.hybrid import HybridSearch, compute_fused_score
+from memex.retrieval.models import (
     DEFAULT_TYPE_WEIGHTS,
     HybridResult,
     MatchSource,
     SearchMode,
-    compute_fused_score,
-    hybrid_search,
+    SearchRequest,
 )
 from memex.stores.neo4j_schema import ensure_schema
 from memex.stores.neo4j_store import Neo4jStore
@@ -87,7 +87,7 @@ async def hybrid_env(
     The query embedding uses base=1.0 for maximum similarity to item1.
 
     Yields:
-        Dict with driver, store, embeddings, and all created domain objects.
+        Dict with driver, store, searcher, embeddings, and domain objects.
     """
     await ensure_schema(neo4j_driver)
     store = Neo4jStore(neo4j_driver)
@@ -138,12 +138,14 @@ async def hybrid_env(
     await store.create_item_with_revision(item3, rev3, [tag3])
     await store.deprecate_item(item3.id)
 
-    # Allow fulltext and vector indexes to update
     await asyncio.sleep(1)
+
+    searcher = HybridSearch(neo4j_driver)
 
     yield {
         "driver": neo4j_driver,
         "store": store,
+        "searcher": searcher,
         "query_embedding": emb1,
         "emb_far": emb2,
         "item1": item1,
@@ -166,10 +168,12 @@ class TestHybridSearch:
 
     async def test_hybrid_finds_results(self, hybrid_env: dict[str, Any]) -> None:
         """Hybrid search with both query and embedding returns results."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+            ),
         )
         assert len(results) >= 1
         rev_ids = {r.revision.id for r in results}
@@ -177,19 +181,21 @@ class TestHybridSearch:
 
     async def test_hybrid_search_mode_field(self, hybrid_env: dict[str, Any]) -> None:
         """Hybrid mode sets search_mode to HYBRID."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+            ),
         )
         for r in results:
             assert r.search_mode == SearchMode.HYBRID
 
     async def test_lexical_only_mode(self, hybrid_env: dict[str, Any]) -> None:
         """Without embedding, search falls back to lexical only."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(query="machine learning"),
         )
         assert len(results) >= 1
         for r in results:
@@ -198,10 +204,12 @@ class TestHybridSearch:
 
     async def test_vector_only_mode(self, hybrid_env: dict[str, Any]) -> None:
         """With empty query but valid embedding, vector only is used."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "",
-            query_embedding=hybrid_env["query_embedding"],
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="",
+                query_embedding=hybrid_env["query_embedding"],
+            ),
         )
         assert len(results) >= 1
         for r in results:
@@ -212,7 +220,8 @@ class TestHybridSearch:
         self, hybrid_env: dict[str, Any]
     ) -> None:
         """No query and no embedding returns empty list."""
-        results = await hybrid_search(hybrid_env["driver"], "")
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(SearchRequest(query=""))
         assert results == []
 
 
@@ -226,11 +235,13 @@ class TestFusionScoring:
         self, hybrid_env: dict[str, Any]
     ) -> None:
         """Fused score equals w * max(lexical, vector) for all results."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
-            memory_limit=10,
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+                memory_limit=10,
+            ),
         )
         w = DEFAULT_TYPE_WEIGHTS[MatchSource.REVISION]
         for r in results:
@@ -241,11 +252,13 @@ class TestFusionScoring:
         self, hybrid_env: dict[str, Any]
     ) -> None:
         """Results are returned in descending fused score order."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
-            memory_limit=10,
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+                memory_limit=10,
+            ),
         )
         scores = [r.score for r in results]
         assert scores == sorted(scores, reverse=True)
@@ -254,11 +267,13 @@ class TestFusionScoring:
         self, hybrid_env: dict[str, Any]
     ) -> None:
         """Item matching on both branches has nonzero lexical and vector."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
-            memory_limit=10,
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+                memory_limit=10,
+            ),
         )
         item1_hits = [r for r in results if r.item_id == hybrid_env["item1"].id]
         assert len(item1_hits) >= 1
@@ -275,9 +290,9 @@ class TestTypeWeights:
 
     async def test_default_revision_weight(self, hybrid_env: dict[str, Any]) -> None:
         """Default weight_revision=0.9 is applied to all matches."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(query="machine learning"),
         )
         w = DEFAULT_TYPE_WEIGHTS[MatchSource.REVISION]
         for r in results:
@@ -288,15 +303,14 @@ class TestTypeWeights:
         self, hybrid_env: dict[str, Any]
     ) -> None:
         """Custom type weights change the fused score."""
+        searcher: HybridSearch = hybrid_env["searcher"]
         custom = {
             MatchSource.REVISION: 0.5,
             MatchSource.ITEM: 1.0,
             MatchSource.ARTIFACT: 0.8,
         }
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            type_weights=custom,
+        results = await searcher.search(
+            SearchRequest(query="machine learning", type_weights=custom),
         )
         for r in results:
             expected = 0.5 * max(r.lexical_score, r.vector_score)
@@ -304,9 +318,9 @@ class TestTypeWeights:
 
     async def test_match_source_is_revision(self, hybrid_env: dict[str, Any]) -> None:
         """All matches report REVISION as match source."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(query="machine learning"),
         )
         for r in results:
             assert r.match_source == MatchSource.REVISION
@@ -320,12 +334,14 @@ class TestMemoryLimit:
 
     async def test_caps_unique_items(self, hybrid_env: dict[str, Any]) -> None:
         """Results contain at most memory_limit unique items."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
-            memory_limit=1,
-            context_top_k=10,
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+                memory_limit=1,
+                limit=10,
+            ),
         )
         unique_items = {r.item_id for r in results}
         assert len(unique_items) <= 1
@@ -334,14 +350,15 @@ class TestMemoryLimit:
         self, hybrid_env: dict[str, Any]
     ) -> None:
         """Large memory_limit returns all matching items."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
-            memory_limit=100,
-            context_top_k=100,
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+                memory_limit=100,
+                limit=100,
+            ),
         )
-        # item1 matches lexically and by vector, item2 by vector only
         assert len(results) >= 2
 
 
@@ -355,11 +372,13 @@ class TestHybridDeprecatedExclusion:
         self, hybrid_env: dict[str, Any]
     ) -> None:
         """Default search excludes revisions from deprecated items."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
-            memory_limit=10,
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+                memory_limit=10,
+            ),
         )
         rev_ids = {r.revision.id for r in results}
         assert hybrid_env["rev3"].id not in rev_ids
@@ -368,12 +387,14 @@ class TestHybridDeprecatedExclusion:
         self, hybrid_env: dict[str, Any]
     ) -> None:
         """include_deprecated=True returns deprecated item revisions."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
-            memory_limit=10,
-            include_deprecated=True,
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+                memory_limit=10,
+                include_deprecated=True,
+            ),
         )
         rev_ids = {r.revision.id for r in results}
         assert hybrid_env["rev1"].id in rev_ids
@@ -388,10 +409,12 @@ class TestMetadataCompleteness:
 
     async def test_all_fields_present(self, hybrid_env: dict[str, Any]) -> None:
         """HybridResult contains all required metadata fields."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
-            query_embedding=hybrid_env["query_embedding"],
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(
+                query="machine learning",
+                query_embedding=hybrid_env["query_embedding"],
+            ),
         )
         assert len(results) >= 1
         r = results[0]
@@ -407,9 +430,9 @@ class TestMetadataCompleteness:
 
     async def test_result_serializes_to_dict(self, hybrid_env: dict[str, Any]) -> None:
         """HybridResult serializes cleanly via model_dump."""
-        results = await hybrid_search(
-            hybrid_env["driver"],
-            "machine learning",
+        searcher: HybridSearch = hybrid_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(query="machine learning"),
         )
         assert len(results) >= 1
         d = results[0].model_dump()

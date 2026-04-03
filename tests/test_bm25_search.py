@@ -11,11 +11,11 @@ from neo4j import AsyncDriver
 
 from memex.domain.models import Item, ItemKind, Project, Revision, Space, Tag
 from memex.retrieval.bm25 import (
-    BM25Result,
-    bm25_search,
+    BM25Search,
     build_search_query,
     sanitize_query,
 )
+from memex.retrieval.models import BM25Result, SearchRequest
 from memex.stores.neo4j_schema import ensure_schema
 from memex.stores.neo4j_store import Neo4jStore
 
@@ -162,12 +162,11 @@ async def search_env(
     - item3 (deprecated): overlapping machine learning content
 
     Yields:
-        Dict with driver, store, and all created domain objects.
+        Dict with driver, store, searcher, and all created domain objects.
     """
     await ensure_schema(neo4j_driver)
     store = Neo4jStore(neo4j_driver)
 
-    # Clean slate
     async with neo4j_driver.session() as session:
         await (await session.run("MATCH (n) DETACH DELETE n")).consume()
 
@@ -176,7 +175,6 @@ async def search_env(
         Space(project_id=project.id, name="research"),
     )
 
-    # Active item about machine learning
     item1 = Item(space_id=space.id, name="ml-basics", kind=ItemKind.FACT)
     rev1 = Revision(
         item_id=item1.id,
@@ -190,7 +188,6 @@ async def search_env(
     tag1 = Tag(item_id=item1.id, name="active", revision_id=rev1.id)
     await store.create_item_with_revision(item1, rev1, [tag1])
 
-    # Active item about graph databases
     item2 = Item(space_id=space.id, name="graph-db", kind=ItemKind.DECISION)
     rev2 = Revision(
         item_id=item2.id,
@@ -204,7 +201,6 @@ async def search_env(
     tag2 = Tag(item_id=item2.id, name="active", revision_id=rev2.id)
     await store.create_item_with_revision(item2, rev2, [tag2])
 
-    # Deprecated item with overlapping ML content
     item3 = Item(space_id=space.id, name="old-ml", kind=ItemKind.FACT)
     rev3 = Revision(
         item_id=item3.id,
@@ -219,12 +215,14 @@ async def search_env(
     await store.create_item_with_revision(item3, rev3, [tag3])
     await store.deprecate_item(item3.id)
 
-    # Allow fulltext index to update
     await asyncio.sleep(1)
+
+    searcher = BM25Search(neo4j_driver)
 
     yield {
         "driver": neo4j_driver,
         "store": store,
+        "searcher": searcher,
         "item1": item1,
         "rev1": rev1,
         "item2": item2,
@@ -233,7 +231,6 @@ async def search_env(
         "rev3": rev3,
     }
 
-    # Cleanup
     async with neo4j_driver.session() as session:
         await (await session.run("MATCH (n) DETACH DELETE n")).consume()
 
@@ -246,7 +243,8 @@ class TestBM25Search:
 
     async def test_finds_matching_revision(self, search_env: dict[str, Any]) -> None:
         """Search for known terms returns the matching revision."""
-        results = await bm25_search(search_env["driver"], "machine learning")
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(SearchRequest(query="machine learning"))
         rev_ids = {r.revision.id for r in results}
         assert search_env["rev1"].id in rev_ids
 
@@ -254,19 +252,22 @@ class TestBM25Search:
         self, search_env: dict[str, Any]
     ) -> None:
         """Results are returned in descending score order."""
-        results = await bm25_search(search_env["driver"], "data")
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(SearchRequest(query="data"))
         if len(results) > 1:
             scores = [r.score for r in results]
             assert scores == sorted(scores, reverse=True)
 
     async def test_limit_caps_results(self, search_env: dict[str, Any]) -> None:
         """Limit parameter restricts result count."""
-        results = await bm25_search(search_env["driver"], "data", limit=1)
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(SearchRequest(query="data", limit=1))
         assert len(results) <= 1
 
     async def test_result_model_structure(self, search_env: dict[str, Any]) -> None:
         """Results contain valid BM25Result with correct types."""
-        results = await bm25_search(search_env["driver"], "graph databases")
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(SearchRequest(query="graph databases"))
         assert len(results) >= 1
         r = results[0]
         assert isinstance(r, BM25Result)
@@ -279,12 +280,16 @@ class TestBM25Search:
         self, search_env: dict[str, Any]
     ) -> None:
         """Query with no matching terms returns empty list."""
-        results = await bm25_search(search_env["driver"], "quantum superconductor")
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(query="quantum superconductor")
+        )
         assert results == []
 
     async def test_empty_query_returns_empty(self, search_env: dict[str, Any]) -> None:
         """Empty query string returns empty list without hitting index."""
-        results = await bm25_search(search_env["driver"], "")
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(SearchRequest(query=""))
         assert results == []
 
 
@@ -298,7 +303,8 @@ class TestDeprecatedExclusion:
         self, search_env: dict[str, Any]
     ) -> None:
         """Default search excludes revisions from deprecated items."""
-        results = await bm25_search(search_env["driver"], "machine learning")
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(SearchRequest(query="machine learning"))
         rev_ids = {r.revision.id for r in results}
         assert search_env["rev1"].id in rev_ids
         assert search_env["rev3"].id not in rev_ids
@@ -307,10 +313,9 @@ class TestDeprecatedExclusion:
         self, search_env: dict[str, Any]
     ) -> None:
         """include_deprecated=True returns deprecated item revisions."""
-        results = await bm25_search(
-            search_env["driver"],
-            "machine learning",
-            include_deprecated=True,
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(query="machine learning", include_deprecated=True),
         )
         rev_ids = {r.revision.id for r in results}
         assert search_env["rev1"].id in rev_ids
@@ -325,12 +330,18 @@ class TestQuerySanitizationIntegration:
 
     async def test_special_chars_safe(self, search_env: dict[str, Any]) -> None:
         """Query with various special characters executes without error."""
-        results = await bm25_search(search_env["driver"], 'hello + (world) "test"')
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(query='hello + (world) "test"')
+        )
         assert isinstance(results, list)
 
     async def test_lucene_injection_safe(self, search_env: dict[str, Any]) -> None:
         """Lucene operator injection attempt is neutralized."""
-        results = await bm25_search(search_env["driver"], "field:value AND !excluded")
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(
+            SearchRequest(query="field:value AND !excluded")
+        )
         assert isinstance(results, list)
 
 
@@ -342,8 +353,8 @@ class TestFuzzyMatching:
 
     async def test_fuzzy_finds_close_match(self, search_env: dict[str, Any]) -> None:
         """Misspelled term within edit distance 1 still matches."""
-        # "machne" is 1 edit from "machine" (missing 'i')
-        results = await bm25_search(search_env["driver"], "machne learning")
+        searcher: BM25Search = search_env["searcher"]
+        results = await searcher.search(SearchRequest(query="machne learning"))
         rev_ids = {r.revision.id for r in results}
         assert search_env["rev1"].id in rev_ids
 
