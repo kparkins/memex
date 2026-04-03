@@ -511,7 +511,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Ensure all mutation operations are transactional",
       "Add tests: immutable revision integrity, SUPERSEDES chain correctness, rollback, superseded revisions remain accessible via explicit history queries"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

@@ -152,3 +152,29 @@
 - `uv run ruff format --check src/ tests/` -- 20 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 13 source files
 - `uv run pytest tests/ -v` -- 133 passed (including 14 new Neo4j CRUD integration tests + 4 schema tests)
+
+## T07: Implement belief-revision operations (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/stores/neo4j_store.py` with 6 new methods on `Neo4jStore`:
+  - `revise_item`: Atomic revise -- creates new immutable revision, SUPERSEDES edge from new to old, moves named tag, records tag assignment history (single transaction)
+  - `rollback_tag`: Moves tag to a strictly earlier revision with validation (same item, lower revision number), records assignment history
+  - `deprecate_item`: Sets deprecated=True and deprecated_at timestamp
+  - `undeprecate_item`: Clears deprecated flag and removes deprecated_at
+  - `get_items_for_space`: Queries items with contraction semantics (deprecated excluded by default, include_deprecated=True for operator access)
+  - `get_supersedes_target`: Traverses SUPERSEDES edge from a revision to its predecessor
+- All mutation operations use `session.execute_write` for transactional guarantees
+- Created `tests/test_belief_revision.py` with 19 integration tests across 5 test classes:
+  - `TestReviseItem`: 6 tests (revision+SUPERSEDES creation, tag movement, assignment history, immutability of old revision, 3-revision chain, missing tag error)
+  - `TestRollbackTag`: 5 tests (rollback moves tag, records history, rejects non-earlier revision, rejects cross-item revision, rejects nonexistent tag)
+  - `TestDeprecateUndeprecate`: 4 tests (deprecate sets flag/time, undeprecate clears, nonexistent errors)
+  - `TestContraction`: 2 tests (deprecated hidden by default, include_deprecated shows all)
+  - `TestExplicitHistory`: 2 tests (superseded revision accessible by ID, all revisions in item history)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 21 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 13 source files
+- `uv run pytest tests/ -v` -- 152 passed (19 new belief-revision tests + 133 existing)

@@ -602,6 +602,316 @@ class Neo4jStore:
             )
             return [_to_revision(dict(rec["r"])) async for rec in result]
 
+    # -- Belief revision operations ----------------------------------------
+
+    async def revise_item(
+        self,
+        item_id: str,
+        revision: Revision,
+        tag_name: str = "active",
+    ) -> tuple[Revision, TagAssignment]:
+        """Create a new revision with SUPERSEDES edge and move the named tag.
+
+        Atomically in a single transaction:
+        1. Creates the new immutable revision linked to the item.
+        2. Creates a SUPERSEDES edge from the new to the previous revision.
+        3. Moves the named tag to the new revision.
+
+        Args:
+            item_id: ID of the item being revised.
+            revision: New Revision domain model to persist.
+            tag_name: Name of the tag to advance (default ``"active"``).
+
+        Returns:
+            Tuple of (persisted revision, new tag assignment).
+
+        Raises:
+            ValueError: If the item has no tag with the given name.
+        """
+        now = datetime.now(UTC)
+
+        async def _work(tx: AsyncManagedTransaction) -> TagAssignment:
+            result = await tx.run(
+                f"MATCH (t:{NodeLabel.TAG} "
+                f"{{item_id: $iid, name: $tname}})"
+                f"-[:{RelType.POINTS_TO}]->"
+                f"(prev:{NodeLabel.REVISION}) "
+                f"RETURN t.id AS tag_id, prev.id AS prev_id",
+                iid=item_id,
+                tname=tag_name,
+            )
+            rec = await result.single()
+            if rec is None:
+                raise ValueError(f"Tag '{tag_name}' not found on item {item_id}")
+            tag_id = str(rec["tag_id"])
+            prev_id = str(rec["prev_id"])
+
+            await _run(
+                tx,
+                f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}) "
+                f"CREATE (:{NodeLabel.REVISION} $props)"
+                f"-[:{RelType.REVISION_OF}]->(i)",
+                iid=item_id,
+                props=_revision_props(revision),
+            )
+            await _run(
+                tx,
+                f"MATCH (nr:{NodeLabel.REVISION} {{id: $nid}}), "
+                f"(prev:{NodeLabel.REVISION} {{id: $pid}}) "
+                f"CREATE (nr)-[:{RelType.SUPERSEDES}]->(prev)",
+                nid=revision.id,
+                pid=prev_id,
+            )
+            await _run(
+                tx,
+                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}})"
+                f"-[old:{RelType.POINTS_TO}]->() DELETE old",
+                tid=tag_id,
+            )
+            await _run(
+                tx,
+                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
+                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+                f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
+                f"SET t.revision_id = $rid, t.updated_at = $ts",
+                tid=tag_id,
+                rid=revision.id,
+                ts=_dt(now),
+            )
+            ta = TagAssignment(
+                tag_id=tag_id,
+                item_id=item_id,
+                revision_id=revision.id,
+                assigned_at=now,
+            )
+            await _run(
+                tx,
+                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
+                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+                f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
+                f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
+                f"CREATE (ta)"
+                f"-[:{RelType.ASSIGNED_TO}]->(r)",
+                tid=tag_id,
+                rid=revision.id,
+                tap=_ta_props(ta),
+            )
+            return ta
+
+        async with self._driver.session(database=self._database) as session:
+            ta = await session.execute_write(_work)
+        return revision, ta
+
+    async def rollback_tag(
+        self,
+        tag_id: str,
+        target_revision_id: str,
+    ) -> TagAssignment:
+        """Roll a tag back to a strictly earlier revision.
+
+        Validates that the target revision belongs to the same item
+        and has a lower revision number than the current pointer.
+
+        Args:
+            tag_id: ID of the tag to roll back.
+            target_revision_id: ID of the earlier revision.
+
+        Returns:
+            The TagAssignment recording this rollback.
+
+        Raises:
+            ValueError: If validation fails (missing tag, wrong item,
+                or target not earlier).
+        """
+        now = datetime.now(UTC)
+
+        async def _work(tx: AsyncManagedTransaction) -> TagAssignment:
+            result = await tx.run(
+                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}})"
+                f"-[:{RelType.POINTS_TO}]->"
+                f"(cur:{NodeLabel.REVISION}) "
+                f"RETURN t.item_id AS item_id, "
+                f"cur.revision_number AS cur_num",
+                tid=tag_id,
+            )
+            rec = await result.single()
+            if rec is None:
+                raise ValueError(f"Tag {tag_id} not found")
+            item_id = str(rec["item_id"])
+            cur_num = int(rec["cur_num"])
+
+            result = await tx.run(
+                f"MATCH (r:{NodeLabel.REVISION} {{id: $rid}}) "
+                f"RETURN r.item_id AS item_id, "
+                f"r.revision_number AS rev_num",
+                rid=target_revision_id,
+            )
+            rec = await result.single()
+            if rec is None:
+                raise ValueError(f"Revision {target_revision_id} not found")
+            if str(rec["item_id"]) != item_id:
+                raise ValueError(
+                    f"Revision {target_revision_id} belongs to a different item"
+                )
+            target_num = int(rec["rev_num"])
+            if target_num >= cur_num:
+                raise ValueError(
+                    f"Revision {target_revision_id} (r{target_num})"
+                    f" is not earlier than current (r{cur_num})"
+                )
+
+            await _run(
+                tx,
+                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}})"
+                f"-[old:{RelType.POINTS_TO}]->() DELETE old",
+                tid=tag_id,
+            )
+            await _run(
+                tx,
+                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
+                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+                f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
+                f"SET t.revision_id = $rid, t.updated_at = $ts",
+                tid=tag_id,
+                rid=target_revision_id,
+                ts=_dt(now),
+            )
+            ta = TagAssignment(
+                tag_id=tag_id,
+                item_id=item_id,
+                revision_id=target_revision_id,
+                assigned_at=now,
+            )
+            await _run(
+                tx,
+                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
+                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+                f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
+                f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
+                f"CREATE (ta)"
+                f"-[:{RelType.ASSIGNED_TO}]->(r)",
+                tid=tag_id,
+                rid=target_revision_id,
+                tap=_ta_props(ta),
+            )
+            return ta
+
+        async with self._driver.session(database=self._database) as session:
+            return await session.execute_write(_work)
+
+    async def deprecate_item(self, item_id: str) -> Item:
+        """Mark an item as deprecated, hiding it from default retrieval.
+
+        Args:
+            item_id: ID of the item to deprecate.
+
+        Returns:
+            The updated Item with deprecated flag set.
+
+        Raises:
+            ValueError: If the item does not exist.
+        """
+        now = datetime.now(UTC)
+
+        async def _work(
+            tx: AsyncManagedTransaction,
+        ) -> dict[str, object]:
+            result = await tx.run(
+                f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}) "
+                f"SET i.deprecated = true, "
+                f"i.deprecated_at = $ts RETURN i",
+                iid=item_id,
+                ts=_dt(now),
+            )
+            rec = await result.single()
+            if rec is None:
+                raise ValueError(f"Item {item_id} not found")
+            return dict(rec["i"])
+
+        async with self._driver.session(database=self._database) as session:
+            props = await session.execute_write(_work)
+        return _to_item(props)
+
+    async def undeprecate_item(self, item_id: str) -> Item:
+        """Remove deprecation, restoring default visibility.
+
+        Args:
+            item_id: ID of the item to restore.
+
+        Returns:
+            The updated Item with deprecated flag cleared.
+
+        Raises:
+            ValueError: If the item does not exist.
+        """
+
+        async def _work(
+            tx: AsyncManagedTransaction,
+        ) -> dict[str, object]:
+            result = await tx.run(
+                f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}) "
+                f"SET i.deprecated = false "
+                f"REMOVE i.deprecated_at RETURN i",
+                iid=item_id,
+            )
+            rec = await result.single()
+            if rec is None:
+                raise ValueError(f"Item {item_id} not found")
+            return dict(rec["i"])
+
+        async with self._driver.session(database=self._database) as session:
+            props = await session.execute_write(_work)
+        return _to_item(props)
+
+    # -- Query operations --------------------------------------------------
+
+    async def get_items_for_space(
+        self,
+        space_id: str,
+        *,
+        include_deprecated: bool = False,
+    ) -> list[Item]:
+        """Retrieve items in a space, respecting contraction semantics.
+
+        By default, deprecated items are excluded per FR-4 contraction.
+        Set ``include_deprecated=True`` for operator-level inspection.
+
+        Args:
+            space_id: ID of the space to query.
+            include_deprecated: If True, include deprecated items.
+
+        Returns:
+            List of Items ordered by created_at.
+        """
+        deprecation_filter = "" if include_deprecated else " WHERE i.deprecated = false"
+        query = (
+            f"MATCH (i:{NodeLabel.ITEM} {{space_id: $sid}})"
+            f"{deprecation_filter} "
+            f"RETURN i ORDER BY i.created_at"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, sid=space_id)
+            return [_to_item(dict(rec["i"])) async for rec in result]
+
+    async def get_supersedes_target(self, revision_id: str) -> Revision | None:
+        """Get the revision that the given revision supersedes.
+
+        Args:
+            revision_id: ID of the superseding revision.
+
+        Returns:
+            The superseded Revision, or None if no edge exists.
+        """
+        query = (
+            f"MATCH (:{NodeLabel.REVISION} {{id: $rid}})"
+            f"-[:{RelType.SUPERSEDES}]->"
+            f"(t:{NodeLabel.REVISION}) RETURN t"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, rid=revision_id)
+            rec = await result.single()
+            return _to_revision(dict(rec["t"])) if rec else None
+
     # -- Internal ---------------------------------------------------------
 
     async def _get_node(
