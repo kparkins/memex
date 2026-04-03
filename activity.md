@@ -885,3 +885,52 @@
 - `uv run ruff format --check src/ tests/` -- 60 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 31 source files
 - `uv run pytest tests/ -v` -- 661 passed (20 new E2E tests + 641 existing)
+
+## T30: Add benchmark harness stubs and document reference-build divergences (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/benchmarks/` package with 4 modules:
+  - **`harness.py`**: Base benchmark types and runner protocol
+    - `RetrievalMetrics`: Precision, recall, F1, and MRR computation from retrieved/expected ID sets
+    - `BenchmarkCase`: Single evaluation case (turns, query, expected IDs, metadata)
+    - `CaseResult`: Per-case result with retrieved IDs and computed metrics
+    - `BenchmarkSuite`: Named collection of benchmark cases
+    - `BenchmarkResult`: Aggregate result with mean metrics and static `aggregate()` factory
+    - `BenchmarkHarness` (ABC): Abstract `load(data_path)` / `run(suite)` interface for concrete harnesses
+  - **`locomo.py`**: LoCoMo-style benchmark harness stub
+    - `LoCoMoCase`: Extended case model with `answer_type` (single_fact/multi_hop/temporal) and `session_length`
+    - `LoCoMoHarness`: Loads LoCoMo-formatted JSON, runs evaluation via injected `query_fn` callback
+    - Supports load from JSON file, FileNotFoundError/ValueError on bad input
+  - **`locomo_plus.py`**: LoCoMo-Plus-style benchmark harness stub
+    - `LoCoMoPlusCase`: Extended case model with multi-session `sessions`, `query_type`, `temporal_anchor`, and `superseded_item_ids`
+    - `LoCoMoPlusHarness`: Loads LoCoMo-Plus JSON, runs evaluation with superseded-item leak detection (logs warning)
+    - Flattens multi-session turns with session boundary markers in metadata
+  - **`__init__.py`**: Re-exports all public types
+- Created `DIVERGENCES.md` documenting 10 categories of intentional differences between this reference build and the paper's production system:
+  1. Language and runtime (Python vs production polyglot)
+  2. LLM and embedding providers (pluggable via litellm, no local inference)
+  3. Benchmark datasets (harness stubs only, no bundled data)
+  4. Formal belief-revision claims (same scope: K*2-K*6, Relevance, Core-Retainment)
+  5. Dream State consolidation (asyncio triggers vs production scheduler)
+  6. Working memory (single Redis, key-prefix isolation)
+  7. Privacy and redaction (regex vs production NER)
+  8. Retrieval pipeline (same scoring formula and UNION ALL Cypher)
+  9. MCP tool surface (dual registration, FastMCP in-process)
+  10. Artifact storage (pointer-only, no storage backend bundled)
+- Created `tests/test_benchmarks.py` with 36 tests across 9 test classes:
+  - `TestRetrievalMetrics`: 8 tests (perfect, partial, no relevant, empty, both empty, MRR rank 2/3, precision with noise)
+  - `TestBenchmarkResultAggregate`: 3 tests (two cases, empty, single perfect)
+  - `TestBenchmarkSuite`: 2 tests (holds cases, metadata)
+  - `TestLoCoMoCase`: 2 tests (to_benchmark_case conversion, default values)
+  - `TestLoCoMoHarness`: 6 tests (load valid, file not found, invalid format, perfect run, empty suite, partial retrieval)
+  - `TestLoCoMoPlusCase`: 4 tests (multi-session conversion, superseded IDs, temporal anchor, defaults)
+  - `TestLoCoMoPlusHarness`: 6 tests (load valid, file not found, invalid format, perfect run, superseded leak warning, empty suite)
+  - `TestBenchmarkSerialization`: 5 tests (metrics, case result, benchmark result, LoCoMo case, LoCoMo-Plus case round-trip via orjson)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 65 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 35 source files
+- `uv run pytest tests/ -v` -- 697 passed (36 new benchmark tests + 661 existing)

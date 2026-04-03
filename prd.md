@@ -819,7 +819,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Create benchmark harness stubs for LoCoMo and LoCoMo-Plus style evaluation",
       "Document intentional differences between this reference build and the paper's production system"
     ],
-    "passes": false
+    "passes": true
   }
 ]
 ```
