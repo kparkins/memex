@@ -496,7 +496,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Implement artifact attachment as pointer-only records",
       "Add integration tests for each create path with read-back verification"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

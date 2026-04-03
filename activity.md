@@ -120,3 +120,35 @@
 - `uv run ruff format --check src/ tests/` -- 18 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 12 source files
 - `uv run pytest tests/ -v` -- 119 passed (including 4 Neo4j integration tests against live container)
+
+## T06: Implement Neo4j CRUD: create items, revisions, tags, and artifacts (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/stores/neo4j_store.py` with `Neo4jStore` class:
+  - `create_project` / `get_project`: Project node CRUD
+  - `create_space` / `get_space`: Space node with IN_PROJECT and optional CHILD_OF edges
+  - `create_item_with_revision`: Atomic creation of Item + Revision + Tags + TagAssignments in a single transaction
+  - `create_revision`: Standalone revision on existing item with REVISION_OF edge
+  - `create_tag`: New tag with TAG_OF, POINTS_TO, and TagAssignment history
+  - `move_tag`: Pointer movement -- deletes old POINTS_TO, creates new one, updates tag properties, records TagAssignment
+  - `attach_artifact`: Pointer-only Artifact node with ATTACHED_TO edge
+  - `get_item`, `get_revision`, `get_tag`, `get_artifact`: Single-node reads
+  - `get_tag_assignments`: Tag history ordered by assigned_at
+  - `get_revisions_for_item`: All revisions ordered by revision_number
+- Serialization helpers: datetime as ISO 8601 strings, metadata dicts as JSON strings via orjson, tuples as lists
+- Node-to-model converters using `Pydantic.model_validate()` with automatic coercion (str->datetime, list->tuple, str->StrEnum)
+- Updated `src/memex/stores/__init__.py` to re-export `Neo4jStore`
+- Created `tests/test_neo4j_store.py` with 14 integration tests across 5 test classes:
+  - `TestProjectAndSpace`: 4 tests (project round-trip, space with project link, nested space, nonexistent returns None)
+  - `TestCreateItemWithRevision`: 4 tests (item+revision, with tags, without tags, multiple tags)
+  - `TestCreateRevision`: 2 tests (standalone revision, enrichment field preservation)
+  - `TestTagOperations`: 2 tests (create tag, move tag with history verification)
+  - `TestAttachArtifact`: 2 tests (full metadata artifact, minimal artifact)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 20 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 13 source files
+- `uv run pytest tests/ -v` -- 133 passed (including 14 new Neo4j CRUD integration tests + 4 schema tests)
