@@ -589,3 +589,38 @@
 - `uv run ruff format --check src/ tests/` -- 48 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 26 source files
 - `uv run pytest tests/ -v` -- 471 passed (31 new Dream State executor tests + 440 existing)
+
+## T22: Implement Dream State safety guards and audit reporting (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/orchestration/dream_pipeline.py` with Dream State pipeline orchestrator:
+  - `DreamAuditReport` (frozen): Full audit trail model with report_id, project_id, timestamp, dry_run, events_collected, revisions_inspected, actions_recommended, execution, circuit_breaker_tripped, deprecation_ratio, max_deprecation_ratio, cursor_after
+  - `compute_deprecation_ratio(actions)`: Calculates fraction of deprecation actions in a list
+  - `apply_circuit_breaker(actions, max_ratio)`: Checks ratio against threshold, strips deprecation actions when tripped, returns (filtered_actions, tripped, ratio)
+  - `DreamStatePipeline`: Orchestrates the full consolidation cycle with safety guards
+    - `run(project_id, dry_run=False, model=None)`: Collects events, assesses via LLM, applies circuit breaker, executes actions (skipped in dry-run), persists audit report, commits cursor (skipped in dry-run)
+    - `_assess(batch, model=None)`: Builds revision summaries with item kind lookups, calls LLM assessment
+    - `serialize_report` / `deserialize_report`: JSON serialization utilities
+  - `_to_revision_summaries`: Converts CollectedRevisions to LLM input with item kind resolution
+  - `_resolve_item_kinds`: Batch item-kind lookup from Neo4j store
+- Extended `src/memex/stores/neo4j_schema.py`:
+  - Added `DREAM_AUDIT_REPORT` to `NodeLabel` enum (auto-creates uniqueness constraint)
+- Extended `src/memex/stores/neo4j_store.py` with audit report persistence:
+  - `save_audit_report(report)`: Persists report as DreamAuditReport node with key queryable fields and full JSON data
+  - `get_audit_report(report_id)`: Retrieves deserialized report dict by ID
+  - `list_audit_reports(project_id, limit=50)`: Lists reports for a project, newest first
+- Updated `src/memex/orchestration/__init__.py` to re-export DreamAuditReport, DreamStatePipeline, apply_circuit_breaker, compute_deprecation_ratio
+- Created `tests/test_dream_safety.py` with 24 tests across 6 test classes:
+  - `TestComputeDeprecationRatio`: 4 unit tests (empty, all deprecations, none, mixed)
+  - `TestApplyCircuitBreaker`: 6 unit tests (below threshold, at threshold trips, above strips, empty, all stripped, custom threshold)
+  - `TestDryRunMode`: 4 integration tests (no deprecation, no metadata update, no cursor commit, still persists audit report)
+  - `TestCircuitBreaker`: 4 integration tests (blocks deprecations, exact threshold, below allows, custom threshold)
+  - `TestAuditReportPersistence`: 6 integration tests (persisted after run, all fields present, not-found returns None, list by project, round-trip via model, captures circuit breaker state)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 50 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 27 source files
+- `uv run pytest tests/ -v` -- 495 passed (24 new safety guard tests + 471 existing)

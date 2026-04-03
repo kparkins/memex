@@ -12,6 +12,7 @@ from typing import Any
 
 import orjson
 from neo4j import AsyncDriver, AsyncManagedTransaction
+from pydantic import BaseModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
@@ -1599,6 +1600,101 @@ class Neo4jStore:
                 return _to_revision(dict(record["r"]))
 
             return await session.execute_write(_run)
+
+    # -- Audit reports ----------------------------------------------------
+
+    async def save_audit_report(
+        self,
+        report: BaseModel,
+    ) -> None:
+        """Persist a Dream State audit report as a graph node.
+
+        Stores key queryable fields as node properties and the full
+        report as a serialized JSON string in the ``data`` property.
+
+        Args:
+            report: A Pydantic model with report_id, project_id,
+                timestamp, dry_run, events_collected,
+                revisions_inspected, and circuit_breaker_tripped
+                attributes.
+        """
+        report_dict = report.model_dump(mode="json")
+        data_json = orjson.dumps(report_dict).decode("utf-8")
+
+        cypher = (
+            f"CREATE (r:{NodeLabel.DREAM_AUDIT_REPORT} {{"
+            "id: $id, project_id: $project_id, "
+            "timestamp: $timestamp, dry_run: $dry_run, "
+            "events_collected: $events_collected, "
+            "revisions_inspected: $revisions_inspected, "
+            "circuit_breaker_tripped: $circuit_breaker_tripped, "
+            "data: $data"
+            "})"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(
+                cypher,
+                id=report_dict["report_id"],
+                project_id=report_dict["project_id"],
+                timestamp=report_dict["timestamp"],
+                dry_run=report_dict["dry_run"],
+                events_collected=report_dict["events_collected"],
+                revisions_inspected=report_dict["revisions_inspected"],
+                circuit_breaker_tripped=report_dict["circuit_breaker_tripped"],
+                data=data_json,
+            )
+            await result.consume()
+
+    async def get_audit_report(self, report_id: str) -> dict[str, object] | None:
+        """Retrieve a Dream State audit report by ID.
+
+        Args:
+            report_id: Unique report identifier.
+
+        Returns:
+            Deserialized report dict, or None if not found.
+        """
+        cypher = (
+            f"MATCH (r:{NodeLabel.DREAM_AUDIT_REPORT} "
+            "{id: $id}) RETURN r.data AS data"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, id=report_id)
+            record = await result.single()
+            if record is None:
+                return None
+            raw: dict[str, object] = orjson.loads(record["data"])
+            return raw
+
+    async def list_audit_reports(
+        self,
+        project_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, object]]:
+        """List Dream State audit reports for a project.
+
+        Args:
+            project_id: Project to query.
+            limit: Maximum number of reports to return.
+
+        Returns:
+            List of deserialized report dicts, newest first.
+        """
+        cypher = (
+            f"MATCH (r:{NodeLabel.DREAM_AUDIT_REPORT} "
+            "{project_id: $pid}) "
+            "RETURN r.data AS data "
+            "ORDER BY r.timestamp DESC "
+            "LIMIT $limit"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, pid=project_id, limit=limit)
+            records = await result.data()
+            reports: list[dict[str, object]] = [
+                orjson.loads(r["data"]) for r in records
+            ]
+            return reports
 
     # -- Internal ---------------------------------------------------------
 

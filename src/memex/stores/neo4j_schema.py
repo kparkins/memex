@@ -31,6 +31,7 @@ class NodeLabel(StrEnum):
     TAG = "Tag"
     ARTIFACT = "Artifact"
     TAG_ASSIGNMENT = "TagAssignment"
+    DREAM_AUDIT_REPORT = "DreamAuditReport"
 
 
 class RelType(StrEnum):

@@ -718,7 +718,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Persist Dream State audit reports after each run",
       "Add tests: dry-run produces no graph mutations, circuit breaker triggers at threshold, audit report is written and retrievable"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
@@ -734,9 +734,19 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
     ],
     "passes": false
   },
-
   {
     "id": "T24",
+    "category": "feature",
+    "description": "refactor code to be object oriented and use SOLID principles & Dependency inversion",
+    "steps": [
+      "Refactor code to use best practices SOLID, Dependency Inversion, Design patterns",
+      "Refactor tests: cover same cases and add new edge cases you discover"
+    ],
+    "passes": false
+  },
+
+  {
+    "id": "T25",
     "category": "feature",
     "description": "Implement MCP tools: memory lifecycle, recall, and working memory",
     "steps": [
@@ -750,7 +760,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
   },
 
   {
-    "id": "T25",
+    "id": "T26",
     "category": "feature",
     "description": "Implement MCP tools: graph navigation, provenance, and temporal queries",
     "steps": [
@@ -764,7 +774,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
   },
 
   {
-    "id": "T26",
+    "id": "T27",
     "category": "feature",
     "description": "Implement MCP tools: graph mutation, Dream State invocation, and reranking support",
     "steps": [
@@ -777,7 +787,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
   },
 
   {
-    "id": "T27",
+    "id": "T28",
     "category": "feature",
     "description": "Implement operator access paths",
     "steps": [
@@ -790,7 +800,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
   },
 
   {
-    "id": "T28",
+    "id": "T29",
     "category": "testing",
     "description": "Add end-to-end integration tests for full memory lifecycle",
     "steps": [
@@ -802,7 +812,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
   },
 
   {
-    "id": "T29",
+    "id": "T30",
     "category": "testing",
     "description": "Add benchmark harness stubs and document reference-build divergences",
     "steps": [

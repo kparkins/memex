@@ -10,6 +10,12 @@ from memex.orchestration.dream_executor import (
     DreamStateExecutor,
     ExecutionReport,
 )
+from memex.orchestration.dream_pipeline import (
+    DreamAuditReport,
+    DreamStatePipeline,
+    apply_circuit_breaker,
+    compute_deprecation_ratio,
+)
 from memex.orchestration.enrichment import (
     EnrichmentResult,
     enrich_revision,
@@ -40,15 +46,19 @@ __all__ = [
     "ArtifactSpec",
     "CollectedRevision",
     "CredentialViolationError",
+    "DreamAuditReport",
     "DreamStateCollector",
     "DreamStateEventBatch",
     "DreamStateExecutor",
+    "DreamStatePipeline",
     "EdgeSpec",
     "EnrichmentResult",
     "ExecutionReport",
     "IngestParams",
     "IngestResult",
+    "apply_circuit_breaker",
     "apply_privacy_hooks",
+    "compute_deprecation_ratio",
     "enrich_revision",
     "memory_ingest",
     "publish_after_ingest",
