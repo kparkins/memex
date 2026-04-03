@@ -72,3 +72,25 @@
 - `uv run ruff format --check src/ tests/` -- 14 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 10 source files
 - `uv run pytest tests/ -v` -- 91 passed in 0.08s
+
+## T04: Model revision-scoped edges and timestamped tag-assignment history (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/domain/edges.py` with three domain models:
+  - `EdgeType` StrEnum: supersedes, depends_on, derived_from, references, related_to, supports, contradicts, bundles
+  - `Edge`: Revision-scoped directed edge with metadata fields (timestamp, confidence, reason, context); confidence constrained to [0.0, 1.0]
+  - `TagAssignment` (frozen=True): Immutable timestamped record of tag-to-revision assignment for point-in-time tag resolution
+- Updated `src/memex/domain/__init__.py` to re-export Edge, EdgeType, TagAssignment
+- Created `tests/test_edges.py` with 24 unit tests across 3 test classes:
+  - `TestEdgeType`: 2 tests (all types defined, string subclass)
+  - `TestEdge`: 12 tests (minimal construction, full metadata, string coercion, invalid type rejected, confidence bounds, unique IDs, all types accepted, serialization round-trip, mutable metadata)
+  - `TestTagAssignment`: 10 tests (construction, explicit timestamp, immutability, unique IDs, hashable, serialization round-trip, history ordering, point-in-time resolution, exact boundary, before-any-assignment)
+- Fixed pre-existing unused variable lint warning in `tests/test_models.py`
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 16 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 11 source files
+- `uv run pytest tests/ -v` -- 115 passed in 0.10s

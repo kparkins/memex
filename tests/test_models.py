@@ -323,7 +323,7 @@ class TestArtifact:
         assert a.metadata["encoding"] == "utf-8"
 
     def test_no_bytes_field(self) -> None:
-        a = Artifact(revision_id="rev-1", name="doc", location="/path/doc.pdf")
+        Artifact(revision_id="rev-1", name="doc", location="/path/doc.pdf")
         field_names = set(Artifact.model_fields)
         assert "bytes" not in field_names
         assert "data" not in field_names

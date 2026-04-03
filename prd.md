@@ -468,7 +468,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Model timestamped tag-assignment history for point-in-time tag resolution",
       "Add unit tests for edge construction and tag-history ordering"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
