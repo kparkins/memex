@@ -73,6 +73,128 @@ async def _run(
     return await (await tx.run(query, **params)).consume()
 
 
+# -- Shared tag helpers ---------------------------------------------------
+
+
+async def _create_tag_in_tx(
+    tx: AsyncManagedTransaction,
+    tag: Tag,
+) -> TagAssignment:
+    """Create a tag with its initial assignment in an existing transaction.
+
+    Atomically creates the Tag node, TAG_OF/POINTS_TO relationships,
+    and the TagAssignment history entry.
+
+    Args:
+        tx: Active managed transaction.
+        tag: Tag domain model to persist.
+
+    Returns:
+        The TagAssignment recording this initial assignment.
+
+    Raises:
+        StorePersistenceError: If the referenced item or revision
+            does not exist.
+    """
+    ta = TagAssignment(
+        tag_id=tag.id,
+        item_id=tag.item_id,
+        revision_id=tag.revision_id,
+    )
+    summary = await _run(
+        tx,
+        f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}), "
+        f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+        f"CREATE (t:{NodeLabel.TAG} $tp)"
+        f"-[:{RelType.TAG_OF}]->(i) "
+        f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
+        f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
+        f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
+        f"CREATE (ta)"
+        f"-[:{RelType.ASSIGNED_TO}]->(r)",
+        iid=tag.item_id,
+        rid=tag.revision_id,
+        tp=tag.model_dump(mode="json", exclude_none=True),
+        tap=ta.model_dump(mode="json", exclude_none=True),
+    )
+    if summary.counters.nodes_created == 0:
+        raise StorePersistenceError(
+            f"Item {tag.item_id} or Revision {tag.revision_id} not found"
+        )
+    return ta
+
+
+async def _move_tag_pointer(
+    tx: AsyncManagedTransaction,
+    tag_id: str,
+    new_revision_id: str,
+    item_id: str,
+    timestamp: datetime,
+) -> TagAssignment:
+    """Move a tag pointer to a new revision within a transaction.
+
+    Verifies the target revision exists before deleting the old
+    POINTS_TO relationship to prevent dangling tag pointers.
+
+    Args:
+        tx: Active managed transaction.
+        tag_id: ID of the tag to move.
+        new_revision_id: ID of the target revision.
+        item_id: ID of the item the tag belongs to.
+        timestamp: Timestamp for the assignment record.
+
+    Returns:
+        The TagAssignment recording this movement.
+
+    Raises:
+        StorePersistenceError: If the target revision does not exist.
+    """
+    result = await tx.run(
+        f"MATCH (r:{NodeLabel.REVISION} {{id: $rid}}) RETURN r.id",
+        rid=new_revision_id,
+    )
+    if await result.single() is None:
+        raise StorePersistenceError(
+            f"Revision {new_revision_id} not found; tag pointer not modified"
+        )
+
+    await _run(
+        tx,
+        f"MATCH (t:{NodeLabel.TAG} {{id: $tid}})"
+        f"-[old:{RelType.POINTS_TO}]->() DELETE old",
+        tid=tag_id,
+    )
+    await _run(
+        tx,
+        f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
+        f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+        f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
+        f"SET t.revision_id = $rid, t.updated_at = $ts",
+        tid=tag_id,
+        rid=new_revision_id,
+        ts=timestamp.isoformat(),
+    )
+    ta = TagAssignment(
+        tag_id=tag_id,
+        item_id=item_id,
+        revision_id=new_revision_id,
+        assigned_at=timestamp,
+    )
+    await _run(
+        tx,
+        f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
+        f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
+        f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
+        f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
+        f"CREATE (ta)"
+        f"-[:{RelType.ASSIGNED_TO}]->(r)",
+        tid=tag_id,
+        rid=new_revision_id,
+        tap=ta.model_dump(mode="json", exclude_none=True),
+    )
+    return ta
+
+
 # -- Store class ----------------------------------------------------------
 
 
@@ -364,28 +486,7 @@ class Neo4jStore:
             )
             assignments: list[TagAssignment] = []
             for tag in tags:
-                ta = TagAssignment(
-                    tag_id=tag.id,
-                    item_id=tag.item_id,
-                    revision_id=tag.revision_id,
-                )
-                await _run(
-                    tx,
-                    f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}), "
-                    f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                    f"CREATE (t:{NodeLabel.TAG} $tp)"
-                    f"-[:{RelType.TAG_OF}]->(i) "
-                    f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
-                    f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
-                    f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
-                    f"CREATE (ta)"
-                    f"-[:{RelType.ASSIGNED_TO}]->(r)",
-                    iid=tag.item_id,
-                    rid=tag.revision_id,
-                    tp=tag.model_dump(mode="json", exclude_none=True),
-                    tap=ta.model_dump(mode="json", exclude_none=True),
-                )
-                assignments.append(ta)
+                assignments.append(await _create_tag_in_tx(tx, tag))
             return assignments
 
         async with self._driver.session(database=self._database) as session:
@@ -453,28 +554,7 @@ class Neo4jStore:
             # Tags + TagAssignments
             assignments: list[TagAssignment] = []
             for tag in tags:
-                ta = TagAssignment(
-                    tag_id=tag.id,
-                    item_id=tag.item_id,
-                    revision_id=tag.revision_id,
-                )
-                await _run(
-                    tx,
-                    f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}), "
-                    f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                    f"CREATE (t:{NodeLabel.TAG} $tp)"
-                    f"-[:{RelType.TAG_OF}]->(i) "
-                    f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
-                    f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
-                    f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
-                    f"CREATE (ta)"
-                    f"-[:{RelType.ASSIGNED_TO}]->(r)",
-                    iid=tag.item_id,
-                    rid=tag.revision_id,
-                    tp=tag.model_dump(mode="json", exclude_none=True),
-                    tap=ta.model_dump(mode="json", exclude_none=True),
-                )
-                assignments.append(ta)
+                assignments.append(await _create_tag_in_tx(tx, tag))
             # Artifacts + ATTACHED_TO
             for artifact in artifacts:
                 await _run(
@@ -592,36 +672,14 @@ class Neo4jStore:
             StorePersistenceError: If the referenced item or revision
                 does not exist.
         """
-        ta = TagAssignment(
-            tag_id=tag.id,
-            item_id=tag.item_id,
-            revision_id=tag.revision_id,
-        )
 
-        async def _work(tx: AsyncManagedTransaction) -> None:
-            summary = await _run(
-                tx,
-                f"MATCH (i:{NodeLabel.ITEM} {{id: $iid}}), "
-                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                f"CREATE (t:{NodeLabel.TAG} $tp)"
-                f"-[:{RelType.TAG_OF}]->(i) "
-                f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
-                f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
-                f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
-                f"CREATE (ta)-[:{RelType.ASSIGNED_TO}]->(r)",
-                iid=tag.item_id,
-                rid=tag.revision_id,
-                tp=tag.model_dump(mode="json", exclude_none=True),
-                tap=ta.model_dump(mode="json", exclude_none=True),
-            )
-            if summary.counters.nodes_created == 0:
-                raise StorePersistenceError(
-                    f"Item {tag.item_id} or Revision {tag.revision_id} not found"
-                )
+        async def _work(
+            tx: AsyncManagedTransaction,
+        ) -> TagAssignment:
+            return await _create_tag_in_tx(tx, tag)
 
         async with self._driver.session(database=self._database) as session:
-            await session.execute_write(_work)
-        return ta
+            return await session.execute_write(_work)
 
     async def move_tag(self, tag_id: str, new_revision_id: str) -> TagAssignment:
         """Move an existing tag to a different revision.
@@ -638,6 +696,7 @@ class Neo4jStore:
 
         Raises:
             ValueError: If the tag does not exist.
+            StorePersistenceError: If the target revision does not exist.
         """
         now = datetime.now(UTC)
 
@@ -653,46 +712,13 @@ class Neo4jStore:
                 raise ValueError(f"Tag {tag_id} not found")
             item_id = str(dict(rec["t"])["item_id"])
 
-            # Delete old POINTS_TO edge(s)
-            await _run(
+            return await _move_tag_pointer(
                 tx,
-                f"MATCH (:{NodeLabel.TAG} {{id: $tid}})"
-                f"-[old:{RelType.POINTS_TO}]->() "
-                f"DELETE old",
-                tid=tag_id,
+                tag_id,
+                new_revision_id,
+                item_id,
+                now,
             )
-            # Create new POINTS_TO and update tag properties
-            await _run(
-                tx,
-                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
-                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
-                f"SET t.revision_id = $rid, "
-                f"t.updated_at = $ts",
-                tid=tag_id,
-                rid=new_revision_id,
-                ts=now.isoformat(),
-            )
-            # Record assignment history
-            ta = TagAssignment(
-                tag_id=tag_id,
-                item_id=item_id,
-                revision_id=new_revision_id,
-                assigned_at=now,
-            )
-            await _run(
-                tx,
-                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
-                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
-                f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
-                f"CREATE (ta)"
-                f"-[:{RelType.ASSIGNED_TO}]->(r)",
-                tid=tag_id,
-                rid=new_revision_id,
-                tap=ta.model_dump(mode="json", exclude_none=True),
-            )
-            return ta
 
         async with self._driver.session(database=self._database) as session:
             return await session.execute_write(_work)
@@ -1054,41 +1080,13 @@ class Neo4jStore:
                 nid=revision.id,
                 pid=prev_id,
             )
-            await _run(
+            return await _move_tag_pointer(
                 tx,
-                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}})"
-                f"-[old:{RelType.POINTS_TO}]->() DELETE old",
-                tid=tag_id,
+                tag_id,
+                revision.id,
+                item_id,
+                now,
             )
-            await _run(
-                tx,
-                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
-                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
-                f"SET t.revision_id = $rid, t.updated_at = $ts",
-                tid=tag_id,
-                rid=revision.id,
-                ts=now.isoformat(),
-            )
-            ta = TagAssignment(
-                tag_id=tag_id,
-                item_id=item_id,
-                revision_id=revision.id,
-                assigned_at=now,
-            )
-            await _run(
-                tx,
-                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
-                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
-                f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
-                f"CREATE (ta)"
-                f"-[:{RelType.ASSIGNED_TO}]->(r)",
-                tid=tag_id,
-                rid=revision.id,
-                tap=ta.model_dump(mode="json", exclude_none=True),
-            )
-            return ta
 
         async with self._driver.session(database=self._database) as session:
             ta = await session.execute_write(_work)
@@ -1152,41 +1150,13 @@ class Neo4jStore:
                     f" is not earlier than current (r{cur_num})"
                 )
 
-            await _run(
+            return await _move_tag_pointer(
                 tx,
-                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}})"
-                f"-[old:{RelType.POINTS_TO}]->() DELETE old",
-                tid=tag_id,
+                tag_id,
+                target_revision_id,
+                item_id,
+                now,
             )
-            await _run(
-                tx,
-                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
-                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                f"CREATE (t)-[:{RelType.POINTS_TO}]->(r) "
-                f"SET t.revision_id = $rid, t.updated_at = $ts",
-                tid=tag_id,
-                rid=target_revision_id,
-                ts=now.isoformat(),
-            )
-            ta = TagAssignment(
-                tag_id=tag_id,
-                item_id=item_id,
-                revision_id=target_revision_id,
-                assigned_at=now,
-            )
-            await _run(
-                tx,
-                f"MATCH (t:{NodeLabel.TAG} {{id: $tid}}), "
-                f"(r:{NodeLabel.REVISION} {{id: $rid}}) "
-                f"CREATE (ta:{NodeLabel.TAG_ASSIGNMENT} $tap)"
-                f"-[:{RelType.ASSIGNMENT_OF}]->(t) "
-                f"CREATE (ta)"
-                f"-[:{RelType.ASSIGNED_TO}]->(r)",
-                tid=tag_id,
-                rid=target_revision_id,
-                tap=ta.model_dump(mode="json", exclude_none=True),
-            )
-            return ta
 
         async with self._driver.session(database=self._database) as session:
             return await session.execute_write(_work)

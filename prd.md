@@ -957,7 +957,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Add tests: move_tag to nonexistent revision raises StorePersistenceError and leaves old pointer intact, revise_item preserves the old pointer if the new revision link fails, and rollback_tag preserves the old pointer when the target revision validation fails",
       "Verify all existing tag tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

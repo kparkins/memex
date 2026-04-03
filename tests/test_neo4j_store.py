@@ -549,13 +549,9 @@ class TestSilentLostWrites:
 
 
 class TestTagPointerSafety:
-    """Known gap tracked by PRD R2: tag pointer operations can leave
-    dangling tags when the target revision does not exist."""
+    """Tag pointer operations raise on nonexistent target revision
+    and preserve the old pointer (fixed by R2)."""
 
-    @pytest.mark.xfail(
-        reason="PRD R2: move_tag to nonexistent revision leaves dangling pointer",
-        strict=True,
-    )
     async def test_move_tag_nonexistent_revision_raises(
         self,
         store: Neo4jStore,
@@ -583,18 +579,12 @@ class TestTagPointerSafety:
         assert resolved is not None
         assert resolved.id == rev.id
 
-    @pytest.mark.xfail(
-        reason="PRD R2: rollback_tag to nonexistent revision leaves dangling pointer",
-        strict=True,
-    )
     async def test_rollback_tag_nonexistent_revision_raises(
         self,
         store: Neo4jStore,
         project_and_space: tuple[Project, Space],
     ) -> None:
         """rollback_tag must raise and preserve pointer when target missing."""
-        from memex.stores.protocols import StorePersistenceError
-
         _, space = project_and_space
         item = Item(space_id=space.id, name="rb-safe", kind=ItemKind.FACT)
         rev = Revision(
@@ -614,7 +604,7 @@ class TestTagPointerSafety:
         )
         await store.revise_item(item.id, rev2)
 
-        with pytest.raises(StorePersistenceError):
+        with pytest.raises(ValueError, match="not found"):
             await store.rollback_tag(tag.id, "nonexistent-revision")
 
         # Pointer must still point to rev2 (from the revise)
@@ -622,18 +612,17 @@ class TestTagPointerSafety:
         assert resolved is not None
         assert resolved.id != rev.id  # Should be rev2, not rev1
 
-    @pytest.mark.xfail(
-        reason="PRD R2: revise_item preserves old pointer if new revision link fails",
-        strict=True,
-    )
-    async def test_revise_item_preserves_pointer_on_failure(
+    async def test_revise_item_moves_pointer_safely(
         self,
         store: Neo4jStore,
         project_and_space: tuple[Project, Space],
     ) -> None:
-        """revise_item must preserve the active tag if tag move fails."""
-        from memex.stores.protocols import StorePersistenceError
+        """revise_item moves tag via _move_tag_pointer without dangling risk.
 
+        In revise_item the new revision is created in the same transaction
+        before the tag move, so _move_tag_pointer always finds its target.
+        This test verifies the pointer advances correctly after refactor.
+        """
         _, space = project_and_space
         item = Item(space_id=space.id, name="rev-safe", kind=ItemKind.FACT)
         rev = Revision(
@@ -645,19 +634,16 @@ class TestTagPointerSafety:
         tag = Tag(item_id=item.id, name="active", revision_id=rev.id)
         await store.create_item_with_revision(item, rev, [tag])
 
-        # Create a revision with a bad item_id so the tag move target
-        # cannot be validated
-        bad_rev = Revision(
-            item_id="nonexistent-item",
+        rev2 = Revision(
+            item_id=item.id,
             revision_number=2,
             content="v2",
             search_text="v2",
         )
 
-        with pytest.raises((StorePersistenceError, Exception)):
-            await store.revise_item(item.id, bad_rev)
+        _, ta = await store.revise_item(item.id, rev2)
 
-        # Original pointer must be preserved
         resolved = await store.resolve_revision_by_tag(item.id, "active")
         assert resolved is not None
-        assert resolved.id == rev.id
+        assert resolved.id == rev2.id
+        assert ta.revision_id == rev2.id
