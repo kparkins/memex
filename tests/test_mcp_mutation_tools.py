@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 import orjson
 import pytest
 
-from memex.domain import Item, ItemKind, Revision, Space, Tag
+from memex.domain import Edge, Item, ItemKind, Revision, Space, Tag
 from memex.mcp.tools import (
     CreateEdgeInput,
     DeprecateItemInput,
@@ -372,6 +372,84 @@ class TestCreateEdge:
         encoded = orjson.dumps(result)
         decoded = orjson.loads(encoded)
         assert decoded["edge"]["edge_type"] == "references"
+
+    async def test_create_edge_publishes_event_to_owning_project_stream(self, env):
+        """Edge events should be published under the source revision's project."""
+        _, rev_a, _ = await _create_item_with_revision(
+            env.store, env.space.id, "event-src", ItemKind.FACT, "a"
+        )
+        _, rev_b, _ = await _create_item_with_revision(
+            env.store, env.space.id, "event-tgt", ItemKind.FACT, "b"
+        )
+
+        await env.service.create_edge(
+            CreateEdgeInput(
+                source_revision_id=rev_a.id,
+                target_revision_id=rev_b.id,
+                edge_type="references",
+            )
+        )
+
+        project_events = await env.feed.read_all(env.project.id)
+        edge_events = [e for e in project_events if e.event_type == "edge.created"]
+        assert len(edge_events) == 1
+        assert edge_events[0].data["source_revision_id"] == rev_a.id
+
+
+class TestMutationEventPublicationIsolation:
+    """Post-commit failure handling: Redis failures must not break mutations."""
+
+    async def test_create_edge_event_failure_does_not_raise(self) -> None:
+        """Edge creation should succeed even if post-commit publish fails."""
+        store = AsyncMock()
+        search = AsyncMock()
+        event_feed = AsyncMock(spec=ConsolidationEventFeed)
+        event_feed.publish.side_effect = RuntimeError("redis unavailable")
+
+        persisted = Edge(
+            source_revision_id="rev-a",
+            target_revision_id="rev-b",
+            edge_type="references",
+        )
+        store.create_edge.return_value = persisted
+
+        service = MemexToolService(store, search, event_feed=event_feed)
+
+        result = await service.create_edge(
+            CreateEdgeInput(
+                source_revision_id="rev-a",
+                target_revision_id="rev-b",
+                edge_type="references",
+            )
+        )
+
+        assert result["edge"]["id"] == persisted.id
+
+    async def test_deprecate_item_event_failure_does_not_raise(self) -> None:
+        """Item deprecation should succeed even if post-commit publish fails."""
+        store = AsyncMock()
+        search = AsyncMock()
+        event_feed = AsyncMock(spec=ConsolidationEventFeed)
+        event_feed.publish.side_effect = RuntimeError("redis unavailable")
+
+        item = Item(
+            space_id="space-1",
+            name="test",
+            kind=ItemKind.FACT,
+            deprecated=True,
+        )
+        store.deprecate_item.return_value = item
+        store.get_space.return_value = Space(
+            id="space-1",
+            project_id="project-1",
+            name="knowledge",
+        )
+
+        service = MemexToolService(store, search, event_feed=event_feed)
+
+        result = await service.deprecate_item(DeprecateItemInput(item_id=item.id))
+
+        assert result["deprecated"] is True
 
 
 # -- Dream State invocation -------------------------------------------------

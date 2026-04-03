@@ -209,8 +209,13 @@ class DreamStatePipeline:
             3. Request LLM assessment.
             4. Apply circuit breaker on deprecation ratio.
             5. Execute actions (skipped in dry-run mode).
-            6. Persist audit report.
-            7. Commit cursor (skipped in dry-run mode).
+            6. Commit cursor (skipped in dry-run mode).
+            7. Persist audit report.
+
+        Cursor is committed before the audit report so that a crash
+        between the two does not cause duplicate action execution on
+        the next run. If audit persistence fails, the cursor is still
+        advanced and a warning is logged.
 
         Args:
             project_id: Project to consolidate.
@@ -243,6 +248,9 @@ class DreamStatePipeline:
         if not dry_run and filtered:
             execution = await self._executor.execute_actions(filtered)
 
+        if not dry_run and batch.events:
+            await self._collector.commit_cursor(project_id, batch.cursor)
+
         report = DreamAuditReport(
             project_id=project_id,
             dry_run=dry_run,
@@ -256,10 +264,15 @@ class DreamStatePipeline:
             cursor_after=batch.cursor,
         )
 
-        await self._store.save_audit_report(report)
-
-        if not dry_run and batch.events:
-            await self._collector.commit_cursor(project_id, batch.cursor)
+        try:
+            await self._store.save_audit_report(report)
+        except Exception:
+            logger.warning(
+                "Audit report persistence failed for project %s; "
+                "cursor was already committed",
+                project_id,
+                exc_info=True,
+            )
 
         return report
 

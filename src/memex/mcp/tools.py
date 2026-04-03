@@ -589,6 +589,29 @@ class MemexToolService:
             event_feed=event_feed,
         )
 
+    async def _resolve_project_id_from_revision(
+        self,
+        revision_id: str,
+    ) -> str:
+        """Resolve project_id from a revision's item's space.
+
+        Args:
+            revision_id: Revision whose owning project to look up.
+
+        Returns:
+            The project_id, or empty string if any lookup step fails.
+        """
+        rev = await self._store.get_revision(revision_id)
+        if rev is None:
+            return ""
+        item = await self._store.get_item(rev.item_id)
+        if item is None:
+            return ""
+        space = await self._store.get_space(item.space_id)
+        if space is None:
+            return ""
+        return space.project_id
+
     async def ingest(self, inp: IngestToolInput) -> dict[str, Any]:
         """Execute the dual-action memory ingest.
 
@@ -1081,9 +1104,27 @@ class MemexToolService:
         item = await self._store.deprecate_item(inp.item_id)
 
         if self._event_feed is not None:
-            space = await self._store.get_space(item.space_id)
-            project_id = space.project_id if space is not None else ""
-            await publish_revision_deprecated(self._event_feed, project_id, item.id)
+            try:
+                space = await self._store.get_space(item.space_id)
+                if space is None:
+                    logger.warning(
+                        "Space %s not found for item %s; "
+                        "publishing deprecation event with empty project_id",
+                        item.space_id,
+                        inp.item_id,
+                    )
+                project_id = space.project_id if space is not None else ""
+                await publish_revision_deprecated(
+                    self._event_feed,
+                    project_id,
+                    item.id,
+                )
+            except Exception:
+                logger.warning(
+                    "Event publication failed after deprecate_item; "
+                    "graph mutation succeeded",
+                    exc_info=True,
+                )
 
         return {
             "item": _serialize_item(item),
@@ -1141,7 +1182,21 @@ class MemexToolService:
         persisted = await self._store.create_edge(edge)
 
         if self._event_feed is not None:
-            await publish_edge_created(self._event_feed, "", persisted)
+            try:
+                project_id = await self._resolve_project_id_from_revision(
+                    inp.source_revision_id,
+                )
+                await publish_edge_created(
+                    self._event_feed,
+                    project_id,
+                    persisted,
+                )
+            except Exception:
+                logger.warning(
+                    "Event publication failed after create_edge; "
+                    "graph mutation succeeded",
+                    exc_info=True,
+                )
 
         return {
             "edge": _serialize_edge(persisted),

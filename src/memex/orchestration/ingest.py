@@ -307,6 +307,7 @@ class IngestService:
                 logger.warning(
                     "Dream State event publication failed; "
                     "ingest succeeded but events were not published",
+                    exc_info=True,
                 )
 
         if params.session_id is not None and self._working_memory is not None:
@@ -337,6 +338,7 @@ class IngestService:
         except Exception:
             logger.warning(
                 "Recall context retrieval failed; returning empty context",
+                exc_info=True,
             )
 
         return IngestResult(
@@ -412,6 +414,7 @@ class IngestService:
                 logger.warning(
                     "Dream State event publication failed after revise; "
                     "revision succeeded but event was not published",
+                    exc_info=True,
                 )
 
         return ReviseResult(

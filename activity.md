@@ -1224,3 +1224,39 @@
 - `uv run mypy src/` -- Success: no issues found in 41 source files
 - `uv run pytest tests/test_r3_security.py tests/test_privacy.py tests/test_revise.py -v` -- 69 passed
 - `uv run pytest tests/ -v` -- 786 passed (11 new R3 tests + 4 previously-xfailing R3 tests now passing), 5 pre-existing failures unchanged (temporal timing, enrichment embedding)
+
+## R4: Fix event publication bugs and harden post-commit failure handling (2026-04-03)
+
+**Status**: PASSED
+
+**Changes**:
+- Added `_resolve_project_id_from_revision` method to `MemexToolService` in `src/memex/mcp/tools.py`:
+  - Resolves project_id by traversing revision -> item -> space -> project
+  - Returns empty string if any lookup step fails (graceful fallback)
+- Fixed `MemexToolService.create_edge` in `src/memex/mcp/tools.py`:
+  - Replaced hardcoded empty string project_id with `_resolve_project_id_from_revision(source_revision_id)` for correct event stream routing
+  - Wrapped event publication in try/except to isolate Redis failures from graph mutation success
+  - Added `exc_info=True` to warning log for debuggability
+- Fixed `MemexToolService.deprecate_item` in `src/memex/mcp/tools.py`:
+  - Added warning log when space lookup fails and project_id falls back to empty string
+  - Wrapped event publication in try/except to isolate Redis failures from graph mutation success
+  - Added `exc_info=True` to warning log for debuggability
+- Fixed `DreamStatePipeline.run()` in `src/memex/orchestration/dream_pipeline.py`:
+  - Reordered cursor commit before audit report persistence (was: save-audit-then-commit-cursor)
+  - Cursor now commits immediately after action execution so partial failure during audit persistence does not cause duplicate action execution on next run
+  - Wrapped audit report persistence in try/except with `exc_info=True` warning log
+- Added `exc_info=True` to 3 `logger.warning` calls in `src/memex/orchestration/ingest.py`:
+  - Event publication failure in `IngestService.ingest()`
+  - Recall context retrieval failure in `IngestService.ingest()`
+  - Event publication failure in `IngestService.revise()`
+- Removed `@pytest.mark.xfail(strict=True)` from 3 R4 tests in `tests/test_mcp_mutation_tools.py`:
+  - `test_create_edge_publishes_event_to_owning_project_stream`: now passes (edge events route to correct project stream)
+  - `test_create_edge_event_failure_does_not_raise`: now passes (Redis failure isolated)
+  - `test_deprecate_item_event_failure_does_not_raise`: now passes (Redis failure isolated)
+
+**Verification**:
+- `uv run ruff check` on changed files -- All checks passed
+- `uv run ruff format --check` on changed files -- 4 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 41 source files
+- `uv run pytest tests/test_mcp_mutation_tools.py tests/test_dream_safety.py tests/test_dream_state_events.py tests/test_ingest.py tests/test_revise.py -v` -- 175 passed, 2 xfailed (R6 future)
+- `uv run pytest tests/ -v` -- 789 passed (3 previously-xfailing R4 tests now passing), 8 xfailed (R5/R6 future), 5 pre-existing failures unchanged (temporal timing, enrichment embedding)

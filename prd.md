@@ -988,7 +988,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Add tests: create_edge event is published under the owning project stream, create_edge survives event publication failure after the edge is persisted, and deprecate_item survives event publication failure after the item is persisted",
       "Verify all existing Dream State and ingest tests pass unchanged"
     ],
-    "passes": false
+    "passes": true
   },
 
   {
