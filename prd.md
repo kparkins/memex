@@ -482,7 +482,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Create vector index for revision embeddings (1536 dimensions)",
       "Add integration test verifying schema creation is idempotent"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

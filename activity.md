@@ -94,3 +94,29 @@
 - `uv run ruff format --check src/ tests/` -- 16 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 11 source files
 - `uv run pytest tests/ -v` -- 115 passed in 0.10s
+
+## T05: Create Neo4j schema, indexes, and constraints (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/stores/neo4j_schema.py` with idempotent schema provisioning:
+  - `NodeLabel` StrEnum: Project, Space, Item, Revision, Tag, Artifact, TagAssignment
+  - `RelType` StrEnum: structural relationships (IN_PROJECT, CHILD_OF, IN_SPACE, REVISION_OF, TAG_OF, POINTS_TO, ATTACHED_TO, ASSIGNMENT_OF, ASSIGNED_TO) and domain edges (SUPERSEDES, DEPENDS_ON, DERIVED_FROM, REFERENCES, RELATED_TO, SUPPORTS, CONTRADICTS, BUNDLES)
+  - Uniqueness constraints on `id` for all seven node types via `IF NOT EXISTS`
+  - Fulltext index `revision_search_text` on `Revision.search_text`
+  - Vector index `revision_embedding` on `Revision.embedding` (1536 dimensions, cosine similarity)
+  - `ensure_schema()` async function using auto-commit transactions for DDL
+- Updated `src/memex/stores/__init__.py` to re-export `NodeLabel`, `RelType`, `ensure_schema`
+- Updated `tests/conftest.py` with shared `neo4j_driver` async fixture (skip-if-unavailable)
+- Created `tests/test_neo4j_schema.py` with 4 integration tests:
+  - `test_creates_uniqueness_constraints`: verifies all 7 node-type constraints exist
+  - `test_creates_fulltext_index`: verifies fulltext index on Revision.search_text
+  - `test_creates_vector_index`: verifies vector index on Revision.embedding
+  - `test_idempotent`: runs ensure_schema twice with no errors
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 18 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 12 source files
+- `uv run pytest tests/ -v` -- 119 passed (including 4 Neo4j integration tests against live container)
