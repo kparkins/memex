@@ -783,7 +783,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Surface reranking support for client, dedicated, and auto modes",
       "Add tests: mutation tools modify graph correctly, Dream State tool triggers pipeline, reranking modes return expected payloads"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

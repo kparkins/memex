@@ -780,3 +780,39 @@
 - `uv run ruff format --check src/ tests/` -- 57 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 31 source files
 - `uv run pytest tests/ -v` -- 585 passed (37 new graph tool tests + 548 existing)
+
+## T27: Implement MCP tools: graph mutation, Dream State invocation, and reranking support (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Extended `src/memex/mcp/tools.py` with 8 new tool capabilities (16 tool registrations including paper taxonomy aliases):
+  - **Graph mutation input models**: `ReviseItemInput`, `RollbackTagInput`, `DeprecateItemInput`, `UndeprecateItemInput`, `MoveTagInput`, `CreateEdgeInput`
+  - **Dream State input model**: `DreamStateInvokeInput` for explicit pipeline invocation
+  - **Reranking input model**: `RerankInput` supporting client/dedicated/auto modes
+  - **MemexToolService methods**: `revise_item()`, `rollback_tag()`, `deprecate_item()`, `undeprecate_item()`, `move_tag()`, `create_edge()`, `invoke_dream_state()`, `rerank()`
+  - **Audit report serializer**: `_serialize_audit_report()` for DreamAuditReport MCP transport
+  - **Constructor update**: `MemexToolService` now accepts optional `DreamStatePipeline` dependency
+  - **Factory update**: `create_mcp_server` builds `DreamStatePipeline` from Redis-backed collector, executor, and cursor when Redis is available
+  - **Tool registration pairs**: Each capability registered under both `memex_*` alias and paper taxonomy name (`mutation_*`, `dream_state_*`, `memory_*`)
+  - Total tools: 42 (26 original + 16 new mutation/dream/rerank)
+  - **Post-commit event publication**: Mutation tools publish `revision.created`, `edge.created`, and `revision.deprecated` events to consolidation feed
+- Updated `src/memex/mcp/__init__.py` to re-export all 8 new input models
+- Updated `tests/test_mcp_tools.py`: Adjusted `test_tool_count` from 26 to 42
+- Updated `tests/test_mcp_graph_tools.py`: Adjusted `test_total_tool_count` from 26 to 42
+- Created `tests/test_mcp_mutation_tools.py` with 34 tests across 9 test classes:
+  - `TestReviseItem`: 4 tests (new revision created, active tag moved, SUPERSEDES edge, custom search_text)
+  - `TestRollbackTag`: 2 tests (rollback to earlier revision, tag assignment in result)
+  - `TestDeprecateItem`: 3 tests (flag set, excluded from listing, undeprecate restores)
+  - `TestMoveTag`: 2 tests (pointer updated, assignment history recorded)
+  - `TestCreateEdge`: 3 tests (edge created, metadata persisted, JSON serializable)
+  - `TestDreamStateInvoke`: 5 tests (not configured raises, audit report returned, dry_run forwarded, model override forwarded, JSON serializable)
+  - `TestRerank`: 7 tests (dedicated sorts by score, client preserves order, auto selects dedicated/client, invalid mode fallback, query echoed, JSON serializable)
+  - `TestMutationToolRegistration`: 5 tests (mutation tools, dream state tools, rerank tools, total count 42, all have descriptions)
+  - `TestMutationToolSerialization`: 3 tests (revise JSON, deprecate JSON, rerank JSON)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 58 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 31 source files
+- `uv run pytest tests/ -v` -- 619 passed (34 new mutation tool tests + 585 existing)

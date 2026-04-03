@@ -12,13 +12,20 @@ canonical capability names to the paper's taxonomy.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import orjson
 from pydantic import BaseModel, Field
 
 from memex.domain import Edge, EdgeType, Item, ItemKind, Revision, TagAssignment
+from memex.orchestration.dream_pipeline import DreamAuditReport, DreamStatePipeline
+from memex.orchestration.events import (
+    publish_edge_created,
+    publish_revision_created,
+    publish_revision_deprecated,
+)
 from memex.orchestration.ingest import (
     ArtifactSpec,
     EdgeSpec,
@@ -30,6 +37,7 @@ from memex.retrieval.multi_query import multi_query_search
 from memex.stores.neo4j_store import Neo4jStore
 from memex.stores.redis_store import (
     ConsolidationEventFeed,
+    DreamStateCursor,
     RedisWorkingMemory,
     WorkingMemoryMessage,
 )
@@ -252,6 +260,123 @@ class ResolveTagAtTimeInput(BaseModel):
     timestamp: str
 
 
+# -- Graph mutation input models -------------------------------------------
+
+
+class ReviseItemInput(BaseModel):
+    """Input schema for ``memex_revise`` / ``mutation_revise``.
+
+    Args:
+        item_id: Item to create a new revision for.
+        content: Content of the new revision.
+        search_text: Fulltext search text (defaults to content).
+        tag_name: Tag to advance to the new revision.
+    """
+
+    item_id: str
+    content: str
+    search_text: str | None = None
+    tag_name: str = "active"
+
+
+class RollbackTagInput(BaseModel):
+    """Input schema for ``memex_rollback`` / ``mutation_rollback``.
+
+    Args:
+        tag_id: Tag to roll back.
+        target_revision_id: Earlier revision to point the tag at.
+    """
+
+    tag_id: str
+    target_revision_id: str
+
+
+class DeprecateItemInput(BaseModel):
+    """Input schema for ``memex_deprecate`` / ``mutation_deprecate``.
+
+    Args:
+        item_id: Item to deprecate.
+    """
+
+    item_id: str
+
+
+class UndeprecateItemInput(BaseModel):
+    """Input schema for ``memex_undeprecate`` / ``mutation_undeprecate``.
+
+    Args:
+        item_id: Item to restore from deprecation.
+    """
+
+    item_id: str
+
+
+class MoveTagInput(BaseModel):
+    """Input schema for ``memex_move_tag`` / ``mutation_move_tag``.
+
+    Args:
+        tag_id: Tag to move.
+        new_revision_id: Revision to point the tag at.
+    """
+
+    tag_id: str
+    new_revision_id: str
+
+
+class CreateEdgeInput(BaseModel):
+    """Input schema for ``memex_create_edge`` / ``mutation_create_edge``.
+
+    Args:
+        source_revision_id: Source revision for the edge.
+        target_revision_id: Target revision for the edge.
+        edge_type: Type of the edge relationship.
+        confidence: Confidence score (0.0-1.0).
+        reason: Reason for this relationship.
+        context: Additional context for the edge.
+    """
+
+    source_revision_id: str
+    target_revision_id: str
+    edge_type: str
+    confidence: float | None = None
+    reason: str | None = None
+    context: str | None = None
+
+
+# -- Dream State invocation input model ------------------------------------
+
+
+class DreamStateInvokeInput(BaseModel):
+    """Input schema for ``memex_dream_state`` / ``dream_state_invoke``.
+
+    Args:
+        project_id: Project to run consolidation on.
+        dry_run: If true, compute actions without applying them.
+        model: Override LLM model for assessment.
+    """
+
+    project_id: str
+    dry_run: bool = False
+    model: str | None = None
+
+
+# -- Reranking input model -------------------------------------------------
+
+
+class RerankInput(BaseModel):
+    """Input schema for ``memex_rerank`` / ``memory_rerank``.
+
+    Args:
+        results: Previously retrieved result dicts to rerank.
+        query: Original query for relevance scoring.
+        mode: Reranking mode (client/dedicated/auto).
+    """
+
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    query: str
+    mode: str = RERANKING_MODE_AUTO
+
+
 # -- Serialization helpers -------------------------------------------------
 
 
@@ -386,6 +511,7 @@ class MemexToolService:
         driver: Neo4j async driver for retrieval queries.
         working_memory: Redis working-memory buffer (``None`` to skip).
         event_feed: Dream State consolidation feed (``None`` to skip).
+        dream_pipeline: Dream State pipeline (``None`` disables invocation).
         database: Neo4j database name.
     """
 
@@ -396,12 +522,14 @@ class MemexToolService:
         *,
         working_memory: RedisWorkingMemory | None = None,
         event_feed: ConsolidationEventFeed | None = None,
+        dream_pipeline: DreamStatePipeline | None = None,
         database: str = "neo4j",
     ) -> None:
         self._store = store
         self._driver = driver
         self._working_memory = working_memory
         self._event_feed = event_feed
+        self._dream_pipeline = dream_pipeline
         self._database = database
         self._ingest_service = IngestService(
             store,
@@ -771,6 +899,247 @@ class MemexToolService:
             "found": revision is not None,
         }
 
+    # -- Graph mutation methods ------------------------------------------------
+
+    async def revise_item(self, inp: ReviseItemInput) -> dict[str, Any]:
+        """Create a new revision, add SUPERSEDES edge, and advance tag.
+
+        Args:
+            inp: Revise input with item_id, content, and tag_name.
+
+        Returns:
+            Dictionary with new revision and tag assignment.
+        """
+        revisions = await self._store.get_revisions_for_item(inp.item_id)
+        next_number = max((r.revision_number for r in revisions), default=0) + 1
+
+        revision = Revision(
+            id=str(uuid.uuid4()),
+            item_id=inp.item_id,
+            revision_number=next_number,
+            content=inp.content,
+            search_text=inp.search_text or inp.content,
+            created_at=datetime.now(UTC),
+        )
+
+        persisted, assignment = await self._store.revise_item(
+            inp.item_id, revision, tag_name=inp.tag_name
+        )
+
+        if self._event_feed is not None:
+            item = await self._store.get_item(inp.item_id)
+            project_id = ""
+            if item is not None:
+                space = await self._store.get_space(item.space_id)
+                if space is not None:
+                    project_id = space.project_id
+            await publish_revision_created(self._event_feed, project_id, persisted)
+
+        return {
+            "revision": _serialize_revision(persisted),
+            "tag_assignment": _serialize_tag_assignment(assignment),
+            "item_id": inp.item_id,
+        }
+
+    async def rollback_tag(self, inp: RollbackTagInput) -> dict[str, Any]:
+        """Roll a tag back to a strictly earlier revision.
+
+        Args:
+            inp: Rollback input with tag_id and target revision.
+
+        Returns:
+            Dictionary with the new tag assignment.
+        """
+        assignment = await self._store.rollback_tag(inp.tag_id, inp.target_revision_id)
+        return {
+            "tag_assignment": _serialize_tag_assignment(assignment),
+            "tag_id": inp.tag_id,
+            "target_revision_id": inp.target_revision_id,
+        }
+
+    async def deprecate_item(self, inp: DeprecateItemInput) -> dict[str, Any]:
+        """Deprecate an item, hiding it from default retrieval.
+
+        Args:
+            inp: Deprecate input with item_id.
+
+        Returns:
+            Dictionary with the updated item.
+        """
+        item = await self._store.deprecate_item(inp.item_id)
+
+        if self._event_feed is not None:
+            space = await self._store.get_space(item.space_id)
+            project_id = space.project_id if space is not None else ""
+            await publish_revision_deprecated(self._event_feed, project_id, item.id)
+
+        return {
+            "item": _serialize_item(item),
+            "deprecated": True,
+        }
+
+    async def undeprecate_item(self, inp: UndeprecateItemInput) -> dict[str, Any]:
+        """Restore an item from deprecation.
+
+        Args:
+            inp: Undeprecate input with item_id.
+
+        Returns:
+            Dictionary with the restored item.
+        """
+        item = await self._store.undeprecate_item(inp.item_id)
+        return {
+            "item": _serialize_item(item),
+            "deprecated": False,
+        }
+
+    async def move_tag(self, inp: MoveTagInput) -> dict[str, Any]:
+        """Move a tag to point at a different revision.
+
+        Args:
+            inp: Move tag input with tag_id and new revision.
+
+        Returns:
+            Dictionary with the new tag assignment.
+        """
+        assignment = await self._store.move_tag(inp.tag_id, inp.new_revision_id)
+        return {
+            "tag_assignment": _serialize_tag_assignment(assignment),
+            "tag_id": inp.tag_id,
+            "new_revision_id": inp.new_revision_id,
+        }
+
+    async def create_edge(self, inp: CreateEdgeInput) -> dict[str, Any]:
+        """Create a typed edge between two revisions.
+
+        Args:
+            inp: Edge creation input with source, target, and type.
+
+        Returns:
+            Dictionary with the created edge.
+        """
+        edge = Edge(
+            source_revision_id=inp.source_revision_id,
+            target_revision_id=inp.target_revision_id,
+            edge_type=EdgeType(inp.edge_type),
+            confidence=inp.confidence,
+            reason=inp.reason,
+            context=inp.context,
+        )
+        persisted = await self._store.create_edge(edge)
+
+        if self._event_feed is not None:
+            await publish_edge_created(self._event_feed, "", persisted)
+
+        return {
+            "edge": _serialize_edge(persisted),
+        }
+
+    # -- Dream State invocation ------------------------------------------------
+
+    async def invoke_dream_state(self, inp: DreamStateInvokeInput) -> dict[str, Any]:
+        """Trigger the Dream State consolidation pipeline.
+
+        Args:
+            inp: Invocation input with project_id and options.
+
+        Returns:
+            Dictionary with the audit report summary.
+
+        Raises:
+            RuntimeError: If Dream State pipeline is not configured.
+        """
+        if self._dream_pipeline is None:
+            raise RuntimeError("Dream State pipeline is not configured")
+
+        report = await self._dream_pipeline.run(
+            inp.project_id, dry_run=inp.dry_run, model=inp.model
+        )
+        return _serialize_audit_report(report)
+
+    # -- Reranking support -----------------------------------------------------
+
+    async def rerank(self, inp: RerankInput) -> dict[str, Any]:
+        """Rerank previously retrieved results.
+
+        Modes:
+            - ``client``: Returns results with metadata for client reranking.
+            - ``dedicated``: Applies server-side score-based reranking.
+            - ``auto``: Selects dedicated when results exist, else client.
+
+        Args:
+            inp: Rerank input with results, query, and mode.
+
+        Returns:
+            Dictionary with reranked results and mode used.
+        """
+        mode = inp.mode
+        if mode not in _VALID_RERANKING_MODES:
+            mode = RERANKING_MODE_AUTO
+
+        effective_mode = mode
+        if mode == RERANKING_MODE_AUTO:
+            effective_mode = (
+                RERANKING_MODE_DEDICATED if inp.results else RERANKING_MODE_CLIENT
+            )
+
+        if effective_mode == RERANKING_MODE_DEDICATED:
+            ranked = sorted(
+                inp.results,
+                key=lambda r: float(r.get("score", 0.0)),
+                reverse=True,
+            )
+        else:
+            ranked = list(inp.results)
+
+        return {
+            "results": ranked,
+            "count": len(ranked),
+            "mode": effective_mode,
+            "query": inp.query,
+        }
+
+
+def _serialize_audit_report(report: DreamAuditReport) -> dict[str, Any]:
+    """Serialize a DreamAuditReport to a JSON-safe dictionary.
+
+    Args:
+        report: Audit report from a Dream State run.
+
+    Returns:
+        Dictionary with all report fields for MCP transport.
+    """
+    execution = None
+    if report.execution is not None:
+        execution = {
+            "total": report.execution.total,
+            "succeeded": report.execution.succeeded,
+            "failed": report.execution.failed,
+            "results": [
+                {
+                    "action_type": r.action.action_type.value,
+                    "success": r.success,
+                    "error": r.error,
+                }
+                for r in report.execution.results
+            ],
+        }
+
+    return {
+        "report_id": report.report_id,
+        "project_id": report.project_id,
+        "timestamp": report.timestamp.isoformat(),
+        "dry_run": report.dry_run,
+        "events_collected": report.events_collected,
+        "revisions_inspected": report.revisions_inspected,
+        "actions_recommended": len(report.actions_recommended),
+        "execution": execution,
+        "circuit_breaker_tripped": report.circuit_breaker_tripped,
+        "deprecation_ratio": report.deprecation_ratio,
+        "max_deprecation_ratio": report.max_deprecation_ratio,
+        "cursor_after": report.cursor_after,
+    }
+
 
 # -- MCP server factory ----------------------------------------------------
 
@@ -798,15 +1167,26 @@ def create_mcp_server(
     """
     from mcp.server.fastmcp import FastMCP
 
+    from memex.orchestration.dream_collector import DreamStateCollector
+    from memex.orchestration.dream_executor import DreamStateExecutor
+
     store = Neo4jStore(neo4j_driver, database=database)
     wm = RedisWorkingMemory(redis_client) if redis_client is not None else None
     feed = ConsolidationEventFeed(redis_client) if redis_client is not None else None
+
+    pipeline: DreamStatePipeline | None = None
+    if redis_client is not None and feed is not None:
+        cursor = DreamStateCursor(redis_client)
+        collector = DreamStateCollector(store, feed, cursor)
+        executor = DreamStateExecutor(store)
+        pipeline = DreamStatePipeline(collector, executor, store)
 
     service = MemexToolService(
         store,
         neo4j_driver,
         working_memory=wm,
         event_feed=feed,
+        dream_pipeline=pipeline,
         database=database,
     )
 
@@ -1215,6 +1595,260 @@ def create_mcp_server(
         """Resolve tag at time (paper taxonomy alias)."""
         inp = ResolveTagAtTimeInput(tag_id=tag_id, timestamp=timestamp)
         result = await service.resolve_tag_at_time(inp)
+        return orjson.dumps(result).decode()
+
+    # -- Graph mutation: revise, rollback, deprecate, tag, edge ---------------
+
+    @mcp.tool(name="memex_revise")
+    async def memex_revise(
+        item_id: str,
+        content: str,
+        search_text: str | None = None,
+        tag_name: str = "active",
+    ) -> str:
+        """Create a new revision on an item with SUPERSEDES edge and tag advance.
+
+        Atomically creates an immutable revision, links it via SUPERSEDES
+        to the previous revision, and moves the named tag forward.
+        """
+        inp = ReviseItemInput(
+            item_id=item_id,
+            content=content,
+            search_text=search_text,
+            tag_name=tag_name,
+        )
+        result = await service.revise_item(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="mutation_revise")
+    async def mutation_revise_alias(
+        item_id: str,
+        content: str,
+        search_text: str | None = None,
+        tag_name: str = "active",
+    ) -> str:
+        """Revise an item (paper taxonomy alias for memex_revise)."""
+        inp = ReviseItemInput(
+            item_id=item_id,
+            content=content,
+            search_text=search_text,
+            tag_name=tag_name,
+        )
+        result = await service.revise_item(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_rollback")
+    async def memex_rollback(
+        tag_id: str,
+        target_revision_id: str,
+    ) -> str:
+        """Roll a tag back to a strictly earlier revision.
+
+        Validates the target belongs to the same item and has a lower
+        revision number than the current pointer.
+        """
+        inp = RollbackTagInput(
+            tag_id=tag_id,
+            target_revision_id=target_revision_id,
+        )
+        result = await service.rollback_tag(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="mutation_rollback")
+    async def mutation_rollback_alias(
+        tag_id: str,
+        target_revision_id: str,
+    ) -> str:
+        """Rollback a tag (paper taxonomy alias for memex_rollback)."""
+        inp = RollbackTagInput(
+            tag_id=tag_id,
+            target_revision_id=target_revision_id,
+        )
+        result = await service.rollback_tag(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_deprecate")
+    async def memex_deprecate(item_id: str) -> str:
+        """Deprecate an item, hiding it from default retrieval paths.
+
+        Sets the deprecation flag and publishes a revision.deprecated
+        event for Dream State processing.
+        """
+        inp = DeprecateItemInput(item_id=item_id)
+        result = await service.deprecate_item(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="mutation_deprecate")
+    async def mutation_deprecate_alias(item_id: str) -> str:
+        """Deprecate an item (paper taxonomy alias)."""
+        inp = DeprecateItemInput(item_id=item_id)
+        result = await service.deprecate_item(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_undeprecate")
+    async def memex_undeprecate(item_id: str) -> str:
+        """Restore an item from deprecation, making it visible again.
+
+        Clears the deprecation flag so the item appears in default
+        retrieval paths.
+        """
+        inp = UndeprecateItemInput(item_id=item_id)
+        result = await service.undeprecate_item(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="mutation_undeprecate")
+    async def mutation_undeprecate_alias(item_id: str) -> str:
+        """Undeprecate an item (paper taxonomy alias)."""
+        inp = UndeprecateItemInput(item_id=item_id)
+        result = await service.undeprecate_item(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_move_tag")
+    async def memex_move_tag(
+        tag_id: str,
+        new_revision_id: str,
+    ) -> str:
+        """Move a tag to point at a different revision.
+
+        Updates the tag pointer and records a new TagAssignment
+        in the history for point-in-time resolution.
+        """
+        inp = MoveTagInput(
+            tag_id=tag_id,
+            new_revision_id=new_revision_id,
+        )
+        result = await service.move_tag(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="mutation_move_tag")
+    async def mutation_move_tag_alias(
+        tag_id: str,
+        new_revision_id: str,
+    ) -> str:
+        """Move a tag (paper taxonomy alias for memex_move_tag)."""
+        inp = MoveTagInput(
+            tag_id=tag_id,
+            new_revision_id=new_revision_id,
+        )
+        result = await service.move_tag(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memex_create_edge")
+    async def memex_create_edge(
+        source_revision_id: str,
+        target_revision_id: str,
+        edge_type: str,
+        confidence: float | None = None,
+        reason: str | None = None,
+        context: str | None = None,
+    ) -> str:
+        """Create a typed edge between two revisions.
+
+        Supports all edge types: SUPERSEDES, DEPENDS_ON, DERIVED_FROM,
+        REFERENCES, RELATED_TO, SUPPORTS, CONTRADICTS, BUNDLES.
+        """
+        inp = CreateEdgeInput(
+            source_revision_id=source_revision_id,
+            target_revision_id=target_revision_id,
+            edge_type=edge_type,
+            confidence=confidence,
+            reason=reason,
+            context=context,
+        )
+        result = await service.create_edge(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="mutation_create_edge")
+    async def mutation_create_edge_alias(
+        source_revision_id: str,
+        target_revision_id: str,
+        edge_type: str,
+        confidence: float | None = None,
+        reason: str | None = None,
+        context: str | None = None,
+    ) -> str:
+        """Create an edge (paper taxonomy alias for memex_create_edge)."""
+        inp = CreateEdgeInput(
+            source_revision_id=source_revision_id,
+            target_revision_id=target_revision_id,
+            edge_type=edge_type,
+            confidence=confidence,
+            reason=reason,
+            context=context,
+        )
+        result = await service.create_edge(inp)
+        return orjson.dumps(result).decode()
+
+    # -- Dream State invocation -----------------------------------------------
+
+    @mcp.tool(name="memex_dream_state")
+    async def memex_dream_state(
+        project_id: str,
+        dry_run: bool = False,
+        model: str | None = None,
+    ) -> str:
+        """Trigger the Dream State consolidation pipeline.
+
+        Runs event collection, LLM assessment, circuit-breaker checks,
+        action execution (unless dry_run), and persists an audit report.
+        """
+        inp = DreamStateInvokeInput(
+            project_id=project_id,
+            dry_run=dry_run,
+            model=model,
+        )
+        result = await service.invoke_dream_state(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="dream_state_invoke")
+    async def dream_state_invoke_alias(
+        project_id: str,
+        dry_run: bool = False,
+        model: str | None = None,
+    ) -> str:
+        """Invoke Dream State (paper taxonomy alias)."""
+        inp = DreamStateInvokeInput(
+            project_id=project_id,
+            dry_run=dry_run,
+            model=model,
+        )
+        result = await service.invoke_dream_state(inp)
+        return orjson.dumps(result).decode()
+
+    # -- Reranking support ----------------------------------------------------
+
+    @mcp.tool(name="memex_rerank")
+    async def memex_rerank(
+        query: str,
+        results: list[dict[str, Any]] | None = None,
+        mode: str = "auto",
+    ) -> str:
+        """Rerank previously retrieved memory results.
+
+        Modes: client (pass-through with metadata), dedicated
+        (server-side score sort), auto (picks best strategy).
+        """
+        inp = RerankInput(
+            results=results or [],
+            query=query,
+            mode=mode,
+        )
+        result = await service.rerank(inp)
+        return orjson.dumps(result).decode()
+
+    @mcp.tool(name="memory_rerank")
+    async def memory_rerank_alias(
+        query: str,
+        results: list[dict[str, Any]] | None = None,
+        mode: str = "auto",
+    ) -> str:
+        """Rerank results (paper taxonomy alias for memex_rerank)."""
+        inp = RerankInput(
+            results=results or [],
+            query=query,
+            mode=mode,
+        )
+        result = await service.rerank(inp)
         return orjson.dumps(result).decode()
 
     return mcp
