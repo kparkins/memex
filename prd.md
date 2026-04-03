@@ -455,7 +455,7 @@ Tasks are intentionally sequential. Implement them top to bottom, one at a time.
       "Model artifact attachments as pointer-only records (location + metadata, no bytes)",
       "Add unit tests for model construction, validation, and serialization"
     ],
-    "passes": false
+    "passes": true
   },
 
   {

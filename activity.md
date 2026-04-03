@@ -43,3 +43,32 @@
 - `uv run ruff format --check src/ tests/` -- 12 files already formatted
 - `uv run mypy src/` -- Success: no issues found in 9 source files
 - `uv run pytest tests/ -v` -- 54 passed in 0.07s
+
+## T03: Define core domain types (2026-04-02)
+
+**Status**: PASSED
+
+**Changes**:
+- Created `src/memex/domain/models.py` with Pydantic v2 models:
+  - `ItemKind` StrEnum: conversation, decision, fact, reflection, error, action, instruction, bundle, system
+  - `Project`: top-level container with id, name, created_at, metadata
+  - `Space`: organizational unit with nested hierarchy via parent_space_id
+  - `Item`: core memory unit with kind, deprecation flag (deprecated, deprecated_at)
+  - `Revision` (frozen=True): immutable content snapshot with embedding, search_text, and FR-8 enrichment fields (summary, topics, keywords, facts, events, implications, embedding_text_override)
+  - `Tag`: mutable pointer from item to revision with created_at/updated_at timestamps
+  - `Artifact`: pointer-only record (location, media_type, size_bytes, metadata -- no bytes stored)
+- Updated `src/memex/domain/__init__.py` to re-export all domain types
+- Created `tests/test_models.py` with 37 unit tests across 7 test classes:
+  - `TestItemKind`: 3 tests (all kinds defined, string subclass, membership)
+  - `TestProject`: 4 tests (defaults, explicit fields, serialization, unique IDs)
+  - `TestSpace`: 3 tests (root, nested, serialization)
+  - `TestItem`: 7 tests (defaults, string coercion, deprecation, invalid kind, all kinds, serialization, mutable deprecation)
+  - `TestRevision`: 10 tests (minimal, enrichments, immutability, model_copy, validation, embedding, hashable, serialization)
+  - `TestTag`: 4 tests (construction, mutable pointer, timestamps, serialization)
+  - `TestArtifact`: 6 tests (minimal, full, no bytes field, negative size rejected, zero size, serialization)
+
+**Verification**:
+- `uv run ruff check src/ tests/` -- All checks passed
+- `uv run ruff format --check src/ tests/` -- 14 files already formatted
+- `uv run mypy src/` -- Success: no issues found in 10 source files
+- `uv run pytest tests/ -v` -- 91 passed in 0.08s

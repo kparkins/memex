@@ -1,5 +1,23 @@
 """Domain models: items, revisions, tags, artifacts, edges, and krefs."""
 
 from memex.domain.kref import Kref
+from memex.domain.models import (
+    Artifact,
+    Item,
+    ItemKind,
+    Project,
+    Revision,
+    Space,
+    Tag,
+)
 
-__all__ = ["Kref"]
+__all__ = [
+    "Artifact",
+    "Item",
+    "ItemKind",
+    "Kref",
+    "Project",
+    "Revision",
+    "Space",
+    "Tag",
+]
