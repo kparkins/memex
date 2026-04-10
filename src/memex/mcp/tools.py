@@ -488,7 +488,9 @@ def _serialize_search_result(result: SearchResult) -> dict[str, Any]:
     Returns:
         Dictionary with all fields serialized for MCP transport.
     """
-    data: dict[str, Any] = {
+    match_source = getattr(result, "match_source", None)
+    search_mode = getattr(result, "search_mode", None)
+    return {
         "revision_id": result.revision.id,
         "item_id": result.item_id,
         "item_kind": result.item_kind.value,
@@ -497,12 +499,9 @@ def _serialize_search_result(result: SearchResult) -> dict[str, Any]:
         "score": result.score,
         "lexical_score": getattr(result, "lexical_score", 0.0),
         "vector_score": getattr(result, "vector_score", 0.0),
+        "match_source": (match_source.value if match_source else "unknown"),
+        "search_mode": (search_mode.value if search_mode else "unknown"),
     }
-    match_source = getattr(result, "match_source", None)
-    data["match_source"] = match_source.value if match_source else "unknown"
-    search_mode = getattr(result, "search_mode", None)
-    data["search_mode"] = search_mode.value if search_mode else "unknown"
-    return data
 
 
 def _serialize_message(msg: WorkingMemoryMessage) -> dict[str, Any]:
@@ -1146,34 +1145,47 @@ class MemexToolService:
             Dictionary with the updated item.
         """
         item = await self._store.deprecate_item(inp.item_id)
-
-        if self._event_feed is not None:
-            try:
-                space = await self._store.get_space(item.space_id)
-                if space is None:
-                    logger.warning(
-                        "Space %s not found for item %s; "
-                        "publishing deprecation event with empty project_id",
-                        item.space_id,
-                        inp.item_id,
-                    )
-                project_id = space.project_id if space is not None else ""
-                await publish_revision_deprecated(
-                    self._event_feed,
-                    project_id,
-                    item.id,
-                )
-            except Exception:
-                logger.warning(
-                    "Event publication failed after deprecate_item; "
-                    "graph mutation succeeded",
-                    exc_info=True,
-                )
-
+        await self._try_publish_deprecation_event(item)
         return {
             "item": _serialize_item(item),
             "deprecated": True,
         }
+
+    async def _try_publish_deprecation_event(
+        self,
+        item: Item,
+    ) -> None:
+        """Publish deprecation event, swallowing failures.
+
+        Post-commit event publication must not break the mutation.
+
+        Args:
+            item: The deprecated item.
+        """
+        if self._event_feed is None:
+            return
+        try:
+            space = await self._store.get_space(item.space_id)
+            if space is None:
+                logger.warning(
+                    "Space %s not found for item %s; "
+                    "publishing deprecation event "
+                    "with empty project_id",
+                    item.space_id,
+                    item.id,
+                )
+            project_id = space.project_id if space else ""
+            await publish_revision_deprecated(
+                self._event_feed,
+                project_id,
+                item.id,
+            )
+        except Exception:
+            logger.warning(
+                "Event publication failed after "
+                "deprecate_item; graph mutation succeeded",
+                exc_info=True,
+            )
 
     async def undeprecate_item(self, inp: UndeprecateItemInput) -> dict[str, Any]:
         """Restore an item from deprecation.
@@ -1224,27 +1236,33 @@ class MemexToolService:
             context=inp.context,
         )
         persisted = await self._store.create_edge(edge)
+        await self._try_publish_edge_event(persisted)
+        return {"edge": _serialize_edge(persisted)}
 
-        if self._event_feed is not None:
-            try:
-                project_id = await self._resolve_project_id_from_revision(
-                    inp.source_revision_id,
-                )
-                await publish_edge_created(
-                    self._event_feed,
-                    project_id,
-                    persisted,
-                )
-            except Exception:
-                logger.warning(
-                    "Event publication failed after create_edge; "
-                    "graph mutation succeeded",
-                    exc_info=True,
-                )
+    async def _try_publish_edge_event(self, edge: Edge) -> None:
+        """Publish edge-created event, swallowing failures.
 
-        return {
-            "edge": _serialize_edge(persisted),
-        }
+        Post-commit event publication must not break the mutation.
+
+        Args:
+            edge: The persisted edge.
+        """
+        if self._event_feed is None:
+            return
+        try:
+            project_id = await self._resolve_project_id_from_revision(
+                edge.source_revision_id,
+            )
+            await publish_edge_created(
+                self._event_feed,
+                project_id,
+                edge,
+            )
+        except Exception:
+            logger.warning(
+                "Event publication failed after create_edge; graph mutation succeeded",
+                exc_info=True,
+            )
 
     # -- Dream State invocation ------------------------------------------------
 
@@ -1470,39 +1488,40 @@ def _make_tool_handler(
         return orjson.dumps(result).decode()
 
     hints = get_type_hints(input_cls)
-    required_params: list[inspect.Parameter] = []
-    optional_params: list[inspect.Parameter] = []
-    for field_name, field_info in input_cls.model_fields.items():
-        annotation = hints[field_name]
-        if field_info.default is not PydanticUndefined:
-            optional_params.append(
+    positional = inspect.Parameter.POSITIONAL_OR_KEYWORD
+    required: list[inspect.Parameter] = []
+    optional: list[inspect.Parameter] = []
+    for name, info in input_cls.model_fields.items():
+        annotation = hints[name]
+        if info.default is not PydanticUndefined:
+            optional.append(
                 inspect.Parameter(
-                    field_name,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    default=field_info.default,
+                    name,
+                    positional,
+                    default=info.default,
                     annotation=annotation,
                 )
             )
-        elif field_info.default_factory is not None:
-            optional_params.append(
+        elif info.default_factory is not None:
+            optional.append(
                 inspect.Parameter(
-                    field_name,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    name,
+                    positional,
                     default=None,
                     annotation=annotation | None,
                 )
             )
         else:
-            required_params.append(
+            required.append(
                 inspect.Parameter(
-                    field_name,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    name,
+                    positional,
                     annotation=annotation,
                 )
             )
 
     sig = inspect.Signature(
-        required_params + optional_params,
+        required + optional,
         return_annotation=str,
     )
     setattr(handler, "__signature__", sig)  # noqa: B010

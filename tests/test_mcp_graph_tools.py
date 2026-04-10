@@ -16,7 +16,16 @@ import orjson
 import pytest
 from pydantic import ValidationError
 
-from memex.domain import Edge, EdgeType, Item, ItemKind, Revision, Space, Tag
+from memex.domain import (
+    Edge,
+    EdgeType,
+    Item,
+    ItemKind,
+    Project,
+    Revision,
+    Space,
+    Tag,
+)
 from memex.mcp.tools import (
     CreateEdgeInput,
     DependenciesInput,
@@ -50,11 +59,7 @@ async def env(neo4j_driver, redis_client):
     await redis_client.flushdb()
 
     store = Neo4jStore(neo4j_driver)
-    project = await store.create_project(
-        __import__("memex.domain", fromlist=["Project"]).Project(
-            name="test-graph-tools"
-        )
-    )
+    project = await store.create_project(Project(name="test-graph-tools"))
     space = await store.create_space(Space(project_id=project.id, name="knowledge"))
 
     search = HybridSearch(neo4j_driver)

@@ -40,14 +40,26 @@ class Neo4jSettings(BaseSettings):
         return self
 
 
+class WorkingMemorySettings(BaseSettings):
+    """Backend-agnostic working-memory buffer settings.
+
+    Args:
+        session_ttl_seconds: Seconds before a session expires.
+        max_messages: Maximum messages retained per session.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="MEMEX_WM_")
+
+    session_ttl_seconds: int = 3600
+    max_messages: int = 50
+
+
 class RedisSettings(BaseSettings):
-    """Redis working-memory settings."""
+    """Redis connection settings."""
 
     model_config = SettingsConfigDict(env_prefix="MEMEX_REDIS_")
 
     url: str = "redis://localhost:6379/0"
-    session_ttl_seconds: int = 3600
-    max_messages: int = 50
 
 
 class ArtifactStorageSettings(BaseSettings):
@@ -114,6 +126,20 @@ class DreamStateSettings(BaseSettings):
     poll_interval_seconds: float = 2.0
 
 
+class MongoSettings(BaseSettings):
+    """MongoDB connection settings.
+
+    Args:
+        uri: MongoDB connection URI.
+        database: Database name for Memex collections.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="MEMEX_MONGO_")
+
+    uri: str = "mongodb://localhost:27017"
+    database: str = "memex"
+
+
 class PrivacySettings(BaseSettings):
     """Privacy and redaction settings."""
 
@@ -124,15 +150,22 @@ class PrivacySettings(BaseSettings):
 
 
 class MemexSettings(BaseSettings):
-    """Root configuration aggregating all subsystem settings."""
+    """Root configuration aggregating all subsystem settings.
+
+    Set ``MEMEX_BACKEND`` to ``"mongo"`` to use MongoDB instead of
+    Neo4j + Redis.  Valid values: ``"neo4j"`` (default), ``"mongo"``.
+    """
 
     model_config = SettingsConfigDict(
         env_prefix="MEMEX_",
         env_nested_delimiter="__",
     )
 
+    backend: str = "neo4j"
+    working_memory: WorkingMemorySettings = WorkingMemorySettings()
     neo4j: Neo4jSettings = Neo4jSettings()
     redis: RedisSettings = RedisSettings()
+    mongo: MongoSettings = MongoSettings()
     artifact_storage: ArtifactStorageSettings = ArtifactStorageSettings()
     embedding: EmbeddingSettings = EmbeddingSettings()
     retrieval: RetrievalSettings = RetrievalSettings()

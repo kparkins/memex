@@ -63,16 +63,12 @@ class MultiQuerySearch:
         variants = await self._generate_variants(request.query)
         all_queries = [request.query] + variants
 
-        expanded = request.model_copy(
-            update={"memory_limit": request.memory_limit * 2}
-        )
+        expanded = request.model_copy(update={"memory_limit": request.memory_limit * 2})
 
         result_batches: list[Sequence[SearchResult]] = list(
             await asyncio.gather(
                 *(
-                    self._delegate.search(
-                        expanded.model_copy(update={"query": q})
-                    )
+                    self._delegate.search(expanded.model_copy(update={"query": q}))
                     for q in all_queries
                 )
             )
@@ -111,9 +107,7 @@ class MultiQuerySearch:
             return variants[: self._num_variants]
         except Exception as exc:
             logger.error("Query variant generation failed: %s", exc)
-            raise RuntimeError(
-                f"Query variant generation failed: {exc}"
-            ) from exc
+            raise RuntimeError(f"Query variant generation failed: {exc}") from exc
 
     @staticmethod
     def _deduplicate(

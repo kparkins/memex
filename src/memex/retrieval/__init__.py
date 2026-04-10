@@ -14,8 +14,8 @@ from memex.retrieval.hybrid import (
     compute_fused_score,
 )
 from memex.retrieval.models import (
-    BM25Result,
     DEFAULT_TYPE_WEIGHTS,
+    BM25Result,
     HybridResult,
     MatchSource,
     SearchMode,

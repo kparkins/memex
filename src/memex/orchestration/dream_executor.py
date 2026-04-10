@@ -166,13 +166,13 @@ class DreamStateExecutor:
             raise ValueError(
                 "revision_id and metadata_updates required for update_metadata"
             )
-        updates = action.metadata_updates
+        md = action.metadata_updates
         await self._store.update_revision_enrichment(
             action.revision_id,
             EnrichmentUpdate(
-                summary=updates.summary,
-                topics=list(updates.topics) if updates.topics else None,
-                keywords=list(updates.keywords) if updates.keywords else None,
+                summary=md.summary,
+                topics=list(md.topics) if md.topics else None,
+                keywords=(list(md.keywords) if md.keywords else None),
             ),
         )
 

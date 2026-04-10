@@ -8,12 +8,11 @@ Models:
 
 from __future__ import annotations
 
-from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from memex.domain.utils import new_id, utcnow
+from memex.domain.utils import UtcDatetime, new_id, utcnow
 
 
 class EdgeType(StrEnum):
@@ -63,7 +62,7 @@ class Edge(BaseModel):
     source_revision_id: str
     target_revision_id: str
     edge_type: EdgeType
-    timestamp: datetime = Field(default_factory=utcnow)
+    timestamp: UtcDatetime = Field(default_factory=utcnow)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     reason: str | None = None
     context: str | None = None
@@ -89,4 +88,4 @@ class TagAssignment(BaseModel, frozen=True):
     tag_id: str
     item_id: str
     revision_id: str
-    assigned_at: datetime = Field(default_factory=utcnow)
+    assigned_at: UtcDatetime = Field(default_factory=utcnow)

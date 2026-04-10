@@ -36,7 +36,6 @@ from memex.orchestration.events import (
     publish_revision_created,
     publish_revision_deprecated,
 )
-from memex.orchestration.lookup import get_item_by_path
 from memex.orchestration.ingest import (
     ArtifactSpec,
     EdgeSpec,
@@ -48,6 +47,7 @@ from memex.orchestration.ingest import (
     memory_ingest,
     memory_revise,
 )
+from memex.orchestration.lookup import get_item_by_path
 from memex.orchestration.privacy import (
     CredentialViolationError,
     apply_privacy_hooks,
@@ -75,7 +75,6 @@ __all__ = [
     "IngestParams",
     "IngestResult",
     "IngestService",
-    "get_item_by_path",
     "ReviseParams",
     "ReviseResult",
     "ScheduledTrigger",
@@ -85,6 +84,7 @@ __all__ = [
     "apply_privacy_hooks",
     "compute_deprecation_ratio",
     "enrich_revision",
+    "get_item_by_path",
     "memory_ingest",
     "memory_revise",
     "publish_after_ingest",

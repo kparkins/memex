@@ -126,7 +126,9 @@ class TestGenerateQueryVariants:
         driver = AsyncMock()
         hybrid = HybridSearch(driver)
         multi = MultiQuerySearch(
-            hybrid, llm_client=client, num_variants=10,
+            hybrid,
+            llm_client=client,
+            num_variants=10,
         )
 
         variants = await multi._generate_variants("test")
@@ -135,9 +137,7 @@ class TestGenerateQueryVariants:
 
     async def test_strips_blank_lines(self) -> None:
         """Blank lines in LLM output are filtered out."""
-        client = _mock_llm_client(
-            "\n  variant one  \n\n  variant two  \n\n"
-        )
+        client = _mock_llm_client("\n  variant one  \n\n  variant two  \n\n")
         driver = AsyncMock()
         hybrid = HybridSearch(driver)
         multi = MultiQuerySearch(hybrid, llm_client=client)
@@ -152,7 +152,9 @@ class TestGenerateQueryVariants:
         driver = AsyncMock()
         hybrid = HybridSearch(driver)
         multi = MultiQuerySearch(
-            hybrid, llm_client=client, variant_model="claude-sonnet-4-6",
+            hybrid,
+            llm_client=client,
+            variant_model="claude-sonnet-4-6",
         )
 
         await multi._generate_variants("test")
@@ -239,7 +241,8 @@ class TestApplyMemoryLimit:
             "rev-3": _make_hybrid_result("rev-3", "item-3", 0.7),
         }
         results = MultiQuerySearch._apply_memory_limit(
-            candidates, memory_limit=10,
+            candidates,
+            memory_limit=10,
         )
         scores = [r.score for r in results]
         assert scores == sorted(scores, reverse=True)
@@ -352,7 +355,8 @@ class TestMultiQuerySearch:
             "neural network models"
         )
         multi = MultiQuerySearch(
-            multi_query_env["hybrid"], llm_client=client,
+            multi_query_env["hybrid"],
+            llm_client=client,
         )
         results = await multi.search(
             SearchRequest(query="machine learning", memory_limit=10),
@@ -372,7 +376,8 @@ class TestMultiQuerySearch:
             "artificial intelligence learning"
         )
         multi = MultiQuerySearch(
-            multi_query_env["hybrid"], llm_client=client,
+            multi_query_env["hybrid"],
+            llm_client=client,
         )
         results = await multi.search(
             SearchRequest(query="machine learning", memory_limit=10),
@@ -381,15 +386,14 @@ class TestMultiQuerySearch:
         rev_ids = [r.revision.id for r in results]
         assert len(rev_ids) == len(set(rev_ids))
 
-    async def test_memory_limit_enforced(
-        self, multi_query_env: dict[str, Any]
-    ) -> None:
+    async def test_memory_limit_enforced(self, multi_query_env: dict[str, Any]) -> None:
         """memory_limit caps unique items even with multiple variants."""
         client = _mock_llm_client(
             "artificial intelligence\ndeep learning\nneural networks"
         )
         multi = MultiQuerySearch(
-            multi_query_env["hybrid"], llm_client=client,
+            multi_query_env["hybrid"],
+            llm_client=client,
         )
         results = await multi.search(
             SearchRequest(
@@ -411,7 +415,8 @@ class TestMultiQuerySearch:
             "artificial intelligence\ndeep learning\nneural computation"
         )
         multi = MultiQuerySearch(
-            multi_query_env["hybrid"], llm_client=client,
+            multi_query_env["hybrid"],
+            llm_client=client,
         )
         results = await multi.search(
             SearchRequest(
@@ -434,7 +439,8 @@ class TestMultiQuerySearch:
             "knowledge graph architecture"
         )
         multi = MultiQuerySearch(
-            multi_query_env["hybrid"], llm_client=client,
+            multi_query_env["hybrid"],
+            llm_client=client,
         )
         results = await multi.search(
             SearchRequest(query="machine learning", memory_limit=10),

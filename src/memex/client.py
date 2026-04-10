@@ -35,6 +35,7 @@ from memex.stores.redis_store import ConsolidationEventFeed, RedisWorkingMemory
 
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
+    from pymongo import AsyncMongoClient
     from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
@@ -81,8 +82,8 @@ class Memex:
     def from_settings(cls, settings: MemexSettings) -> Memex:
         """Build a fully-wired Memex from explicit settings.
 
-        Constructs Neo4jStore, HybridSearch, RedisWorkingMemory, and
-        ConsolidationEventFeed from the provided configuration.
+        Constructs the appropriate store and search backends based on
+        ``settings.backend`` (``"neo4j"`` or ``"mongo"``).
 
         Args:
             settings: Root configuration object.
@@ -90,6 +91,20 @@ class Memex:
         Returns:
             A ready-to-use Memex instance.  Call ``close()`` (or use
             as an async context manager) when done.
+        """
+        if settings.backend == "mongo":
+            return cls._build_mongo(settings)
+        return cls._build_neo4j(settings)
+
+    @classmethod
+    def _build_neo4j(cls, settings: MemexSettings) -> Memex:
+        """Wire Neo4j + Redis backends.
+
+        Args:
+            settings: Root configuration object.
+
+        Returns:
+            Memex instance backed by Neo4j and Redis.
         """
         from neo4j import AsyncGraphDatabase
         from redis.asyncio import Redis
@@ -105,7 +120,13 @@ class Memex:
 
         store = Neo4jStore(driver, database=settings.neo4j.database)
         search = HybridSearch(driver, database=settings.neo4j.database)
-        wm = RedisWorkingMemory(redis_client)
+        wm_cfg = settings.working_memory
+        wm = RedisWorkingMemory(
+            redis_client,
+            settings=settings.redis,
+            session_ttl_seconds=wm_cfg.session_ttl_seconds,
+            max_messages=wm_cfg.max_messages,
+        )
         ef = ConsolidationEventFeed(redis_client)
 
         instance = cls(
@@ -117,6 +138,90 @@ class Memex:
         instance._driver = driver
         instance._redis = redis_client
         return instance
+
+    @classmethod
+    def _build_mongo(cls, settings: MemexSettings) -> Memex:
+        """Wire MongoDB backends (store, search, working memory, events).
+
+        Args:
+            settings: Root configuration object.
+
+        Returns:
+            Memex instance backed entirely by MongoDB.
+        """
+        from pymongo import AsyncMongoClient
+
+        from memex.retrieval.mongo_hybrid import MongoHybridSearch
+        from memex.stores.mongo_event_feed import (
+            MongoEventFeed,
+        )
+        from memex.stores.mongo_store import MongoStore
+        from memex.stores.mongo_working_memory import MongoWorkingMemory
+
+        mongo_client = AsyncMongoClient(settings.mongo.uri)
+        db = mongo_client[settings.mongo.database]
+
+        store = MongoStore(mongo_client, database=settings.mongo.database)
+        search = MongoHybridSearch(
+            db["revisions"],
+            db["items"],
+        )
+        wm_cfg = settings.working_memory
+        wm = MongoWorkingMemory(
+            db["working_memory"],
+            session_ttl_seconds=wm_cfg.session_ttl_seconds,
+            max_messages=wm_cfg.max_messages,
+        )
+        ef = MongoEventFeed(db["events"])
+
+        instance = cls(
+            store,
+            search,
+            working_memory=wm,
+            event_feed=ef,
+        )
+        instance._mongo_client = mongo_client  # type: ignore[attr-defined]
+        return instance
+
+    @classmethod
+    def from_client(
+        cls,
+        client: AsyncMongoClient,
+        database: str = "memex",
+        settings: MemexSettings | None = None,
+    ) -> Memex:
+        """Build a Memex from an existing pymongo AsyncMongoClient.
+
+        Useful when the host application already has a MongoDB client
+        and wants to share the connection pool.
+
+        Args:
+            client: Existing async MongoDB client.
+            database: Database name for memex collections.
+            settings: Optional settings (uses defaults if None).
+
+        Returns:
+            Memex instance. Caller owns the client lifecycle.
+        """
+        from memex.retrieval.mongo_hybrid import MongoHybridSearch
+        from memex.stores.mongo_event_feed import MongoEventFeed
+        from memex.stores.mongo_store import MongoStore
+        from memex.stores.mongo_working_memory import MongoWorkingMemory
+
+        cfg = settings or MemexSettings(backend="mongo")
+        db = client[database]
+
+        store = MongoStore(client, database=database)
+        search = MongoHybridSearch(db["revisions"], db["items"])
+        wm_cfg = cfg.working_memory
+        wm = MongoWorkingMemory(
+            db["working_memory"],
+            session_ttl_seconds=wm_cfg.session_ttl_seconds,
+            max_messages=wm_cfg.max_messages,
+        )
+        ef = MongoEventFeed(db["events"])
+
+        return cls(store, search, working_memory=wm, event_feed=ef)
 
     @classmethod
     def from_env(cls) -> Memex:
@@ -224,7 +329,7 @@ class Memex:
         )
 
     async def close(self) -> None:
-        """Release owned driver and Redis connections.
+        """Release owned driver and Redis/MongoDB connections.
 
         Safe to call multiple times.  Only closes connections that
         were created by ``from_settings`` or ``from_env``.
@@ -235,6 +340,10 @@ class Memex:
         if self._driver is not None:
             await self._driver.close()
             self._driver = None
+        mongo_client = getattr(self, "_mongo_client", None)
+        if mongo_client is not None:
+            mongo_client.close()
+            self._mongo_client = None  # type: ignore[attr-defined]
 
     # -- Async context manager ----------------------------------------------
 

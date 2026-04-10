@@ -122,23 +122,19 @@ def _to_revision_summaries(
     Returns:
         List of revision summaries for LLM assessment.
     """
-    summaries: list[RevisionSummary] = []
-    for collected in revisions.values():
-        rev = collected.revision
-        kind = item_kinds.get(rev.item_id, "unknown")
-        summaries.append(
-            RevisionSummary(
-                revision_id=rev.id,
-                item_id=rev.item_id,
-                item_kind=kind,
-                content=rev.content,
-                summary=rev.summary,
-                topics=list(rev.topics) if rev.topics else None,
-                keywords=list(rev.keywords) if rev.keywords else None,
-                bundle_item_ids=collected.bundle_item_ids,
-            )
+    return [
+        RevisionSummary(
+            revision_id=c.revision.id,
+            item_id=c.revision.item_id,
+            item_kind=item_kinds.get(c.revision.item_id, "unknown"),
+            content=c.revision.content,
+            summary=c.revision.summary,
+            topics=(list(c.revision.topics) if c.revision.topics else None),
+            keywords=(list(c.revision.keywords) if c.revision.keywords else None),
+            bundle_item_ids=c.bundle_item_ids,
         )
-    return summaries
+        for c in revisions.values()
+    ]
 
 
 async def _resolve_item_kinds(

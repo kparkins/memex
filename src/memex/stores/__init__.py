@@ -51,6 +51,6 @@ __all__ = [
     "TemporalResolver",
     "WorkingMemoryMessage",
     "build_session_id",
-    "MAX_TRAVERSAL_DEPTH",
     "ensure_schema",
+    "MAX_TRAVERSAL_DEPTH",
 ]

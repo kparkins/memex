@@ -28,12 +28,7 @@ from memex.stores.neo4j_schema import NodeLabel, RelType
 
 _FULLTEXT_INDEX_NAME = "revision_search_text"
 _VECTOR_INDEX_NAME = "revision_embedding"
-
-_RETURN_CLAUSE = (
-    "RETURN r, r.id AS rev_id, score AS raw_score, "
-    "{source} AS source, i.id AS item_id, i.kind AS item_kind "
-    "ORDER BY score DESC LIMIT $lim"
-)
+_DEPRECATED_OVERFETCH_FACTOR = 2
 
 
 def compute_fused_score(
@@ -156,7 +151,7 @@ class HybridSearch:
             build_search_query(request.query) if request.query.strip() else ""
         )
         has_lexical = bool(search_query)
-        has_vector = bool(request.query_embedding and len(request.query_embedding) > 0)
+        has_vector = bool(request.query_embedding)
 
         if not has_lexical and not has_vector:
             return []
@@ -170,16 +165,17 @@ class HybridSearch:
 
         dep_filter = "" if request.include_deprecated else "WHERE i.deprecated = false "
         vec_top_k = (
-            request.limit * 2 if not request.include_deprecated else request.limit
+            request.limit
+            if request.include_deprecated
+            else request.limit * _DEPRECATED_OVERFETCH_FACTOR
         )
 
-        cypher, params = self._resolve_query(
+        cypher, params = self._build_query(
             search_mode,
             dep_filter,
             search_query,
-            request.query_embedding,
+            request,
             vec_top_k,
-            request.limit,
         )
 
         candidates = await self._execute_and_collect(
@@ -195,14 +191,13 @@ class HybridSearch:
             request.memory_limit,
         )
 
-    def _resolve_query(
-        self,
+    @staticmethod
+    def _build_query(
         mode: SearchMode,
         dep_filter: str,
         search_query: str,
-        query_embedding: list[float] | None,
+        request: SearchRequest,
         vec_top_k: int,
-        limit: int,
     ) -> tuple[str, dict[str, Any]]:
         """Select the Cypher query and parameters for the given mode.
 
@@ -210,9 +205,8 @@ class HybridSearch:
             mode: Active search mode.
             dep_filter: Deprecated-item WHERE clause.
             search_query: Sanitized fulltext query.
-            query_embedding: Embedding vector (may be ``None``).
+            request: Search parameters (embedding, limit).
             vec_top_k: Over-fetch count for vector branch.
-            limit: Per-branch candidate limit.
 
         Returns:
             Tuple of (cypher_string, parameter_dict).
@@ -223,19 +217,19 @@ class HybridSearch:
             )
             return cypher, {
                 "q": search_query,
-                "embedding": query_embedding,
+                "embedding": request.query_embedding,
                 "top_k": vec_top_k,
-                "lim": limit,
+                "lim": request.limit,
             }
         if mode == SearchMode.LEXICAL:
             return _lexical_branch(dep_filter), {
                 "q": search_query,
-                "lim": limit,
+                "lim": request.limit,
             }
         return _vector_branch(dep_filter), {
-            "embedding": query_embedding,
+            "embedding": request.query_embedding,
             "top_k": vec_top_k,
-            "lim": limit,
+            "lim": request.limit,
         }
 
     async def _execute_and_collect(

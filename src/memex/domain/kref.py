@@ -23,6 +23,9 @@ _SEGMENT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 
 _SCHEME = "kref://"
 
+# project/space/item.kind requires at least 3 path segments.
+_MIN_PATH_SEGMENTS = 3
+
 
 class Kref(BaseModel, frozen=True):
     """Immutable, hashable kref:// URI for addressing graph objects.
@@ -87,7 +90,7 @@ class Kref(BaseModel, frozen=True):
         path_part, query_part = _split_query(remainder)
 
         segments = path_part.split("/")
-        if len(segments) < 3:
+        if len(segments) < _MIN_PATH_SEGMENTS:
             raise ValueError(
                 "kref URI requires at least project/space/item.kind, "
                 f"got {len(segments)} segment(s): {uri!r}"
@@ -162,10 +165,7 @@ def _require_segment(label: str, value: str) -> None:
 
 def _split_query(remainder: str) -> tuple[str, str]:
     """Split ``path?query`` into ``(path, query)``."""
-    if "?" in remainder:
-        path, query = remainder.split("?", 1)
-    else:
-        path, query = remainder, ""
+    path, _, query = remainder.partition("?")
     return path, query
 
 
@@ -214,9 +214,11 @@ def _parse_query(query: str) -> tuple[int | None, str | None]:
 
 def _build_query(revision: int | None, artifact: str | None) -> str:
     """Build a canonical query string from optional revision and artifact."""
-    parts: list[str] = []
-    if revision is not None:
-        parts.append(f"r={revision}")
-    if artifact is not None:
-        parts.append(f"a={artifact}")
-    return "&".join(parts)
+    return "&".join(
+        part
+        for part in (
+            f"r={revision}" if revision is not None else None,
+            f"a={artifact}" if artifact is not None else None,
+        )
+        if part is not None
+    )

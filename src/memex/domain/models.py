@@ -12,12 +12,11 @@ Models:
 
 from __future__ import annotations
 
-from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from memex.domain.utils import new_id, utcnow
+from memex.domain.utils import UtcDatetime, new_id, utcnow
 
 
 class ItemKind(StrEnum):
@@ -58,7 +57,7 @@ class Project(BaseModel):
 
     id: str = Field(default_factory=new_id)
     name: str
-    created_at: datetime = Field(default_factory=utcnow)
+    created_at: UtcDatetime = Field(default_factory=utcnow)
     metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
@@ -77,7 +76,7 @@ class Space(BaseModel):
     project_id: str
     name: str
     parent_space_id: str | None = None
-    created_at: datetime = Field(default_factory=utcnow)
+    created_at: UtcDatetime = Field(default_factory=utcnow)
 
 
 class Item(BaseModel):
@@ -101,8 +100,8 @@ class Item(BaseModel):
     name: str
     kind: ItemKind
     deprecated: bool = False
-    deprecated_at: datetime | None = None
-    created_at: datetime = Field(default_factory=utcnow)
+    deprecated_at: UtcDatetime | None = None
+    created_at: UtcDatetime = Field(default_factory=utcnow)
 
 
 class Revision(BaseModel, frozen=True):
@@ -135,7 +134,7 @@ class Revision(BaseModel, frozen=True):
     content: str
     search_text: str
     embedding: tuple[float, ...] | None = None
-    created_at: datetime = Field(default_factory=utcnow)
+    created_at: UtcDatetime = Field(default_factory=utcnow)
 
     # FR-8 enrichment metadata (populated asynchronously after creation)
     summary: str | None = None
@@ -167,8 +166,8 @@ class Tag(BaseModel):
     item_id: str
     name: str
     revision_id: str
-    created_at: datetime = Field(default_factory=utcnow)
-    updated_at: datetime = Field(default_factory=utcnow)
+    created_at: UtcDatetime = Field(default_factory=utcnow)
+    updated_at: UtcDatetime = Field(default_factory=utcnow)
 
 
 class Artifact(BaseModel):
@@ -195,4 +194,4 @@ class Artifact(BaseModel):
     media_type: str | None = None
     size_bytes: int | None = Field(default=None, ge=0)
     metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=utcnow)
+    created_at: UtcDatetime = Field(default_factory=utcnow)

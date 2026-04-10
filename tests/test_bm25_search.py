@@ -281,9 +281,7 @@ class TestBM25Search:
     ) -> None:
         """Query with no matching terms returns empty list."""
         searcher: BM25Search = search_env["searcher"]
-        results = await searcher.search(
-            SearchRequest(query="quantum superconductor")
-        )
+        results = await searcher.search(SearchRequest(query="quantum superconductor"))
         assert results == []
 
     async def test_empty_query_returns_empty(self, search_env: dict[str, Any]) -> None:
@@ -331,9 +329,7 @@ class TestQuerySanitizationIntegration:
     async def test_special_chars_safe(self, search_env: dict[str, Any]) -> None:
         """Query with various special characters executes without error."""
         searcher: BM25Search = search_env["searcher"]
-        results = await searcher.search(
-            SearchRequest(query='hello + (world) "test"')
-        )
+        results = await searcher.search(SearchRequest(query='hello + (world) "test"'))
         assert isinstance(results, list)
 
     async def test_lucene_injection_safe(self, search_env: dict[str, Any]) -> None:

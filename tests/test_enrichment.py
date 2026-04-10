@@ -501,7 +501,7 @@ class TestEnrichRevision:
 
         # Verify embed was called with the override text
         call_args = mock_gen.call_args
-        assert call_args.args[1] == "custom embedding text"
+        assert call_args.args[0] == "custom embedding text"
 
     async def test_embedding_uses_search_text_without_override(
         self, enrichment_env: dict[str, Any]
@@ -527,7 +527,7 @@ class TestEnrichRevision:
 
         # Verify embed was called with enriched search text
         call_args = mock_gen.call_args
-        embed_input = call_args.args[1]
+        embed_input = call_args.args[0]
         assert "quick brown fox" in embed_input
         assert "testing" in embed_input  # from default mock topics
 

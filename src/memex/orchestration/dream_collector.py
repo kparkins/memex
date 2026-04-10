@@ -158,6 +158,15 @@ class DreamStateCollector:
         return result
 
 
+_REVISION_ID_KEYS: dict[ConsolidationEventType, tuple[str, ...]] = {
+    ConsolidationEventType.REVISION_CREATED: ("revision_id",),
+    ConsolidationEventType.EDGE_CREATED: (
+        "source_revision_id",
+        "target_revision_id",
+    ),
+}
+
+
 def _extract_revision_ids(
     events: list[ConsolidationEvent],
 ) -> set[str]:
@@ -171,9 +180,7 @@ def _extract_revision_ids(
     """
     ids: set[str] = set()
     for event in events:
-        if event.event_type == ConsolidationEventType.REVISION_CREATED:
-            ids.add(event.data["revision_id"])
-        elif event.event_type == ConsolidationEventType.EDGE_CREATED:
-            ids.add(event.data["source_revision_id"])
-            ids.add(event.data["target_revision_id"])
+        keys = _REVISION_ID_KEYS.get(event.event_type, ())
+        for key in keys:
+            ids.add(event.data[key])
     return ids

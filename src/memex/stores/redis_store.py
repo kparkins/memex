@@ -90,14 +90,29 @@ class RedisWorkingMemory:
     """
 
     _KEY_PREFIX = "memex:wm"
+    _DEFAULT_TTL_SECONDS = 3600
+    _DEFAULT_MAX_MESSAGES = 50
 
     def __init__(
         self,
         client: aioredis.Redis,
         settings: RedisSettings | None = None,
+        *,
+        session_ttl_seconds: int | None = None,
+        max_messages: int | None = None,
     ) -> None:
         self._client = client
         self._settings = settings or RedisSettings()
+        self._session_ttl = (
+            session_ttl_seconds
+            if session_ttl_seconds is not None
+            else self._DEFAULT_TTL_SECONDS
+        )
+        self._max_messages = (
+            max_messages
+            if max_messages is not None
+            else self._DEFAULT_MAX_MESSAGES
+        )
 
     def _key(self, project_id: str, session_id: str) -> str:
         """Build the Redis key for a session buffer.
@@ -138,8 +153,8 @@ class RedisWorkingMemory:
 
         async with self._client.pipeline(transaction=True) as pipe:
             pipe.rpush(key, payload)
-            pipe.ltrim(key, -self._settings.max_messages, -1)
-            pipe.expire(key, self._settings.session_ttl_seconds)
+            pipe.ltrim(key, -self._max_messages, -1)
+            pipe.expire(key, self._session_ttl)
             await pipe.execute()
 
         return msg

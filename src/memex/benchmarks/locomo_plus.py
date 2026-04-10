@@ -153,10 +153,9 @@ class LoCoMoPlusHarness(BenchmarkHarness):
             msg = "LoCoMo-Plus data must be a JSON array of case objects"
             raise ValueError(msg)
 
-        cases: list[BenchmarkCase] = []
-        for entry in raw:
-            plus_case = LoCoMoPlusCase.model_validate(entry)
-            cases.append(plus_case.to_benchmark_case())
+        cases = [
+            LoCoMoPlusCase.model_validate(entry).to_benchmark_case() for entry in raw
+        ]
 
         logger.info(
             "Loaded %d LoCoMo-Plus cases from %s",

@@ -173,6 +173,42 @@ class ReviseResult(BaseModel):
     item_id: str
 
 
+def _sanitize_text_pair(
+    content: str,
+    search_text: str | None,
+    privacy: PrivacySettings,
+) -> tuple[str, str]:
+    """Sanitize content and optional search_text through privacy hooks.
+
+    Args:
+        content: Raw content text.
+        search_text: Optional override search text; falls back to
+            sanitized content when ``None``.
+        privacy: Privacy hook settings.
+
+    Returns:
+        Tuple of (sanitized_content, sanitized_search_text).
+
+    Raises:
+        CredentialViolationError: If credential patterns are detected
+            and rejection is enabled.
+    """
+    sanitized_content = apply_privacy_hooks(
+        content,
+        redact_pii_enabled=privacy.pii_redaction_enabled,
+        reject_credentials_enabled=privacy.credential_rejection_enabled,
+    )
+    if search_text is not None:
+        sanitized_search = apply_privacy_hooks(
+            search_text,
+            redact_pii_enabled=privacy.pii_redaction_enabled,
+            reject_credentials_enabled=privacy.credential_rejection_enabled,
+        )
+    else:
+        sanitized_search = sanitized_content
+    return sanitized_content, sanitized_search
+
+
 class IngestService:
     """Orchestrates atomic memory ingest with injected dependencies.
 
@@ -224,19 +260,10 @@ class IngestService:
         privacy = privacy or PrivacySettings()
         retrieval = retrieval or RetrievalSettings()
 
-        sanitized_content = apply_privacy_hooks(
+        sanitized_content, sanitized_search = _sanitize_text_pair(
             params.content,
-            redact_pii_enabled=privacy.pii_redaction_enabled,
-            reject_credentials_enabled=privacy.credential_rejection_enabled,
-        )
-        sanitized_search = (
-            apply_privacy_hooks(
-                params.search_text,
-                redact_pii_enabled=privacy.pii_redaction_enabled,
-                reject_credentials_enabled=privacy.credential_rejection_enabled,
-            )
-            if params.search_text is not None
-            else sanitized_content
+            params.search_text,
+            privacy,
         )
 
         space = await self._store.resolve_space(
@@ -377,19 +404,10 @@ class IngestService:
         """
         privacy = privacy or PrivacySettings()
 
-        sanitized_content = apply_privacy_hooks(
+        sanitized_content, sanitized_search = _sanitize_text_pair(
             params.content,
-            redact_pii_enabled=privacy.pii_redaction_enabled,
-            reject_credentials_enabled=privacy.credential_rejection_enabled,
-        )
-        sanitized_search = (
-            apply_privacy_hooks(
-                params.search_text,
-                redact_pii_enabled=privacy.pii_redaction_enabled,
-                reject_credentials_enabled=privacy.credential_rejection_enabled,
-            )
-            if params.search_text is not None
-            else sanitized_content
+            params.search_text,
+            privacy,
         )
 
         revisions = await self._store.get_revisions_for_item(params.item_id)

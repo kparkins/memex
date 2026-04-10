@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import orjson
 import pytest
 
-from memex.domain import Item, ItemKind, Revision, Space, Tag
+from memex.domain import Item, ItemKind, Project, Revision, Space, Tag
 from memex.mcp.tools import (
     GetAuditReportInput,
     GetRevisionsInput,
@@ -43,9 +43,7 @@ async def env(neo4j_driver, redis_client):
     await redis_client.flushdb()
 
     store = Neo4jStore(neo4j_driver)
-    project = await store.create_project(
-        __import__("memex.domain", fromlist=["Project"]).Project(name="test-operator")
-    )
+    project = await store.create_project(Project(name="test-operator"))
     space = await store.create_space(Space(project_id=project.id, name="ops"))
 
     search = HybridSearch(neo4j_driver)

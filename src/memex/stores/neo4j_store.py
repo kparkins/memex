@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
+from memex.domain.utils import format_utc
 from memex.stores.neo4j_schema import NodeLabel, RelType
 from memex.stores.protocols import EnrichmentUpdate, StorePersistenceError
 
@@ -57,6 +58,40 @@ _EDGE_PROPS_EXCLUDE: set[str] = {
 
 _ROOT_SENTINEL = "__ROOT__"
 MAX_TRAVERSAL_DEPTH = 20
+
+
+def _edge_from_record(rec: Any) -> Edge:
+    """Build an Edge domain model from a Cypher result record.
+
+    Expects keys: ``src_id``, ``tgt_id``, ``rel_type``, ``props``.
+
+    Args:
+        rec: A Neo4j Record with edge projection columns.
+
+    Returns:
+        Hydrated Edge domain model.
+    """
+    return Edge.model_validate(
+        dict(rec["props"])
+        | {
+            "source_revision_id": str(rec["src_id"]),
+            "target_revision_id": str(rec["tgt_id"]),
+            "edge_type": str(rec["rel_type"]).lower(),
+        }
+    )
+
+
+def _validate_traversal_depth(depth: int) -> None:
+    """Raise ValueError if depth is outside the 1..MAX_TRAVERSAL_DEPTH range.
+
+    Args:
+        depth: Requested traversal depth.
+
+    Raises:
+        ValueError: If depth is out of range.
+    """
+    if not 1 <= depth <= MAX_TRAVERSAL_DEPTH:
+        raise ValueError(f"depth must be 1-{MAX_TRAVERSAL_DEPTH}, got {depth}")
 
 
 # -- Transaction helper ---------------------------------------------------
@@ -173,7 +208,7 @@ async def _move_tag_pointer(
         f"SET t.revision_id = $rid, t.updated_at = $ts",
         tid=tag_id,
         rid=new_revision_id,
-        ts=timestamp.isoformat(),
+        ts=format_utc(timestamp),
     )
     ta = TagAssignment(
         tag_id=tag_id,
@@ -405,7 +440,7 @@ class Neo4jStore:
         async def _work(tx: AsyncManagedTransaction) -> Space:
             on_create_props: dict[str, object] = {
                 "id": new_space.id,
-                "created_at": new_space.created_at.isoformat(),
+                "created_at": format_utc(new_space.created_at),
             }
             if parent_space_id is not None:
                 on_create_props["parent_space_id"] = parent_space_id
@@ -872,10 +907,11 @@ class Neo4jStore:
         Returns:
             Item if found, None otherwise.
         """
-        deprecated_filter = "" if include_deprecated else " AND i.deprecated = false"
+        where = "" if include_deprecated else " WHERE i.deprecated = false"
         query = (
-            f"MATCH (i:{NodeLabel.ITEM} {{space_id: $sid, name: $name, "
-            f"kind: $kind}}) WHERE true{deprecated_filter} RETURN i LIMIT 1"
+            f"MATCH (i:{NodeLabel.ITEM} {{space_id: $sid, "
+            f"name: $name, kind: $kind}}){where} "
+            f"RETURN i LIMIT 1"
         )
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, sid=space_id, name=name, kind=kind)
@@ -1026,7 +1062,7 @@ class Neo4jStore:
             f"RETURN r ORDER BY r.created_at DESC LIMIT 1"
         )
         async with self._driver.session(database=self._database) as session:
-            result = await session.run(query, iid=item_id, ts=timestamp.isoformat())
+            result = await session.run(query, iid=item_id, ts=format_utc(timestamp))
             rec = await result.single()
             return Revision.model_validate(dict(rec["r"])) if rec else None
 
@@ -1057,7 +1093,7 @@ class Neo4jStore:
             f"RETURN r"
         )
         async with self._driver.session(database=self._database) as session:
-            result = await session.run(query, tid=tag_id, ts=timestamp.isoformat())
+            result = await session.run(query, tid=tag_id, ts=format_utc(timestamp))
             rec = await result.single()
             return Revision.model_validate(dict(rec["r"])) if rec else None
 
@@ -1224,7 +1260,7 @@ class Neo4jStore:
                 f"SET i.deprecated = true, "
                 f"i.deprecated_at = $ts RETURN i",
                 iid=item_id,
-                ts=now.isoformat(),
+                ts=format_utc(now),
             )
             rec = await result.single()
             if rec is None:
@@ -1286,10 +1322,10 @@ class Neo4jStore:
         Returns:
             List of Items ordered by created_at.
         """
-        deprecation_filter = "" if include_deprecated else " WHERE i.deprecated = false"
+        where = "" if include_deprecated else " WHERE i.deprecated = false"
         query = (
             f"MATCH (i:{NodeLabel.ITEM} {{space_id: $sid}})"
-            f"{deprecation_filter} "
+            f"{where} "
             f"RETURN i ORDER BY i.created_at"
         )
         async with self._driver.session(database=self._database) as session:
@@ -1420,14 +1456,7 @@ class Neo4jStore:
             rec = await result.single()
             if rec is None:
                 return None
-            return Edge.model_validate(
-                dict(rec["props"])
-                | {
-                    "source_revision_id": str(rec["src_id"]),
-                    "target_revision_id": str(rec["tgt_id"]),
-                    "edge_type": str(rec["rel_type"]).lower(),
-                }
-            )
+            return _edge_from_record(rec)
 
     async def get_edges(
         self,
@@ -1499,17 +1528,7 @@ class Neo4jStore:
 
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, **params)
-            return [
-                Edge.model_validate(
-                    dict(rec["props"])
-                    | {
-                        "source_revision_id": str(rec["src_id"]),
-                        "target_revision_id": str(rec["tgt_id"]),
-                        "edge_type": str(rec["rel_type"]).lower(),
-                    }
-                )
-                async for rec in result
-            ]
+            return [_edge_from_record(rec) async for rec in result]
 
     async def get_bundle_memberships(self, item_id: str) -> list[str]:
         """Return bundle item IDs that the given item belongs to.
@@ -1599,18 +1618,12 @@ class Neo4jStore:
             f"type(r) AS rel_type, properties(r) AS props"
         )
         async with self._driver.session(database=self._database) as session:
-            result = await session.run(query, rid=revision_id, types=_DOMAIN_REL_TYPES)
-            return [
-                Edge.model_validate(
-                    dict(rec["props"])
-                    | {
-                        "source_revision_id": str(rec["src_id"]),
-                        "target_revision_id": str(rec["tgt_id"]),
-                        "edge_type": str(rec["rel_type"]).lower(),
-                    }
-                )
-                async for rec in result
-            ]
+            result = await session.run(
+                query,
+                rid=revision_id,
+                types=_DOMAIN_REL_TYPES,
+            )
+            return [_edge_from_record(rec) async for rec in result]
 
     async def get_dependencies(
         self,
@@ -1632,13 +1645,13 @@ class Neo4jStore:
             ordered by created_at.
 
         Raises:
-            ValueError: If depth is outside the 1-20 range.
+            ValueError: If depth is outside the valid range.
         """
-        if not 1 <= depth <= MAX_TRAVERSAL_DEPTH:
-            raise ValueError(f"depth must be 1-20, got {depth}")
+        _validate_traversal_depth(depth)
         query = (
             f"MATCH (:{NodeLabel.REVISION} {{id: $rid}})"
-            f"-[:{RelType.DEPENDS_ON}|{RelType.DERIVED_FROM}*1..{depth}]->"
+            f"-[:{RelType.DEPENDS_ON}|{RelType.DERIVED_FROM}"
+            f"*1..{depth}]->"
             f"(dep:{NodeLabel.REVISION}) "
             f"RETURN DISTINCT dep ORDER BY dep.created_at"
         )
@@ -1668,13 +1681,13 @@ class Neo4jStore:
             created_at.
 
         Raises:
-            ValueError: If depth is outside the 1-20 range.
+            ValueError: If depth is outside the valid range.
         """
-        if not 1 <= depth <= MAX_TRAVERSAL_DEPTH:
-            raise ValueError(f"depth must be 1-20, got {depth}")
+        _validate_traversal_depth(depth)
         query = (
             f"MATCH (impacted:{NodeLabel.REVISION})"
-            f"-[:{RelType.DEPENDS_ON}|{RelType.DERIVED_FROM}*1..{depth}]->"
+            f"-[:{RelType.DEPENDS_ON}|{RelType.DERIVED_FROM}"
+            f"*1..{depth}]->"
             f"(:{NodeLabel.REVISION} {{id: $rid}}) "
             f"RETURN DISTINCT impacted ORDER BY impacted.created_at"
         )

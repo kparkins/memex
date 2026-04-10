@@ -70,18 +70,21 @@ def _build_enriched_search_text(
         Combined search text for fulltext indexing.
     """
     parts = [original]
-    if enrichment.summary:
-        parts.append(enrichment.summary)
-    if enrichment.topics:
-        parts.append(" ".join(enrichment.topics))
-    if enrichment.keywords:
-        parts.append(" ".join(enrichment.keywords))
-    if enrichment.facts:
-        parts.extend(enrichment.facts)
-    if enrichment.events:
-        parts.extend(enrichment.events)
-    if enrichment.implications:
-        parts.extend(enrichment.implications)
+    # Join space-separated fields, extend sequence fields
+    for joined in (
+        enrichment.summary,
+        " ".join(enrichment.topics) if enrichment.topics else None,
+        " ".join(enrichment.keywords) if enrichment.keywords else None,
+    ):
+        if joined:
+            parts.append(joined)
+    for sequence in (
+        enrichment.facts,
+        enrichment.events,
+        enrichment.implications,
+    ):
+        if sequence:
+            parts.extend(sequence)
     return " ".join(parts)
 
 

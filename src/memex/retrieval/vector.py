@@ -16,6 +16,7 @@ from memex.retrieval.models import SearchRequest, VectorResult
 from memex.stores.neo4j_schema import NodeLabel, RelType
 
 _VECTOR_INDEX_NAME = "revision_embedding"
+_DEPRECATED_OVERFETCH_FACTOR = 2
 
 _DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 _DEFAULT_EMBED_DIMS = 1536
@@ -83,9 +84,7 @@ class VectorSearch:
         if not request.query_embedding:
             return []
 
-        dep_filter = (
-            "" if request.include_deprecated else "WHERE i.deprecated = false "
-        )
+        dep_filter = "" if request.include_deprecated else "WHERE i.deprecated = false "
 
         cypher = (
             f"CALL db.index.vector.queryNodes("
@@ -98,7 +97,9 @@ class VectorSearch:
         )
 
         top_k = (
-            request.limit * 2 if not request.include_deprecated else request.limit
+            request.limit
+            if request.include_deprecated
+            else request.limit * _DEPRECATED_OVERFETCH_FACTOR
         )
 
         async with self._driver.session(database=self._database) as session:

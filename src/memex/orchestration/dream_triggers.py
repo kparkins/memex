@@ -134,6 +134,8 @@ class _BackgroundTrigger(DreamStateTrigger, ABC):
         settings: Dream State configuration.
     """
 
+    _task: asyncio.Task[None] | None
+
     def __init__(
         self,
         pipeline: DreamStatePipeline,
@@ -141,7 +143,7 @@ class _BackgroundTrigger(DreamStateTrigger, ABC):
         settings: DreamStateSettings | None = None,
     ) -> None:
         super().__init__(pipeline, settings=settings)
-        self._task: asyncio.Task[None] | None = None
+        self._task = None
 
     async def start(self, project_id: str) -> None:
         """Start the background monitoring loop.
@@ -212,16 +214,15 @@ class ScheduledTrigger(_BackgroundTrigger):
             return
 
 
-class IdleTrigger(_BackgroundTrigger):
-    """Fires when pending events exist but the queue is inactive.
+class _EventFeedTrigger(_BackgroundTrigger, ABC):
+    """Base for triggers that poll an event feed with a cursor.
 
-    Polls the event feed at ``poll_interval_seconds``.  When events
-    are pending (since cursor) and the most recent event timestamp is
-    older than ``idle_timeout_seconds``, the pipeline fires.
+    Provides shared constructor for ``IdleTrigger`` and
+    ``ThresholdTrigger`` which both need an event feed and cursor.
 
     Args:
         pipeline: Dream State pipeline to invoke.
-        event_feed: Consolidation event feed for checking events.
+        event_feed: Consolidation event feed for polling.
         cursor: Dream State cursor for reading position.
         settings: Dream State configuration.
     """
@@ -237,6 +238,21 @@ class IdleTrigger(_BackgroundTrigger):
         super().__init__(pipeline, settings=settings)
         self._event_feed = event_feed
         self._cursor = cursor
+
+
+class IdleTrigger(_EventFeedTrigger):
+    """Fires when pending events exist but the queue is inactive.
+
+    Polls the event feed at ``poll_interval_seconds``.  When events
+    are pending (since cursor) and the most recent event timestamp is
+    older than ``idle_timeout_seconds``, the pipeline fires.
+
+    Args:
+        pipeline: Dream State pipeline to invoke.
+        event_feed: Consolidation event feed for checking events.
+        cursor: Dream State cursor for reading position.
+        settings: Dream State configuration.
+    """
 
     async def _loop(self, project_id: str) -> None:
         """Poll for pending events and fire after idle timeout.
@@ -274,7 +290,7 @@ class IdleTrigger(_BackgroundTrigger):
             return
 
 
-class ThresholdTrigger(_BackgroundTrigger):
+class ThresholdTrigger(_EventFeedTrigger):
     """Fires when pending event count reaches the configured threshold.
 
     Polls the event feed at ``poll_interval_seconds``.  When the number
@@ -287,18 +303,6 @@ class ThresholdTrigger(_BackgroundTrigger):
         cursor: Dream State cursor for reading position.
         settings: Dream State configuration.
     """
-
-    def __init__(
-        self,
-        pipeline: DreamStatePipeline,
-        event_feed: ConsolidationEventFeed,
-        cursor: DreamStateCursor,
-        *,
-        settings: DreamStateSettings | None = None,
-    ) -> None:
-        super().__init__(pipeline, settings=settings)
-        self._event_feed = event_feed
-        self._cursor = cursor
 
     async def _loop(self, project_id: str) -> None:
         """Poll event count and fire when threshold reached.

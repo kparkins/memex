@@ -10,7 +10,7 @@ import logging
 from enum import StrEnum
 
 import orjson
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from memex.domain.edges import EdgeType
 from memex.llm.client import LiteLLMClient, LLMClient
@@ -136,6 +136,13 @@ Respond ONLY with a JSON array of action objects. Each must have \
 "action_type" and "reason".
 Return an empty array [] if no actions are needed."""
 
+_CONTEXT_OPTIONAL_FIELDS = (
+    "summary",
+    "topics",
+    "keywords",
+    "bundle_item_ids",
+)
+
 
 def _build_context(revisions: list[RevisionSummary]) -> str:
     """Format revision summaries as JSON for LLM prompt context.
@@ -154,14 +161,10 @@ def _build_context(revisions: list[RevisionSummary]) -> str:
             "kind": rev.item_kind,
             "content": rev.content,
         }
-        if rev.summary:
-            entry["summary"] = rev.summary
-        if rev.topics:
-            entry["topics"] = rev.topics
-        if rev.keywords:
-            entry["keywords"] = rev.keywords
-        if rev.bundle_item_ids:
-            entry["bundle_item_ids"] = rev.bundle_item_ids
+        for field in _CONTEXT_OPTIONAL_FIELDS:
+            value = getattr(rev, field)
+            if value:
+                entry[field] = value
         entries.append(entry)
     return orjson.dumps(entries, option=orjson.OPT_INDENT_2).decode()
 
@@ -184,7 +187,7 @@ def _parse_actions(raw: str) -> list[DreamAction]:
     for item in data:
         try:
             actions.append(DreamAction.model_validate(item))
-        except Exception:
+        except ValidationError:
             logger.warning("Skipping invalid dream action: %s", item)
     return actions
 

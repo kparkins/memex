@@ -96,15 +96,7 @@ async def extract_enrichments(
         )
         cleaned = strip_markdown_fence(raw)
         data = orjson.loads(cleaned)
-        return EnrichmentOutput(
-            summary=data.get("summary", ""),
-            topics=tuple(data.get("topics", [])),
-            keywords=tuple(data.get("keywords", [])),
-            facts=tuple(data.get("facts", [])),
-            events=tuple(data.get("events", [])),
-            implications=tuple(data.get("implications", [])),
-            embedding_text_override=data.get("embedding_text_override"),
-        )
-    except Exception as e:
-        logger.error("Enrichment extraction failed: %s", e)
-        raise RuntimeError(f"Enrichment extraction failed: {e}") from e
+        return EnrichmentOutput.model_validate(data)
+    except Exception as exc:
+        logger.error("Enrichment extraction failed: %s", exc)
+        raise RuntimeError(f"Enrichment extraction failed: {exc}") from exc

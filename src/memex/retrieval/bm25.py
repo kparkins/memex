@@ -102,9 +102,7 @@ class BM25Search:
         if not search_query:
             return []
 
-        dep_filter = (
-            "" if request.include_deprecated else "WHERE i.deprecated = false "
-        )
+        dep_filter = "" if request.include_deprecated else "WHERE i.deprecated = false "
 
         cypher = (
             f"CALL db.index.fulltext.queryNodes("

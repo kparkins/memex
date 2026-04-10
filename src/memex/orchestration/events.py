@@ -112,8 +112,7 @@ async def publish_after_ingest(
     Returns:
         All published consolidation events.
     """
-    published: list[ConsolidationEvent] = []
-    published.append(await publish_revision_created(feed, project_id, revision))
+    published = [await publish_revision_created(feed, project_id, revision)]
     for edge in edges:
         published.append(await publish_edge_created(feed, project_id, edge))
     return published

@@ -56,7 +56,8 @@ class TestVectorSearchEmbed:
         ) as mock_embed:
             driver = AsyncMock()
             searcher = VectorSearch(
-                driver, embedding_client=LiteLLMEmbeddingClient(),
+                driver,
+                embedding_client=LiteLLMEmbeddingClient(),
             )
             result = await searcher.embed("test text")
 
@@ -100,7 +101,8 @@ class TestVectorSearchEmbed:
         ):
             driver = AsyncMock()
             searcher = VectorSearch(
-                driver, embedding_client=LiteLLMEmbeddingClient(),
+                driver,
+                embedding_client=LiteLLMEmbeddingClient(),
             )
             with pytest.raises(RuntimeError, match="Embedding generation failed"):
                 await searcher.embed("test")
@@ -177,7 +179,8 @@ async def vector_env(
     await asyncio.sleep(1)
 
     searcher = VectorSearch(
-        neo4j_driver, embedding_client=LiteLLMEmbeddingClient(),
+        neo4j_driver,
+        embedding_client=LiteLLMEmbeddingClient(),
     )
 
     yield {
@@ -279,7 +282,8 @@ class TestBetaCalibration:
         searcher: VectorSearch = vector_env["searcher"]
         results = await searcher.search(
             SearchRequest(
-                query_embedding=vector_env["query_embedding"], beta=0.5,
+                query_embedding=vector_env["query_embedding"],
+                beta=0.5,
             ),
         )
         for r in results:
@@ -292,7 +296,8 @@ class TestBetaCalibration:
         searcher: VectorSearch = vector_env["searcher"]
         results = await searcher.search(
             SearchRequest(
-                query_embedding=vector_env["query_embedding"], beta=1.0,
+                query_embedding=vector_env["query_embedding"],
+                beta=1.0,
             ),
         )
         for r in results:
