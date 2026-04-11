@@ -19,6 +19,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING
 
 from memex.config import MemexSettings
+from memex.domain.edges import Edge
 from memex.domain.models import Item, Space
 from memex.orchestration.ingest import (
     IngestParams,
@@ -28,7 +29,11 @@ from memex.orchestration.ingest import (
     ReviseResult,
 )
 from memex.orchestration.lookup import get_item_by_path
-from memex.retrieval.models import SearchRequest, SearchResult
+from memex.retrieval.models import (
+    SearchRequest,
+    SearchResult,
+    ScopedRecallResult,
+)
 from memex.retrieval.strategy import SearchStrategy
 from memex.stores.protocols import MemoryStore
 from memex.stores.redis_store import ConsolidationEventFeed, RedisWorkingMemory
@@ -292,7 +297,8 @@ class Memex:
         space_names: Sequence[str] | None = None,
         limit: int = 10,
         memory_limit: int = 3,
-    ) -> Sequence[SearchResult]:
+        include_edges: bool = False,
+    ) -> Sequence[SearchResult] | ScopedRecallResult:
         """Hybrid recall restricted to a whitelist of spaces within a project.
 
         Resolves each name in ``space_names`` to a top-level space id via
@@ -311,6 +317,13 @@ class Memex:
         silently widening to project scope, so a typo never leaks
         cross-space results.
 
+        When ``include_edges`` is ``True``, the method returns a
+        :class:`~memex.retrieval.models.ScopedRecallResult` containing
+        both the search results and any pre-existing typed edges
+        connecting revisions among the returned items. This enables
+        cross-Space traversal (e.g. detecting a SUPPORTS edge between
+        a ``kb`` Item and a ``nutrition`` Item).
+
         Args:
             query: Natural-language search string.
             project_id: Project whose spaces ``space_names`` refer to.
@@ -318,10 +331,15 @@ class Memex:
                 project. ``None`` disables scoping.
             limit: Maximum per-branch candidates.
             memory_limit: Maximum unique items in results.
+            include_edges: If ``True``, return a
+                ``ScopedRecallResult`` with edge metadata instead of
+                a plain ``Sequence[SearchResult]``.
 
         Returns:
-            Search results ordered by descending relevance, restricted
-            to the resolved spaces when ``space_names`` is provided.
+            When ``include_edges`` is ``False`` (default), returns a
+            ``Sequence[SearchResult]`` ordered by descending relevance.
+            When ``include_edges`` is ``True``, returns a
+            ``ScopedRecallResult`` with results and inter-item edges.
         """
         space_ids: tuple[str, ...] | None = None
         if space_names is not None:
@@ -331,16 +349,28 @@ class Memex:
                 if space is not None:
                     resolved.append(space.id)
             if not resolved:
-                return []
+                return [] if not include_edges else ScopedRecallResult(
+                    results=[],
+                    edges=[],
+                )
             space_ids = tuple(resolved)
 
-        return await self._search.search(
+        results = await self._search.search(
             SearchRequest(
                 query=query,
                 limit=limit,
                 memory_limit=memory_limit,
                 space_ids=space_ids,
             )
+        )
+
+        if not include_edges:
+            return results
+
+        edges = await self._collect_result_edges(results)
+        return ScopedRecallResult(
+            results=list(results),
+            edges=edges,
         )
 
     async def revise(self, params: ReviseParams) -> ReviseResult:
@@ -432,6 +462,50 @@ class Memex:
         if mongo_client is not None:
             mongo_client.close()
             self._mongo_client = None  # type: ignore[attr-defined]
+
+    # -- Private helpers ------------------------------------------------------
+
+    async def _collect_result_edges(
+        self,
+        results: Sequence[SearchResult],
+    ) -> list[Edge]:
+        """Find typed edges between revisions in the given results.
+
+        Collects all revision IDs from the search results and queries
+        the store for any edges whose source and target both appear
+        among those revisions. This enables cross-Space traversal by
+        surfacing pre-existing semantic connections (e.g. a SUPPORTS
+        edge) between recalled items.
+
+        Args:
+            results: Search results whose revision IDs to probe for
+                inter-connected edges.
+
+        Returns:
+            List of edges connecting any pair of revisions in the
+            results. Edges are deduplicated.
+        """
+        seen_item_ids: set[str] = set()
+        revision_ids: list[str] = []
+        for r in results:
+            if r.item_id not in seen_item_ids:
+                seen_item_ids.add(r.item_id)
+                revision_ids.append(r.revision.id)
+
+        if len(revision_ids) < 2:
+            return []
+
+        rev_id_set = set(revision_ids)
+        edges: list[Edge] = []
+        for rev_id in revision_ids:
+            rev_edges = await self._store.get_edges(
+                source_revision_id=rev_id,
+            )
+            for edge in rev_edges:
+                if edge.target_revision_id in rev_id_set:
+                    edges.append(edge)
+
+        return edges
 
     # -- Async context manager ----------------------------------------------
 

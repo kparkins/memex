@@ -8,7 +8,7 @@ import pytest
 
 from memex.client import Memex
 from memex.config import MemexSettings
-from memex.domain.edges import TagAssignment
+from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Item, ItemKind, Revision, Space
 from memex.orchestration.ingest import IngestParams, ReviseParams
 from memex.retrieval.models import (
@@ -16,6 +16,7 @@ from memex.retrieval.models import (
     MatchSource,
     SearchMode,
     SearchRequest,
+    ScopedRecallResult,
 )
 from memex.stores.protocols import MemoryStore
 
@@ -54,18 +55,35 @@ def _make_memex(
     )
 
 
-def _make_hybrid_result() -> HybridResult:
-    """Build a sample HybridResult for recall tests."""
+def _make_hybrid_result(
+    *,
+    item_id: str = "item-1",
+    revision_id: str | None = None,
+    item_kind: ItemKind = ItemKind.FACT,
+) -> HybridResult:
+    """Build a sample HybridResult for recall tests.
+
+    Args:
+        item_id: Owning item ID.
+        revision_id: Override revision ID (auto-generated if None).
+        item_kind: Item kind for the result.
+
+    Returns:
+        A HybridResult with the specified field values.
+    """
+    from uuid import uuid4
+
     return HybridResult(
         revision=Revision(
-            item_id="item-1",
+            id=revision_id or str(uuid4()),
+            item_id=item_id,
             revision_number=1,
             content="test content",
             search_text="test",
         ),
         score=0.9,
-        item_id="item-1",
-        item_kind=ItemKind.FACT,
+        item_id=item_id,
+        item_kind=item_kind,
         lexical_score=0.8,
         vector_score=0.7,
         match_source=MatchSource.REVISION,
@@ -288,6 +306,152 @@ class TestMemexRecallScoped:
         )
 
         assert len(list(results)) == 1
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_include_edges_returns_container(
+        self,
+    ) -> None:
+        """When ``include_edges=True``, return a ``ScopedRecallResult``.
+
+        The facade wraps search results in the container type so
+        callers receive both the scored results and any inter-item
+        edges in a single object.
+        """
+        store = _mock_store()
+        store.find_space.return_value = Space(
+            id="sp-alpha", project_id=PROJECT_ID, name="alpha"
+        )
+        store.get_edges.return_value = []
+        search = _mock_search()
+        search.search.return_value = [_make_hybrid_result()]
+        m = _make_memex(store=store, search=search)
+
+        result = await m.recall_scoped(
+            "q",
+            project_id=PROJECT_ID,
+            space_names=["alpha"],
+            include_edges=True,
+        )
+
+        assert isinstance(result, ScopedRecallResult)
+        assert len(result.results) == 1
+        assert result.edges == []
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_include_edges_with_supports_edge(
+        self,
+    ) -> None:
+        """Seeded SUPPORTS edge between items appears in edge metadata.
+
+        Acceptance test: a kb Item and a nutrition Item connected by
+        a SUPPORTS edge are both returned when edge traversal is
+        enabled, and the edge metadata is included.
+        """
+        from datetime import datetime, timezone
+
+        kb_space = Space(id="sp-kb", project_id=PROJECT_ID, name="kb")
+        nutr_space = Space(
+            id="sp-nutrition", project_id=PROJECT_ID, name="nutrition"
+        )
+        kb_result = _make_hybrid_result(
+            item_id="item-kb",
+            revision_id="rev-kb-1",
+            item_kind=ItemKind.FACT,
+        )
+        nutr_result = _make_hybrid_result(
+            item_id="item-nutrition",
+            revision_id="rev-nutr-1",
+            item_kind=ItemKind.FACT,
+        )
+        supports_edge = Edge(
+            source_revision_id="rev-kb-1",
+            target_revision_id="rev-nutr-1",
+            edge_type=EdgeType.SUPPORTS,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        store = _mock_store()
+        store.find_space.side_effect = [kb_space, nutr_space]
+        store.get_edges.side_effect = lambda source_revision_id=None, **kw: (
+            [supports_edge]
+            if source_revision_id == "rev-kb-1"
+            else []
+        )
+        search = _mock_search()
+        search.search.return_value = [kb_result, nutr_result]
+        m = _make_memex(store=store, search=search)
+
+        result = await m.recall_scoped(
+            "protein sources for muscle recovery",
+            project_id=PROJECT_ID,
+            space_names=["kb", "nutrition"],
+            include_edges=True,
+        )
+
+        assert isinstance(result, ScopedRecallResult)
+        assert len(result.results) == 2
+        assert len(result.edges) == 1
+        assert result.edges[0].edge_type == EdgeType.SUPPORTS
+        assert result.edges[0].source_revision_id == "rev-kb-1"
+        assert result.edges[0].target_revision_id == "rev-nutr-1"
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_include_edges_empty_no_results(
+        self,
+    ) -> None:
+        """No resolved spaces with ``include_edges=True`` returns empty container.
+
+        When every ``space_names`` fails to resolve and
+        ``include_edges`` is ``True``, return an empty
+        ``ScopedRecallResult`` rather than an empty list so callers
+        always receive the same type.
+        """
+        store = _mock_store()
+        store.find_space.return_value = None
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        result = await m.recall_scoped(
+            "q",
+            project_id=PROJECT_ID,
+            space_names=["ghost-space"],
+            include_edges=True,
+        )
+
+        assert isinstance(result, ScopedRecallResult)
+        assert result.results == []
+        assert result.edges == []
+        search.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_include_edges_skips_single_result(
+        self,
+    ) -> None:
+        """When only one item is returned, no edge lookup is performed.
+
+        Edges require at least two endpoints; requesting edges with
+        fewer than two unique items should skip the store query
+        entirely.
+        """
+        store = _mock_store()
+        store.find_space.return_value = Space(
+            id="sp-alpha", project_id=PROJECT_ID, name="alpha"
+        )
+        store.get_edges.return_value = []
+        search = _mock_search()
+        search.search.return_value = [_make_hybrid_result()]
+        m = _make_memex(store=store, search=search)
+
+        result = await m.recall_scoped(
+            "q",
+            project_id=PROJECT_ID,
+            space_names=["alpha"],
+            include_edges=True,
+        )
+
+        assert isinstance(result, ScopedRecallResult)
+        store.get_edges.assert_not_awaited()
+        assert result.edges == []
 
 
 class TestMemexRevise:

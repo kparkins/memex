@@ -10,6 +10,7 @@ import enum
 
 from pydantic import BaseModel, Field
 
+from memex.domain.edges import Edge
 from memex.domain.models import ItemKind, Revision
 
 
@@ -74,6 +75,25 @@ class SearchRequest(BaseModel, frozen=True):
         default_factory=lambda: dict(DEFAULT_TYPE_WEIGHTS)
     )
     space_ids: tuple[str, ...] | None = None
+
+
+class ScopedRecallResult(BaseModel, frozen=True):
+    """Container for scoped recall results with optional edge metadata.
+
+    Returned by ``Memex.recall_scoped`` when ``include_edges=True``.
+    Provides search results together with any pre-existing typed edges
+    connecting the revisions of the returned items, enabling
+    cross-Space traversal.
+
+    Args:
+        results: Search results ordered by descending relevance.
+        edges: Typed edges whose source and target revisions both
+            appear among the returned results. Empty when no
+            inter-result edges exist.
+    """
+
+    results: list[SearchResult]
+    edges: list[Edge] = Field(default_factory=list)
 
 
 class SearchResult(BaseModel, frozen=True):
