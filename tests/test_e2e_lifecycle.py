@@ -110,7 +110,7 @@ async def env(neo4j_driver, redis_client):
         collector,
         executor,
         store,
-        settings=DreamStateSettings(),
+        settings=DreamStateSettings(enabled=True),
         llm_client=fake_llm,
     )
 

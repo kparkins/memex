@@ -25,7 +25,7 @@ from memex.orchestration.dream_collector import (
     DreamStateCollector,
     DreamStateEventBatch,
 )
-from memex.orchestration.dream_executor import DreamStateExecutor
+from memex.orchestration.dream_executor import DreamStateExecutor, ExecutionReport
 from memex.orchestration.dream_pipeline import (
     DreamAuditReport,
     DreamStatePipeline,
@@ -65,7 +65,7 @@ async def env(neo4j_driver, redis_client):
     collector = DreamStateCollector(store, feed, cursor)
     executor = DreamStateExecutor(store)
     pipeline = DreamStatePipeline(
-        collector, executor, store, settings=DreamStateSettings()
+        collector, executor, store, settings=DreamStateSettings(enabled=True)
     )
 
     return SimpleNamespace(
@@ -522,7 +522,7 @@ class TestCircuitBreaker:
             env.collector,
             env.executor,
             env.store,
-            settings=DreamStateSettings(max_deprecation_ratio=0.9),
+            settings=DreamStateSettings(enabled=True, max_deprecation_ratio=0.9),
         )
 
         with (
@@ -738,7 +738,7 @@ class TestDreamStateModelConfig:
         """Pipeline should forward DreamStateSettings.model to assess_batch."""
         item, rev, _ = await _create_item(env.store, env.space)
 
-        custom_settings = DreamStateSettings(model="custom-model-v1")
+        custom_settings = DreamStateSettings(enabled=True, model="custom-model-v1")
         pipeline = DreamStatePipeline(
             env.collector,
             env.executor,
@@ -773,3 +773,137 @@ class TestDreamStateModelConfig:
         # Check the model kwarg passed to assess_batch
         model_arg = call_kwargs.kwargs.get("model") or call_kwargs[1].get("model")
         assert model_arg == "custom-model-v1"
+
+
+# -- Unit tests: dream_state.enabled flag ----------------------------------
+
+
+class TestDreamStateEnabledFlag:
+    """Decision #12: Dream State runs only when ``enabled`` is True.
+
+    Fresh installs default ``dream_state.enabled`` to False so the
+    pipeline short-circuits without calling the collector, LLM, or
+    executor. Supporting infrastructure (event publication, audit
+    report storage, cursor keys) remains wired; flipping the flag to
+    True re-activates the executor.
+    """
+
+    _PROJECT_ID = "test-project-enabled-flag"
+
+    def test_enabled_defaults_to_false(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Fresh settings default the enabled flag to False.
+
+        The env var is explicitly cleared so the assertion reflects
+        the class-level default rather than any ambient override.
+        """
+        monkeypatch.delenv("MEMEX_DREAM_ENABLED", raising=False)
+        settings = DreamStateSettings()
+        assert settings.enabled is False
+
+    def test_enabled_can_be_overridden(self) -> None:
+        """Explicit ``enabled=True`` overrides the default."""
+        settings = DreamStateSettings(enabled=True)
+        assert settings.enabled is True
+
+    @pytest.mark.asyncio
+    async def test_disabled_short_circuits_without_touching_dependencies(
+        self,
+    ) -> None:
+        """Disabled pipeline must not call collector, LLM, or executor."""
+        collector = AsyncMock(spec=DreamStateCollector)
+        executor = AsyncMock(spec=DreamStateExecutor)
+        store = AsyncMock()
+        pipeline = DreamStatePipeline(
+            collector,
+            executor,
+            store,
+            settings=DreamStateSettings(),
+        )
+
+        with patch(
+            "memex.orchestration.dream_pipeline.assess_batch",
+            new_callable=AsyncMock,
+        ) as mock_assess:
+            report = await pipeline.run(self._PROJECT_ID)
+
+        assert report.disabled is True
+        assert report.project_id == self._PROJECT_ID
+        assert report.events_collected == 0
+        assert report.revisions_inspected == 0
+        assert report.actions_recommended == []
+        assert report.execution is None
+        assert report.circuit_breaker_tripped is False
+        assert report.cursor_after == ""
+
+        collector.collect.assert_not_called()
+        collector.commit_cursor.assert_not_called()
+        executor.execute_actions.assert_not_called()
+        mock_assess.assert_not_called()
+        store.save_audit_report.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enabled_flag_runs_executor(self) -> None:
+        """Setting ``enabled=True`` re-activates collection and execution."""
+        item_id = "item-enabled"
+        revision = Revision(
+            item_id=item_id,
+            revision_number=1,
+            content="enabled content",
+            search_text="enabled content",
+        )
+
+        collector = AsyncMock(spec=DreamStateCollector)
+        collector.collect = AsyncMock(
+            return_value=DreamStateEventBatch(
+                events=[],
+                revisions={revision.id: CollectedRevision(revision=revision)},
+                cursor="0-0",
+            )
+        )
+
+        executor = AsyncMock(spec=DreamStateExecutor)
+        executor.execute_actions = AsyncMock(
+            return_value=ExecutionReport(
+                results=[],
+                total=1,
+                succeeded=1,
+                failed=0,
+            )
+        )
+
+        store = AsyncMock()
+        store.get_items_batch = AsyncMock(
+            return_value={
+                item_id: Item(
+                    id=item_id,
+                    space_id="space-1",
+                    name="item-enabled",
+                    kind=ItemKind.FACT,
+                )
+            }
+        )
+        store.save_audit_report = AsyncMock()
+
+        pipeline = DreamStatePipeline(
+            collector,
+            executor,
+            store,
+            settings=DreamStateSettings(enabled=True),
+        )
+
+        mock_actions = [_make_metadata_action(revision.id)]
+        with patch(
+            "memex.orchestration.dream_pipeline.assess_batch",
+            new_callable=AsyncMock,
+            return_value=mock_actions,
+        ) as mock_assess:
+            report = await pipeline.run(self._PROJECT_ID)
+
+        assert report.disabled is False
+        collector.collect.assert_awaited_once()
+        mock_assess.assert_awaited_once()
+        executor.execute_actions.assert_awaited_once_with(mock_actions)
+        store.save_audit_report.assert_awaited_once()

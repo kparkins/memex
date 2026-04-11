@@ -106,6 +106,12 @@ class DreamStateSettings(BaseSettings):
     """Dream State consolidation settings.
 
     Args:
+        enabled: Master switch for Dream State execution. Disabled by
+            default so fresh installs never mutate the graph via the
+            consolidation pipeline. Surrounding infrastructure (event
+            publication, audit report storage, cursors) remains wired
+            regardless of this flag; set to ``True`` to re-enable the
+            executor. Override via ``MEMEX_DREAM_ENABLED``.
         batch_size: Max revisions per LLM assessment batch.
         max_deprecation_ratio: Circuit-breaker threshold (0.1-0.9).
         model: LLM model for Dream State assessment.
@@ -117,6 +123,7 @@ class DreamStateSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MEMEX_DREAM_")
 
+    enabled: bool = False
     batch_size: int = 20
     max_deprecation_ratio: float = Field(default=0.5, ge=0.1, le=0.9)
     model: str = "gpt-4o-mini"

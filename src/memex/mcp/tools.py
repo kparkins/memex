@@ -1397,6 +1397,7 @@ def _serialize_audit_report(report: DreamAuditReport) -> dict[str, Any]:
         "project_id": report.project_id,
         "timestamp": report.timestamp.isoformat(),
         "dry_run": report.dry_run,
+        "disabled": report.disabled,
         "events_collected": report.events_collected,
         "revisions_inspected": report.revisions_inspected,
         "actions_recommended": len(report.actions_recommended),

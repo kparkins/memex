@@ -44,6 +44,10 @@ class DreamAuditReport(BaseModel, frozen=True):
         project_id: Project this run targeted.
         timestamp: When the run completed.
         dry_run: Whether execution was suppressed.
+        disabled: Whether the run was short-circuited because the
+            ``dream_state.enabled`` config flag is off. Disabled runs
+            perform no collection, assessment, or execution and are not
+            persisted to the audit store.
         events_collected: Number of consolidation events consumed.
         revisions_inspected: Number of distinct revisions fetched.
         actions_recommended: Full list of LLM-recommended actions.
@@ -59,6 +63,7 @@ class DreamAuditReport(BaseModel, frozen=True):
     project_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     dry_run: bool
+    disabled: bool = False
     events_collected: int
     revisions_inspected: int
     actions_recommended: list[DreamAction]
@@ -200,6 +205,10 @@ class DreamStatePipeline:
         """Execute one Dream State consolidation pass.
 
         Steps:
+            0. Short-circuit when the ``dream_state.enabled`` flag is
+               off: no collection, assessment, or execution; the
+               returned report is flagged ``disabled`` and is not
+               persisted.
             1. Collect events since last cursor.
             2. Build revision summaries for LLM input.
             3. Request LLM assessment.
@@ -219,8 +228,16 @@ class DreamStatePipeline:
             model: Override LLM model for assessment.
 
         Returns:
-            Persisted audit report summarizing this run.
+            Persisted audit report summarizing this run, or an
+            ephemeral disabled-state report when the pipeline is off.
         """
+        if not self._settings.enabled:
+            logger.info(
+                "Dream State pipeline disabled; skipping run for project %s",
+                project_id,
+            )
+            return self._disabled_report(project_id, dry_run=dry_run)
+
         batch = await self._collector.collect(
             project_id,
             count=self._settings.batch_size,
@@ -271,6 +288,40 @@ class DreamStatePipeline:
             )
 
         return report
+
+    def _disabled_report(
+        self,
+        project_id: str,
+        *,
+        dry_run: bool,
+    ) -> DreamAuditReport:
+        """Build an ephemeral audit report for a disabled pipeline run.
+
+        The returned report is not persisted to the store; it exists
+        solely so that callers of :meth:`run` receive a uniform
+        response type. ``disabled`` is set to ``True`` so clients can
+        distinguish a no-op run from a zero-event real run.
+
+        Args:
+            project_id: Project whose run was skipped.
+            dry_run: Whether the caller requested dry-run mode.
+
+        Returns:
+            A disabled-state audit report with all counters zeroed.
+        """
+        return DreamAuditReport(
+            project_id=project_id,
+            dry_run=dry_run,
+            disabled=True,
+            events_collected=0,
+            revisions_inspected=0,
+            actions_recommended=[],
+            execution=None,
+            circuit_breaker_tripped=False,
+            deprecation_ratio=0.0,
+            max_deprecation_ratio=self._settings.max_deprecation_ratio,
+            cursor_after="",
+        )
 
     async def _assess(
         self,
