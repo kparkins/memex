@@ -12,13 +12,14 @@ backward-compatible convenience wrapper.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from memex.config import PrivacySettings, RetrievalSettings
+from memex.config import EnrichmentSettings, PrivacySettings, RetrievalSettings
 from memex.domain import (
     Artifact,
     Edge,
@@ -30,6 +31,7 @@ from memex.domain import (
     Tag,
     TagAssignment,
 )
+from memex.orchestration.enrichment import EnrichmentResult, EnrichmentService
 from memex.orchestration.events import (
     publish_after_ingest,
     publish_revision_created,
@@ -209,6 +211,41 @@ def _sanitize_text_pair(
     return sanitized_content, sanitized_search
 
 
+def _log_enrichment_task_result(task: asyncio.Task[EnrichmentResult]) -> None:
+    """Consume and log the result of a fire-and-forget enrichment task.
+
+    Installed as an ``asyncio.Task`` done-callback so that:
+
+    1. ``Task exception was never retrieved`` warnings never fire
+       for background enrichment failures.
+    2. Failures are observable via structured log lines instead of
+       bubbling up through an unrelated coroutine.
+
+    Args:
+        task: The completed ``asyncio.Task`` whose result (or
+            exception) should be consumed and logged.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "Background enrichment task %s raised: %s",
+            task.get_name(),
+            exc,
+            exc_info=exc,
+        )
+        return
+    result = task.result()
+    if not result.success:
+        logger.warning(
+            "Background enrichment task %s failed for revision %s: %s",
+            task.get_name(),
+            result.revision_id,
+            result.error,
+        )
+
+
 class IngestService:
     """Orchestrates atomic memory ingest with injected dependencies.
 
@@ -221,6 +258,15 @@ class IngestService:
         search: Search strategy for recall context retrieval.
         working_memory: Redis session buffer (``None`` to skip).
         event_feed: Consolidation event feed (``None`` to skip).
+        enrichment_service: Optional enrichment pipeline. When set,
+            ingest schedules a fire-and-forget enrichment task for
+            each newly created revision so FR-8 fields (summary,
+            topics, keywords, facts, events, implications, embedding,
+            enriched search_text) are populated off the critical
+            ingest path.
+        enrichment_settings: Enrichment configuration. ``enabled``
+            defaults to ``True`` so wiring an ``enrichment_service``
+            activates the pipeline without extra configuration.
     """
 
     def __init__(
@@ -230,11 +276,15 @@ class IngestService:
         *,
         working_memory: RedisWorkingMemory | None = None,
         event_feed: ConsolidationEventFeed | None = None,
+        enrichment_service: EnrichmentService | None = None,
+        enrichment_settings: EnrichmentSettings | None = None,
     ) -> None:
         self._store = store
         self._search = search
         self._working_memory = working_memory
         self._event_feed = event_feed
+        self._enrichment_service = enrichment_service
+        self._enrichment_settings = enrichment_settings or EnrichmentSettings()
 
     async def ingest(
         self,
@@ -337,6 +387,8 @@ class IngestService:
                     exc_info=True,
                 )
 
+        self._schedule_enrichment(revision.id, privacy=privacy)
+
         if params.session_id is not None and self._working_memory is not None:
             await self._working_memory.add_message(
                 project_id=params.project_id,
@@ -435,11 +487,68 @@ class IngestService:
                     exc_info=True,
                 )
 
+        self._schedule_enrichment(persisted.id, privacy=privacy)
+
         return ReviseResult(
             revision=persisted,
             tag_assignment=assignment,
             item_id=params.item_id,
         )
+
+    def _schedule_enrichment(
+        self,
+        revision_id: str,
+        *,
+        privacy: PrivacySettings,
+    ) -> asyncio.Task[EnrichmentResult] | None:
+        """Schedule fire-and-forget enrichment for a newly committed revision.
+
+        Creates an ``asyncio.Task`` that invokes the injected
+        ``EnrichmentService`` without awaiting completion, so the
+        caller of ``ingest`` / ``revise`` returns immediately while
+        enrichment continues in the background. Scheduling is a
+        no-op when no enrichment service is wired, when the
+        ``enrichment.enabled`` flag is off, or when no event loop
+        is currently running.
+
+        Task exceptions are swallowed via a done-callback that
+        logs and consumes the failure, so fire-and-forget tasks
+        never surface "Task exception was never retrieved" warnings.
+
+        Args:
+            revision_id: ID of the revision to enrich.
+            privacy: Privacy hook settings to forward to the
+                enrichment pipeline (propagates the caller's
+                redaction/credential policy).
+
+        Returns:
+            The scheduled ``asyncio.Task`` when a task was created,
+            otherwise ``None``.
+        """
+        if self._enrichment_service is None:
+            return None
+        if not self._enrichment_settings.enabled:
+            return None
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "No running event loop; skipping enrichment scheduling for revision %s",
+                revision_id,
+            )
+            return None
+
+        task = loop.create_task(
+            self._enrichment_service.enrich(
+                revision_id,
+                enrichment_settings=self._enrichment_settings,
+                privacy_settings=privacy,
+            ),
+            name=f"enrich-{revision_id}",
+        )
+        task.add_done_callback(_log_enrichment_task_result)
+        return task
 
     async def _resolve_project_id(self, item_id: str) -> str:
         """Look up the project_id for an item via its parent space.
@@ -467,12 +576,18 @@ async def memory_ingest(
     privacy: PrivacySettings | None = None,
     retrieval: RetrievalSettings | None = None,
     event_feed: ConsolidationEventFeed | None = None,
+    enrichment_service: EnrichmentService | None = None,
+    enrichment_settings: EnrichmentSettings | None = None,
     database: str = "neo4j",
 ) -> IngestResult:
     """Backward-compatible convenience wrapper around ``IngestService``.
 
     Constructs the service with injected dependencies from the raw
     driver and client objects, then delegates to ``IngestService.ingest``.
+    Enrichment is opt-in: callers that want fire-and-forget enrichment
+    on every ingest should pass an ``EnrichmentService`` explicitly,
+    or use the ``Memex`` facade which wires it automatically from
+    configuration.
 
     Args:
         neo4j_driver: Neo4j async driver instance.
@@ -483,6 +598,11 @@ async def memory_ingest(
         retrieval: Retrieval tuning for recall context.
         event_feed: Consolidation event feed for Dream State
             publication. ``None`` skips event publication.
+        enrichment_service: Optional enrichment pipeline. ``None``
+            (the default) disables fire-and-forget enrichment for
+            this call.
+        enrichment_settings: Enrichment configuration. Only
+            consulted when ``enrichment_service`` is provided.
         database: Neo4j database name.
 
     Returns:
@@ -503,6 +623,8 @@ async def memory_ingest(
         search,
         working_memory=wm,
         event_feed=event_feed,
+        enrichment_service=enrichment_service,
+        enrichment_settings=enrichment_settings,
     )
     return await service.ingest(params, privacy=privacy, retrieval=retrieval)
 
@@ -513,12 +635,18 @@ async def memory_revise(
     params: ReviseParams,
     *,
     event_feed: ConsolidationEventFeed | None = None,
+    enrichment_service: EnrichmentService | None = None,
+    enrichment_settings: EnrichmentSettings | None = None,
     database: str = "neo4j",
 ) -> ReviseResult:
     """Convenience wrapper for ``IngestService.revise``.
 
     Constructs the service with injected dependencies from the raw
     driver and client objects, then delegates to ``IngestService.revise``.
+    Enrichment is opt-in: callers that want fire-and-forget enrichment
+    on every revise should pass an ``EnrichmentService`` explicitly,
+    or use the ``Memex`` facade which wires it automatically from
+    configuration.
 
     Args:
         neo4j_driver: Neo4j async driver instance.
@@ -527,6 +655,11 @@ async def memory_revise(
         params: Revise parameters.
         event_feed: Consolidation event feed for Dream State
             publication. ``None`` skips event publication.
+        enrichment_service: Optional enrichment pipeline. ``None``
+            (the default) disables fire-and-forget enrichment for
+            this call.
+        enrichment_settings: Enrichment configuration. Only
+            consulted when ``enrichment_service`` is provided.
         database: Neo4j database name.
 
     Returns:
@@ -543,5 +676,7 @@ async def memory_revise(
         search,
         working_memory=wm,
         event_feed=event_feed,
+        enrichment_service=enrichment_service,
+        enrichment_settings=enrichment_settings,
     )
     return await service.revise(params)

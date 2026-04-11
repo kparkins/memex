@@ -18,8 +18,9 @@ from collections.abc import Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING
 
-from memex.config import MemexSettings
+from memex.config import EnrichmentSettings, MemexSettings
 from memex.domain.models import Item
+from memex.orchestration.enrichment import EnrichmentService
 from memex.orchestration.ingest import (
     IngestParams,
     IngestResult,
@@ -53,6 +54,11 @@ class Memex:
         search: Hybrid search strategy.
         working_memory: Redis session buffer (optional).
         event_feed: Consolidation event feed (optional).
+        enrichment_service: Optional enrichment pipeline passed to
+            ``IngestService`` so ingest/revise schedule fire-and-forget
+            enrichment for every new revision.
+        enrichment_settings: Enrichment configuration forwarded to
+            ``IngestService``.
     """
 
     def __init__(
@@ -62,6 +68,8 @@ class Memex:
         *,
         working_memory: RedisWorkingMemory | None = None,
         event_feed: ConsolidationEventFeed | None = None,
+        enrichment_service: EnrichmentService | None = None,
+        enrichment_settings: EnrichmentSettings | None = None,
     ) -> None:
         self._store = store
         self._search = search
@@ -72,6 +80,8 @@ class Memex:
             search,
             working_memory=working_memory,
             event_feed=event_feed,
+            enrichment_service=enrichment_service,
+            enrichment_settings=enrichment_settings,
         )
         self._driver: AsyncDriver | None = None
         self._redis: Redis | None = None
@@ -128,12 +138,17 @@ class Memex:
             max_messages=wm_cfg.max_messages,
         )
         ef = ConsolidationEventFeed(redis_client)
+        enrichment_service = (
+            EnrichmentService(store) if settings.enrichment.enabled else None
+        )
 
         instance = cls(
             store,
             search,
             working_memory=wm,
             event_feed=ef,
+            enrichment_service=enrichment_service,
+            enrichment_settings=settings.enrichment,
         )
         instance._driver = driver
         instance._redis = redis_client
@@ -173,12 +188,17 @@ class Memex:
             max_messages=wm_cfg.max_messages,
         )
         ef = MongoEventFeed(db["events"])
+        enrichment_service = (
+            EnrichmentService(store) if settings.enrichment.enabled else None
+        )
 
         instance = cls(
             store,
             search,
             working_memory=wm,
             event_feed=ef,
+            enrichment_service=enrichment_service,
+            enrichment_settings=settings.enrichment,
         )
         instance._mongo_client = mongo_client  # type: ignore[attr-defined]
         return instance
@@ -220,8 +240,18 @@ class Memex:
             max_messages=wm_cfg.max_messages,
         )
         ef = MongoEventFeed(db["events"])
+        enrichment_service = (
+            EnrichmentService(store) if cfg.enrichment.enabled else None
+        )
 
-        return cls(store, search, working_memory=wm, event_feed=ef)
+        return cls(
+            store,
+            search,
+            working_memory=wm,
+            event_feed=ef,
+            enrichment_service=enrichment_service,
+            enrichment_settings=cfg.enrichment,
+        )
 
     @classmethod
     def from_env(cls) -> Memex:
