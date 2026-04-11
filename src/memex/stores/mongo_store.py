@@ -34,6 +34,10 @@ MAX_TRAVERSAL_DEPTH = 20
 _MIN_TRAVERSAL_DEPTH = 1
 _ROOT_SENTINEL = "__ROOT__"
 
+# TTL index semantics: when expireAfterSeconds is 0 and the indexed field is
+# a BSON Date, MongoDB expires each document at its own stored timestamp.
+WORKING_MEMORY_TTL_EXPIRE_AFTER_SECONDS = 0
+
 _DEPENDENCY_EDGE_TYPES: frozenset[str] = frozenset(
     {EdgeType.DEPENDS_ON, EdgeType.DERIVED_FROM}
 )
@@ -152,6 +156,15 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
     # audit_reports
     await db.audit_reports.create_index(
         [("project_id", ASCENDING), ("timestamp", DESCENDING)]
+    )
+
+    # working_memory -- TTL index on absolute expires_at timestamp.
+    # expireAfterSeconds=0 instructs MongoDB to remove each document when
+    # wall-clock time passes its own ``expires_at`` value. This enforces the
+    # 1-hour session expiry (see prd.md "default TTL of 1 hour").
+    await db.working_memory.create_index(
+        "expires_at",
+        expireAfterSeconds=WORKING_MEMORY_TTL_EXPIRE_AFTER_SECONDS,
     )
 
 
