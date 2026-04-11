@@ -11,15 +11,20 @@ Collections:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections import deque
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.asynchronous.client_session import AsyncClientSession
+from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.asynchronous.database import AsyncDatabase
+from pymongo.operations import SearchIndexModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
@@ -37,6 +42,70 @@ _ROOT_SENTINEL = "__ROOT__"
 # TTL index semantics: when expireAfterSeconds is 0 and the indexed field is
 # a BSON Date, MongoDB expires each document at its own stored timestamp.
 WORKING_MEMORY_TTL_EXPIRE_AFTER_SECONDS = 0
+
+# -- Search index constants ---------------------------------------------------
+
+# Canonical names for the Atlas Search indexes on the ``revisions`` collection.
+# Retrieval code (``memex.retrieval.mongo_hybrid``) imports these to target
+# ``$search`` and ``$vectorSearch`` stages — keep them in a single place so a
+# rename is a one-file change.
+FULLTEXT_INDEX_NAME = "revision_search_text"
+VECTOR_INDEX_NAME = "revision_embedding"
+
+# Default wall-clock budget for an index to finish its initial build and
+# become queryable. Cold builds against self-hosted mongot typically take
+# 10-60s for an empty collection; 120s is the safety margin the spike
+# recommended (see docs/mongot-index-provisioning.md §5).
+SEARCH_INDEX_WAIT_TIMEOUT_SECONDS = 120.0
+
+_SEARCH_INDEX_POLL_INTERVAL_SECONDS = 1.0
+_DEFAULT_EMBEDDING_DIMENSIONS = 1536
+_REVISION_CONTENT_FIELD = "content"
+_REVISION_TITLE_FIELD = "title"
+_REVISION_EMBEDDING_FIELD = "embedding"
+_DEFAULT_LEXICAL_ANALYZER = "lucene.standard"
+_VECTOR_SEARCH_INDEX_TYPE = "vectorSearch"
+_VECTOR_SIMILARITY_COSINE = "cosine"
+_SEARCH_INDEX_STATUS_FAILED = "FAILED"
+
+_LEXICAL_INDEX_DEFINITION: dict[str, Any] = {
+    "mappings": {
+        "dynamic": False,
+        "fields": {
+            _REVISION_CONTENT_FIELD: {
+                "type": "string",
+                "analyzer": _DEFAULT_LEXICAL_ANALYZER,
+            },
+            _REVISION_TITLE_FIELD: {
+                "type": "string",
+                "analyzer": _DEFAULT_LEXICAL_ANALYZER,
+            },
+        },
+    }
+}
+
+_VECTOR_INDEX_DEFINITION: dict[str, Any] = {
+    "fields": [
+        {
+            "type": "vector",
+            "path": _REVISION_EMBEDDING_FIELD,
+            "numDimensions": _DEFAULT_EMBEDDING_DIMENSIONS,
+            "similarity": _VECTOR_SIMILARITY_COSINE,
+        }
+    ]
+}
+
+SEARCH_INDEX_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {
+        "name": FULLTEXT_INDEX_NAME,
+        "definition": _LEXICAL_INDEX_DEFINITION,
+    },
+    {
+        "name": VECTOR_INDEX_NAME,
+        "type": _VECTOR_SEARCH_INDEX_TYPE,
+        "definition": _VECTOR_INDEX_DEFINITION,
+    },
+)
 
 _DEPENDENCY_EDGE_TYPES: frozenset[str] = frozenset(
     {EdgeType.DEPENDS_ON, EdgeType.DERIVED_FROM}
@@ -79,25 +148,11 @@ def _validate_traversal_depth(depth: int) -> None:
 
 
 async def ensure_indexes(db: AsyncDatabase) -> None:
-    """Create necessary indexes for all Memex collections.
+    """Create necessary B-tree indexes for all Memex collections.
 
-    Does NOT create Atlas Search indexes -- those must be provisioned
-    via the Atlas UI or CLI:
-
-    .. code-block:: json
-
-        {
-            "name": "revision_vector_index",
-            "type": "vectorSearch",
-            "definition": {
-                "fields": [{
-                    "type": "vector",
-                    "path": "embedding",
-                    "numDimensions": 1536,
-                    "similarity": "cosine"
-                }]
-            }
-        }
+    Search indexes (Atlas Search / mongot) are provisioned separately
+    via :func:`ensure_search_indexes` — they live on a different admin
+    surface and can take tens of seconds to become queryable.
 
     Args:
         db: AsyncDatabase instance.
@@ -212,6 +267,133 @@ async def backfill_revision_space_id(db: AsyncDatabase) -> int:
         )
         total_updated += result.modified_count
     return total_updated
+
+
+# -- Search index setup -------------------------------------------------------
+
+
+class SearchIndexBuildError(RuntimeError):
+    """Raised when a search index build fails or never becomes queryable.
+
+    Captures the ``message`` field reported by ``$listSearchIndexes`` on
+    ``FAILED`` indexes so callers can surface the root cause. Callers must
+    not silently retry: a ``FAILED`` build almost always indicates an
+    invalid definition (bad analyzer, wrong vector dimensionality, etc.)
+    and retrying will not fix it.
+
+    Args:
+        index_name: Name of the search index that failed.
+        message: Failure message reported by mongot.
+    """
+
+    def __init__(self, index_name: str, message: str) -> None:
+        super().__init__(
+            f"search index {index_name!r} failed: {message}"
+            if message
+            else f"search index {index_name!r} failed"
+        )
+        self.index_name = index_name
+        self.message = message
+
+
+async def wait_until_queryable(
+    coll: AsyncCollection[Mapping[str, Any]],
+    name: str,
+    timeout_s: float = SEARCH_INDEX_WAIT_TIMEOUT_SECONDS,
+) -> None:
+    """Block until the named search index reports ``queryable=True``.
+
+    Polls ``$listSearchIndexes`` until the index enters a queryable state
+    or until ``timeout_s`` has elapsed. Returning successfully is the
+    precondition for issuing ``$search`` / ``$vectorSearch`` queries — a
+    fresh ``createSearchIndexes`` call returns well before the Lucene
+    segments are actually built (see docs/mongot-primer.md §5.1).
+
+    Args:
+        coll: Collection hosting the search index.
+        name: Search index name to wait on.
+        timeout_s: Maximum wall-clock seconds to wait.
+
+    Raises:
+        SearchIndexBuildError: If the index enters ``FAILED`` state.
+        TimeoutError: If ``timeout_s`` elapses before the index is queryable.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        async for idx in await coll.list_search_indexes(name):
+            if idx.get("status") == _SEARCH_INDEX_STATUS_FAILED:
+                raise SearchIndexBuildError(name, str(idx.get("message") or ""))
+            if idx.get("queryable"):
+                return
+        await asyncio.sleep(_SEARCH_INDEX_POLL_INTERVAL_SECONDS)
+    raise TimeoutError(f"search index {name!r} not queryable in {timeout_s}s")
+
+
+async def _list_existing_search_indexes(
+    coll: AsyncCollection[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """Return a mapping of search-index name to its current descriptor.
+
+    Args:
+        coll: Collection to query.
+
+    Returns:
+        Dict keyed by index name. Values are the raw descriptors returned
+        by ``$listSearchIndexes``.
+    """
+    existing: dict[str, Mapping[str, Any]] = {}
+    async for idx in await coll.list_search_indexes():
+        existing[idx["name"]] = idx
+    return existing
+
+
+async def ensure_search_indexes(db: AsyncDatabase[Mapping[str, Any]]) -> None:
+    """Idempotently provision Memex search indexes on the revisions collection.
+
+    For each canonical index in :data:`SEARCH_INDEX_DEFINITIONS`:
+
+    * If the index does not exist, create it via ``createSearchIndexes``.
+    * If the index exists with a definition that matches the canonical
+      one, do nothing.
+    * If the index exists but its ``latestDefinition`` differs from the
+      canonical one, issue ``updateSearchIndex`` to converge.
+    * If the index exists in ``FAILED`` state, raise
+      :class:`SearchIndexBuildError`; the caller must drop it explicitly
+      rather than silently retrying.
+
+    Does NOT wait for freshly-created indexes to become queryable —
+    callers that need that guarantee (CI, integration tests, application
+    startup gating) must follow up with :func:`wait_until_queryable`.
+
+    Args:
+        db: AsyncDatabase handle rooted at the Memex database.
+
+    Raises:
+        SearchIndexBuildError: If an existing index reports ``FAILED``.
+    """
+    coll = db.revisions
+    existing = await _list_existing_search_indexes(coll)
+
+    to_create: list[SearchIndexModel] = []
+    for spec in SEARCH_INDEX_DEFINITIONS:
+        name = spec["name"]
+        current = existing.get(name)
+        if current is None:
+            to_create.append(
+                SearchIndexModel(
+                    definition=spec["definition"],
+                    name=name,
+                    type=spec.get("type"),
+                )
+            )
+            continue
+        if current.get("status") == _SEARCH_INDEX_STATUS_FAILED:
+            raise SearchIndexBuildError(name, str(current.get("message") or ""))
+        if current.get("latestDefinition") != spec["definition"]:
+            await coll.update_search_index(name, spec["definition"])
+
+    if to_create:
+        await coll.create_search_indexes(to_create)
 
 
 # -- Store class --------------------------------------------------------------
