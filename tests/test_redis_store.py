@@ -127,8 +127,12 @@ async def wm(
     Returns:
         Configured RedisWorkingMemory backed by the test Redis client.
     """
-    settings = RedisSettings(session_ttl_seconds=60, max_messages=5)
-    return RedisWorkingMemory(redis_client, settings)
+    return RedisWorkingMemory(
+        redis_client,
+        RedisSettings(),
+        session_ttl_seconds=60,
+        max_messages=5,
+    )
 
 
 @pytest.fixture
@@ -213,8 +217,12 @@ class TestSessionIsolation:
         redis_client: aioredis.Redis,  # type: ignore[type-arg]
     ) -> None:
         """Sessions with different context namespaces are isolated."""
-        settings = RedisSettings(session_ttl_seconds=60, max_messages=50)
-        wm = RedisWorkingMemory(redis_client, settings)
+        wm = RedisWorkingMemory(
+            redis_client,
+            RedisSettings(),
+            session_ttl_seconds=60,
+            max_messages=50,
+        )
         sid_personal = build_session_id(
             "personal", "alice", datetime(2026, 4, 2, tzinfo=UTC), 1
         )
