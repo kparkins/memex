@@ -26,11 +26,10 @@ from memex.retrieval.models import (
     SearchMode,
     SearchRequest,
 )
+from memex.stores.mongo_store import FULLTEXT_INDEX_NAME, VECTOR_INDEX_NAME
 
 logger = logging.getLogger(__name__)
 
-FULLTEXT_INDEX_NAME = "revision_search_text"
-VECTOR_INDEX_NAME = "revision_embedding"
 _DEPRECATED_OVERFETCH_FACTOR = 2
 
 # Internal fields injected by aggregation pipelines, stripped before
