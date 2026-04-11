@@ -19,7 +19,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING
 
 from memex.config import MemexSettings
-from memex.domain.models import Item
+from memex.domain.models import Item, Space
 from memex.orchestration.ingest import (
     IngestParams,
     IngestResult,
@@ -305,6 +305,35 @@ class Memex:
             Item if found, None otherwise.
         """
         return await self._store.get_item(item_id)
+
+    async def get_or_create_space(
+        self,
+        name: str,
+        project_id: str,
+        parent_space_id: str | None = None,
+    ) -> Space:
+        """Idempotently resolve or create a Space within a project.
+
+        Delegates to the store's atomic ``resolve_space`` primitive, so
+        concurrent callers converge on the same Space rather than
+        producing duplicates. Repeated calls with the same
+        ``(name, project_id, parent_space_id)`` triple return a Space
+        with the same ``id``.
+
+        Args:
+            name: Space name (used in kref paths).
+            project_id: ID of the owning project.
+            parent_space_id: Parent space for nested hierarchy, or None
+                for a top-level space.
+
+        Returns:
+            The resolved or newly created Space.
+        """
+        return await self._store.resolve_space(
+            project_id=project_id,
+            space_name=name,
+            parent_space_id=parent_space_id,
+        )
 
     async def get_item_by_path(
         self,

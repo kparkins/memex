@@ -213,6 +213,55 @@ class TestMemexGetItem:
         assert result is None
 
 
+class TestMemexGetOrCreateSpace:
+    """Verify Memex.get_or_create_space delegates and is idempotent."""
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_store_resolve_space(self) -> None:
+        """Helper forwards arguments to store.resolve_space."""
+        store = _mock_store()
+        m = _make_memex(store=store)
+
+        space = await m.get_or_create_space(SPACE_NAME, PROJECT_ID)
+
+        assert space.id == "sp-1"
+        assert space.name == SPACE_NAME
+        assert space.project_id == PROJECT_ID
+        store.resolve_space.assert_awaited_once_with(
+            project_id=PROJECT_ID,
+            space_name=SPACE_NAME,
+            parent_space_id=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_forwards_parent_space_id(self) -> None:
+        """parent_space_id is propagated to the store."""
+        store = _mock_store()
+        m = _make_memex(store=store)
+
+        await m.get_or_create_space(SPACE_NAME, PROJECT_ID, parent_space_id="sp-root")
+
+        store.resolve_space.assert_awaited_once_with(
+            project_id=PROJECT_ID,
+            space_name=SPACE_NAME,
+            parent_space_id="sp-root",
+        )
+
+    @pytest.mark.asyncio
+    async def test_idempotent_repeat_calls_return_same_space(self) -> None:
+        """Calling the helper twice returns the same Space identity."""
+        store = _mock_store()
+        m = _make_memex(store=store)
+
+        first = await m.get_or_create_space(SPACE_NAME, PROJECT_ID)
+        second = await m.get_or_create_space(SPACE_NAME, PROJECT_ID)
+
+        assert first.id == second.id
+        assert first.project_id == second.project_id
+        assert first.name == second.name
+        assert store.resolve_space.await_count == 2
+
+
 class TestMemexGetItemByPath:
     """Verify Memex.get_item_by_path resolves space then item."""
 
