@@ -19,7 +19,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING
 
 from memex.config import MemexSettings
-from memex.domain.models import Item
+from memex.domain.models import Item, Project
 from memex.orchestration.ingest import (
     IngestParams,
     IngestResult,
@@ -294,6 +294,23 @@ class Memex:
             ReviseResult with the new revision and tag assignment.
         """
         return await self._ingest_service.revise(params)
+
+    async def get_or_create_project(self, name: str) -> Project:
+        """Idempotently resolve or create a ``Project`` by name.
+
+        Delegates to the store's atomic ``resolve_project`` primitive,
+        so concurrent callers converge on the same Project rather than
+        producing duplicates. Repeated calls with the same ``name``
+        return a Project with the same ``id``.
+
+        Args:
+            name: Human-readable project name (e.g. the becoming
+                Project name from ``memex.conventions``).
+
+        Returns:
+            The resolved or newly created Project.
+        """
+        return await self._store.resolve_project(name=name)
 
     async def get_item(self, item_id: str) -> Item | None:
         """Retrieve a single item by ID.

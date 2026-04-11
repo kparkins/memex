@@ -9,7 +9,7 @@ import pytest
 from memex.client import Memex
 from memex.config import MemexSettings
 from memex.domain.edges import TagAssignment
-from memex.domain.models import Item, ItemKind, Revision, Space
+from memex.domain.models import Item, ItemKind, Project, Revision, Space
 from memex.orchestration.ingest import IngestParams, ReviseParams
 from memex.retrieval.models import (
     HybridResult,
@@ -20,12 +20,14 @@ from memex.retrieval.models import (
 from memex.stores.protocols import MemoryStore
 
 PROJECT_ID = "proj-1"
+PROJECT_NAME = "jeeves"
 SPACE_NAME = "research"
 
 
 def _mock_store() -> AsyncMock:
     """Create a mock MemoryStore with sensible defaults."""
     store = AsyncMock(spec=MemoryStore)
+    store.resolve_project.return_value = Project(id=PROJECT_ID, name=PROJECT_NAME)
     store.resolve_space.return_value = Space(
         id="sp-1", project_id=PROJECT_ID, name=SPACE_NAME
     )
@@ -185,6 +187,45 @@ class TestMemexRevise:
         assert result.revision.content == "new"
         assert result.item_id == "item-1"
         store.revise_item.assert_awaited_once()
+
+
+class TestMemexGetOrCreateProject:
+    """Verify Memex.get_or_create_project delegates and is idempotent."""
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_store_resolve_project(self) -> None:
+        """Helper forwards the name to store.resolve_project."""
+        store = _mock_store()
+        m = _make_memex(store=store)
+
+        project = await m.get_or_create_project(PROJECT_NAME)
+
+        assert project.id == PROJECT_ID
+        assert project.name == PROJECT_NAME
+        store.resolve_project.assert_awaited_once_with(name=PROJECT_NAME)
+
+    @pytest.mark.asyncio
+    async def test_idempotent_repeat_calls_return_same_project(self) -> None:
+        """Calling the helper twice returns the same Project identity."""
+        store = _mock_store()
+        m = _make_memex(store=store)
+
+        first = await m.get_or_create_project(PROJECT_NAME)
+        second = await m.get_or_create_project(PROJECT_NAME)
+
+        assert first.id == second.id
+        assert first.name == second.name
+        assert store.resolve_project.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_project_domain_model(self) -> None:
+        """Returned value is a ``Project`` instance."""
+        store = _mock_store()
+        m = _make_memex(store=store)
+
+        result = await m.get_or_create_project(PROJECT_NAME)
+
+        assert isinstance(result, Project)
 
 
 class TestMemexGetItem:

@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
-from memex.domain.utils import format_utc
+from memex.domain.utils import format_utc, new_id, utcnow
 from memex.stores.neo4j_schema import NodeLabel, RelType
 from memex.stores.protocols import EnrichmentUpdate, StorePersistenceError
 
@@ -300,6 +300,49 @@ class Neo4jStore:
             data = dict(rec["p"])
             data["metadata"] = _decode_meta(data.get("metadata", ""))
             return Project.model_validate(data)
+
+    async def resolve_project(self, name: str) -> Project:
+        """Find an existing Project by name or atomically create one.
+
+        Uses Cypher ``MERGE`` on the ``name`` key within a single write
+        transaction so concurrent callers converge on the same Project
+        node. On first creation, seeds ``id``, ``created_at``, and an
+        empty metadata dict via ``ON CREATE SET``.
+
+        Args:
+            name: Human-readable project name.
+
+        Returns:
+            Resolved or newly created Project.
+
+        Raises:
+            StorePersistenceError: If the MERGE returns no record.
+        """
+        on_create_props: dict[str, object] = {
+            "id": new_id(),
+            "created_at": format_utc(utcnow()),
+            "metadata": _encode_meta({}) or "",
+        }
+
+        async def _work(tx: AsyncManagedTransaction) -> Project:
+            result = await tx.run(
+                f"MERGE (p:{NodeLabel.PROJECT} {{name: $name}}) "
+                "ON CREATE SET p += $props "
+                "RETURN p",
+                name=name,
+                props=on_create_props,
+            )
+            rec = await result.single()
+            if rec is None:
+                raise StorePersistenceError(
+                    f"MERGE on Project {name!r} returned no record"
+                )
+            data = dict(rec["p"])
+            data["metadata"] = _decode_meta(data.get("metadata", ""))
+            return Project.model_validate(data)
+
+        async with self._driver.session(database=self._database) as session:
+            return await session.execute_write(_work)
 
     # -- Space ------------------------------------------------------------
 

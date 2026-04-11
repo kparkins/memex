@@ -105,6 +105,22 @@ class TestProjectAndSpace:
         assert await store.get_tag("missing") is None
         assert await store.get_artifact("missing") is None
 
+    async def test_resolve_project_creates_then_reuses(
+        self,
+        store: Neo4jStore,
+    ) -> None:
+        """resolve_project is idempotent: second call returns same id."""
+        first = await store.resolve_project("jeeves")
+        second = await store.resolve_project("jeeves")
+
+        assert first.id == second.id
+        assert first.name == "jeeves"
+        assert second.name == "jeeves"
+
+        fetched = await store.get_project_by_name("jeeves")
+        assert fetched is not None
+        assert fetched.id == first.id
+
 
 # -- Item + Revision creation ---------------------------------------------
 
