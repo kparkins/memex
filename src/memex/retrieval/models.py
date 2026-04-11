@@ -57,6 +57,11 @@ class SearchRequest(BaseModel, frozen=True):
         include_deprecated: If True, include results from deprecated items.
         beta: Calibration factor for cosine similarity.
         type_weights: Per-source type weights for hybrid fusion.
+        space_ids: Optional whitelist of space ids to restrict recall to.
+            When provided, only revisions whose denormalized ``space_id``
+            matches one of these values are considered. ``None`` (the
+            default) disables the filter; an empty tuple is a no-op
+            request by convention and returns no results.
     """
 
     query: str = ""
@@ -68,6 +73,7 @@ class SearchRequest(BaseModel, frozen=True):
     type_weights: dict[MatchSource, float] = Field(
         default_factory=lambda: dict(DEFAULT_TYPE_WEIGHTS)
     )
+    space_ids: tuple[str, ...] | None = None
 
 
 class SearchResult(BaseModel, frozen=True):

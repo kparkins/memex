@@ -156,6 +156,140 @@ class TestMemexRecall:
         assert len(results) == 0
 
 
+class TestMemexRecallScoped:
+    """Verify Memex.recall_scoped resolves spaces and forwards the filter."""
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_with_none_omits_space_filter(self) -> None:
+        """``space_names=None`` leaves ``space_ids`` unset on the request.
+
+        Without a whitelist the call degrades to an unscoped recall:
+        the store's ``find_space`` primitive is never invoked and the
+        downstream search receives no ``space_ids`` constraint.
+        """
+        store = _mock_store()
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        await m.recall_scoped(
+            "question",
+            project_id=PROJECT_ID,
+            space_names=None,
+        )
+
+        store.find_space.assert_not_awaited()
+        req = search.search.call_args[0][0]
+        assert isinstance(req, SearchRequest)
+        assert req.query == "question"
+        assert req.space_ids is None
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_resolves_space_names(self) -> None:
+        """Each name in ``space_names`` is resolved via ``find_space``.
+
+        The resulting space ids are forwarded as a tuple on the
+        ``SearchRequest`` so MongoHybridSearch can emit the space
+        ``$match`` stage.
+        """
+        store = _mock_store()
+        store.find_space.side_effect = [
+            Space(id="sp-alpha", project_id=PROJECT_ID, name="alpha"),
+            Space(id="sp-beta", project_id=PROJECT_ID, name="beta"),
+        ]
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        await m.recall_scoped(
+            "why",
+            project_id=PROJECT_ID,
+            space_names=["alpha", "beta"],
+            limit=7,
+            memory_limit=4,
+        )
+
+        assert store.find_space.await_count == 2
+        store.find_space.assert_any_await(PROJECT_ID, "alpha")
+        store.find_space.assert_any_await(PROJECT_ID, "beta")
+
+        req = search.search.call_args[0][0]
+        assert req.query == "why"
+        assert req.limit == 7
+        assert req.memory_limit == 4
+        assert req.space_ids == ("sp-alpha", "sp-beta")
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_skips_unknown_spaces(self) -> None:
+        """Unknown names are dropped from the filter tuple.
+
+        When a caller asks for two spaces and only one exists, the
+        resolved space id alone makes it into ``space_ids``. The
+        search still runs -- partial scoping beats no scoping.
+        """
+        store = _mock_store()
+        store.find_space.side_effect = [
+            None,
+            Space(id="sp-beta", project_id=PROJECT_ID, name="beta"),
+        ]
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        await m.recall_scoped(
+            "q",
+            project_id=PROJECT_ID,
+            space_names=["ghost", "beta"],
+        )
+
+        req = search.search.call_args[0][0]
+        assert req.space_ids == ("sp-beta",)
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_returns_empty_when_no_spaces_resolve(
+        self,
+    ) -> None:
+        """If every requested space is unknown, recall returns early.
+
+        Returning an empty sequence avoids silently widening the query
+        to project scope when a caller typos every space name.
+        """
+        store = _mock_store()
+        store.find_space.return_value = None
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        results = await m.recall_scoped(
+            "q",
+            project_id=PROJECT_ID,
+            space_names=["ghost-one", "ghost-two"],
+        )
+
+        assert list(results) == []
+        search.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_returns_search_results(self) -> None:
+        """Scoped recall surfaces whatever the search strategy returns.
+
+        Integration-style smoke: wiring through the facade must preserve
+        the HybridResult list produced by the search strategy so
+        callers can render the matches directly.
+        """
+        store = _mock_store()
+        store.find_space.return_value = Space(
+            id="sp-alpha", project_id=PROJECT_ID, name="alpha"
+        )
+        search = _mock_search()
+        search.search.return_value = [_make_hybrid_result()]
+        m = _make_memex(store=store, search=search)
+
+        results = await m.recall_scoped(
+            "q",
+            project_id=PROJECT_ID,
+            space_names=["alpha"],
+        )
+
+        assert len(list(results)) == 1
+
+
 class TestMemexRevise:
     """Verify Memex.revise delegates to IngestService.revise."""
 

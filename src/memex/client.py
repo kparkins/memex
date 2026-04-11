@@ -284,6 +284,65 @@ class Memex:
             )
         )
 
+    async def recall_scoped(
+        self,
+        query: str,
+        *,
+        project_id: str,
+        space_names: Sequence[str] | None = None,
+        limit: int = 10,
+        memory_limit: int = 3,
+    ) -> Sequence[SearchResult]:
+        """Hybrid recall restricted to a whitelist of spaces within a project.
+
+        Resolves each name in ``space_names`` to a top-level space id via
+        the underlying store's ``find_space`` primitive, then forwards a
+        ``SearchRequest`` whose ``space_ids`` field drives the extra
+        ``$match`` stage in :class:`~memex.retrieval.mongo_hybrid.MongoHybridSearch`.
+        The filter leverages the denormalized ``space_id`` on revisions
+        (see ``me-revision-space-denorm`` Phase A), so the scoped recall
+        path remains index-covered.
+
+        When ``space_names`` is ``None`` the call degrades to an
+        unscoped ``recall`` -- useful for callers that sometimes want to
+        widen the query. When ``space_names`` is provided but every name
+        fails to resolve within the project (e.g. the space does not
+        exist yet), the method returns an empty sequence rather than
+        silently widening to project scope, so a typo never leaks
+        cross-space results.
+
+        Args:
+            query: Natural-language search string.
+            project_id: Project whose spaces ``space_names`` refer to.
+            space_names: Whitelist of top-level space names within the
+                project. ``None`` disables scoping.
+            limit: Maximum per-branch candidates.
+            memory_limit: Maximum unique items in results.
+
+        Returns:
+            Search results ordered by descending relevance, restricted
+            to the resolved spaces when ``space_names`` is provided.
+        """
+        space_ids: tuple[str, ...] | None = None
+        if space_names is not None:
+            resolved: list[str] = []
+            for name in space_names:
+                space = await self._store.find_space(project_id, name)
+                if space is not None:
+                    resolved.append(space.id)
+            if not resolved:
+                return []
+            space_ids = tuple(resolved)
+
+        return await self._search.search(
+            SearchRequest(
+                query=query,
+                limit=limit,
+                memory_limit=memory_limit,
+                space_ids=space_ids,
+            )
+        )
+
     async def revise(self, params: ReviseParams) -> ReviseResult:
         """Create a new revision, advance the tag, and publish events.
 

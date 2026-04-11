@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from pymongo.asynchronous.collection import AsyncCollection
@@ -82,6 +83,28 @@ def _deprecated_filter_stages(
     return stages
 
 
+def _space_filter_stage(
+    space_ids: Sequence[str] | None,
+) -> dict[str, Any] | None:
+    """Build a ``$match`` stage restricting results to the given space ids.
+
+    Relies on the ``space_id`` denormalization introduced by
+    ``me-revision-space-denorm`` Phase A: every revision doc now
+    carries its owning item's ``space_id``, so the filter is a direct
+    field match with no ``$lookup`` required.
+
+    Args:
+        space_ids: Whitelist of space ids. ``None`` disables the filter.
+
+    Returns:
+        A pipeline ``$match`` stage, or ``None`` when filtering is
+        disabled.
+    """
+    if space_ids is None:
+        return None
+    return {"$match": {"space_id": {"$in": list(space_ids)}}}
+
+
 class MongoHybridSearch:
     """Hybrid retrieval strategy for MongoDB Atlas Search + Vector Search.
 
@@ -143,21 +166,24 @@ class MongoHybridSearch:
         dep_stages = _deprecated_filter_stages(
             self._items_name, request.include_deprecated
         )
+        space_stage = _space_filter_stage(request.space_ids)
 
         candidates: dict[str, dict[str, Any]] = {}
 
         if search_mode == SearchMode.HYBRID:
             lex_docs, vec_docs = await asyncio.gather(
-                self._run_lexical(search_query, request, dep_stages),
-                self._run_vector(request, dep_stages),
+                self._run_lexical(search_query, request, dep_stages, space_stage),
+                self._run_vector(request, dep_stages, space_stage),
             )
             self._collect(candidates, lex_docs, "lexical", request.beta)
             self._collect(candidates, vec_docs, "vector", request.beta)
         elif search_mode == SearchMode.LEXICAL:
-            lex_docs = await self._run_lexical(search_query, request, dep_stages)
+            lex_docs = await self._run_lexical(
+                search_query, request, dep_stages, space_stage
+            )
             self._collect(candidates, lex_docs, "lexical", request.beta)
         else:
-            vec_docs = await self._run_vector(request, dep_stages)
+            vec_docs = await self._run_vector(request, dep_stages, space_stage)
             self._collect(candidates, vec_docs, "vector", request.beta)
 
         return _fuse_and_limit(candidates, weights, search_mode, request.memory_limit)
@@ -167,6 +193,7 @@ class MongoHybridSearch:
         search_query: str,
         request: SearchRequest,
         dep_stages: list[dict[str, Any]],
+        space_stage: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         """Run the Atlas Search lexical pipeline.
 
@@ -174,6 +201,8 @@ class MongoHybridSearch:
             search_query: Sanitized fulltext query string.
             request: Search parameters for limit / deprecated settings.
             dep_stages: Pre-built $lookup + $match stages.
+            space_stage: Optional ``$match`` stage restricting results to
+                a whitelist of denormalized ``space_id`` values.
 
         Returns:
             List of raw aggregation result documents.
@@ -195,9 +224,11 @@ class MongoHybridSearch:
                     "_source": "lexical",
                 }
             },
-            *dep_stages,
-            {"$limit": request.limit},
         ]
+        if space_stage is not None:
+            pipeline.append(space_stage)
+        pipeline.extend(dep_stages)
+        pipeline.append({"$limit": request.limit})
         cursor = await self._revisions.aggregate(pipeline)
         return [doc async for doc in cursor]
 
@@ -205,15 +236,19 @@ class MongoHybridSearch:
         self,
         request: SearchRequest,
         dep_stages: list[dict[str, Any]],
+        space_stage: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         """Run the Atlas Vector Search pipeline.
 
         ``$vectorSearch`` must be the first stage in the pipeline
-        (MongoDB requirement).
+        (MongoDB requirement), so the space filter is applied as the
+        immediately-following ``$match`` stage.
 
         Args:
             request: Search parameters (embedding, limit, deprecated).
             dep_stages: Pre-built $lookup + $match stages.
+            space_stage: Optional ``$match`` stage restricting results to
+                a whitelist of denormalized ``space_id`` values.
 
         Returns:
             List of raw aggregation result documents.
@@ -239,8 +274,10 @@ class MongoHybridSearch:
                     "_source": "vector",
                 }
             },
-            *dep_stages,
         ]
+        if space_stage is not None:
+            pipeline.append(space_stage)
+        pipeline.extend(dep_stages)
         cursor = await self._revisions.aggregate(pipeline)
         return [doc async for doc in cursor]
 
