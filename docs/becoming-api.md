@@ -14,6 +14,28 @@ The canonical Project and Space names used by these helpers are
 defined in `memex.conventions` (see `BECOMING_PROJECT_NAME`,
 `AGENT_MEMORY_SPACE`, `KB_SPACE`, `NUTRITION_SPACE`).
 
+## Project helpers
+
+### `Memex.get_or_create_project(name) -> Project`
+
+Idempotently resolve or create a `Project` by human-readable name.
+Delegates to the store's atomic `resolve_project` primitive so
+concurrent callers converge on the same `Project.id` rather than
+producing duplicate nodes or documents. Repeated calls with the same
+`name` return a Project with the same `id`.
+
+Arguments:
+
+- `name` -- Human-readable project name, typically the becoming
+  Project name from `memex.conventions.BECOMING_PROJECT_NAME`
+  (e.g. `"jeeves"`).
+
+Returns the resolved or newly created `Project` domain model.
+
+Used by the Phase D bootstrap routine `be-bootstrap-memex-project`
+to provision the canonical becoming Project on first boot, before
+any `get_or_create_space` calls that require a `Project.id`.
+
 ## Space helpers
 
 ### `Memex.get_or_create_space(name, project_id, parent_space_id=None) -> Space`
@@ -36,3 +58,187 @@ Returns the resolved or newly created `Space` domain model.
 Used by the Phase D consumers `be-bootstrap-memex-project`,
 `be-kb-module`, and `be-nutrition-module-wrapper` to provision the
 canonical Spaces listed in `memex.conventions.BECOMING_SPACE_NAMES`.
+
+## Content card helpers
+
+### `attach_card_artifact`
+
+Signature:
+
+```python
+from memex.helpers.becoming import attach_card_artifact
+from memex.stores.protocols import Ingestor
+
+async def attach_card_artifact(
+    store: Ingestor,
+    space_id: str,
+    item_name: str,
+    summary: str,
+    artifact_location: str,
+    *,
+    artifact_name: str = "card",
+    metadata: dict[str, str | int | float | bool] | None = None,
+) -> tuple[Item, Artifact]: ...
+```
+
+Materializes a rendered content card as an immutable memex record. It
+creates a standalone `Item` with `kind=FACT` in the given Space, writes
+an initial `Revision` containing `summary` as both content and
+`search_text`, attaches an `"active"` `Tag` to that Revision, and
+finally attaches a pointer-only `Artifact` whose `location` resolves to
+the caller-owned snapshot document.
+
+### Why
+
+Per Decision #17 (becoming-merge-plan, 2026-04-11), renderer code is
+mutable — macros evolve, primitives change, design tokens shift — but
+historical records must be immutable. Materializing the rendered blocks
+at snapshot time locks in the view as it was shown, so recall returns
+the faithful original rather than a re-render against a
+potentially-evolved renderer.
+
+The memex side only creates the Item + Revision + Artifact triple. The
+caller (Phase D becoming code, starting with `be-kb-module`) writes the
+snapshot document first and passes the resolved URI in. No new
+`ItemKind` values are introduced: the existing `FACT` kind plus the
+existing `memex.Artifact` domain class cover the whole flow, and the
+CI check that forbids new `ItemKind` members stays valid.
+
+### Becoming-side example
+
+```python
+from uuid import uuid4
+
+from memex import Memex
+from memex.conventions import BECOMING_PROJECT_NAME, KB_SPACE
+from memex.helpers.becoming import attach_card_artifact
+
+
+async def snapshot_card(
+    memex: Memex,
+    becoming_db,  # pymongo AsyncDatabase for the becoming side
+    card_blocks: list[dict],
+    card_summary: str,
+) -> str:
+    """Freeze a rendered card and register it in memex.
+
+    Returns the memex Item id of the new record.
+    """
+    # 1. Write the snapshot document first so the URI resolves.
+    snapshot_id = str(uuid4())
+    await becoming_db["card_snapshots"].insert_one(
+        {
+            "_id": snapshot_id,
+            "blocks": card_blocks,
+            "renderer_version": 1,
+        }
+    )
+    artifact_location = f"mongodb://becoming/card_snapshots/{snapshot_id}"
+
+    # 2. Resolve the target Space via the canonical naming constants.
+    project = await memex.get_or_create_project(BECOMING_PROJECT_NAME)
+    space = await memex.get_or_create_space(project.id, KB_SPACE)
+
+    # 3. Materialize the memex triple (Item + Revision + Artifact).
+    item, _artifact = await attach_card_artifact(
+        memex.store,
+        space.id,
+        item_name=f"card-{snapshot_id}",
+        summary=card_summary,
+        artifact_location=artifact_location,
+        metadata={"renderer_version": 1, "block_count": len(card_blocks)},
+    )
+    return item.id
+```
+
+On later recall, walking from the `Item` to its latest `Revision` and
+calling `store.get_artifact_by_name(revision_id, "card")` returns the
+Artifact record. Its `location` field re-resolves to the original
+snapshot document in `card_snapshots`, guaranteeing a byte-identical
+view of the card as it was first shown.
+
+## Search index helpers
+
+### `ensure_search_indexes(db)` — provision Atlas Search / mongot indexes
+
+**Module:** `memex.stores.mongo_store`
+**Since:** `me-ensure-search-indexes` (Phase A)
+
+Idempotently creates the two Memex search indexes on the `revisions`
+collection:
+
+| Index name             | Type           | Purpose                                      |
+|------------------------|----------------|----------------------------------------------|
+| `revision_search_text` | lexical        | `$search` against `content` and `title`      |
+| `revision_embedding`   | `vectorSearch` | `$vectorSearch` against `embedding` (1536-d) |
+
+Both names are exported as module constants (`FULLTEXT_INDEX_NAME`,
+`VECTOR_INDEX_NAME`) so retrieval code and the provisioning code cannot
+drift.
+
+#### Usage
+
+```python
+from pymongo import AsyncMongoClient
+
+from memex.stores.mongo_store import (
+    ensure_indexes,
+    ensure_search_indexes,
+    wait_until_queryable,
+    FULLTEXT_INDEX_NAME,
+    VECTOR_INDEX_NAME,
+)
+
+client = AsyncMongoClient(uri)
+db = client.memex
+
+# Regular B-tree indexes first -- they are cheap and synchronous.
+await ensure_indexes(db)
+
+# Search indexes are async on the mongot side: createSearchIndexes
+# returns well before the Lucene segments are built.
+await ensure_search_indexes(db)
+
+# Gate application startup on queryability before issuing $search /
+# $vectorSearch stages. Cold builds typically take 10-60s on an empty
+# collection; the default 120s budget is usually sufficient.
+await wait_until_queryable(db.revisions, FULLTEXT_INDEX_NAME)
+await wait_until_queryable(db.revisions, VECTOR_INDEX_NAME)
+```
+
+#### Idempotency
+
+`ensure_search_indexes` is safe to call repeatedly. On each call it:
+
+1. Lists existing search indexes via `$listSearchIndexes`.
+2. Creates any missing index via `createSearchIndexes`.
+3. Calls `updateSearchIndex` if an existing index's `latestDefinition`
+   does not match the canonical definition (definition drift).
+4. Raises `SearchIndexBuildError` if an existing index is in `FAILED`
+   state — callers must drop the index explicitly, not silently retry.
+
+#### Failure handling
+
+Two typed exceptions surface mongot build errors:
+
+- `SearchIndexBuildError` — the index's `status` is `FAILED`. The
+  exception carries `index_name` and the mongot-reported `message`
+  field. Common causes: invalid analyzer name, wrong vector
+  dimensionality, malformed `fields` array (see
+  `docs/mongot-primer.md` §5.4).
+- `TimeoutError` — `wait_until_queryable` did not observe
+  `queryable: true` within its budget. The index is still building or
+  stuck in `PENDING`.
+
+Never silently retry either exception; both indicate a definition
+problem or a mongot-side failure that needs operator attention.
+
+#### Version / environment requirements
+
+- pymongo >= 4.5 (for `AsyncCollection.create_search_indexes`)
+- mongod >= 8.0 (tarball) or >= 8.2.0 (docker preview)
+- mongot sidecar running alongside mongod (`mongodb-community-search`)
+- mongod running as a replica set — standalone is not supported
+
+See `docs/mongot-primer.md` and `docs/mongot-index-provisioning.md`
+for deployment details and common failure modes.
