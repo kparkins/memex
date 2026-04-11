@@ -264,6 +264,36 @@ class MongoStore:
             return None
         return Project.model_validate(doc)
 
+    async def resolve_project(self, name: str) -> Project:
+        """Find an existing project by name or atomically create one.
+
+        Uses ``find_one_and_update`` with ``upsert=True`` to eliminate
+        the TOCTOU race in a find-then-create pattern. Safe under the
+        ``projects.name`` unique index.
+
+        Args:
+            name: Human-readable project name.
+
+        Returns:
+            Resolved or newly created Project.
+        """
+        now = utcnow()
+        new_id_val = new_id()
+        on_insert: dict[str, Any] = {
+            "_id": new_id_val,
+            "id": new_id_val,
+            "name": name,
+            "created_at": format_utc(now),
+            "metadata": {},
+        }
+        doc = await self._db.projects.find_one_and_update(
+            {"name": name},
+            {"$setOnInsert": on_insert},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return Project.model_validate(doc)
+
     # -- Space ----------------------------------------------------------------
 
     async def resolve_space(

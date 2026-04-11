@@ -73,6 +73,25 @@ class StorePersistenceError(Exception):
 
 
 @runtime_checkable
+class ProjectResolver(Protocol):
+    """Resolve or create projects by human-readable name."""
+
+    async def resolve_project(self, name: str) -> Project:
+        """Find an existing project by name or atomically create one.
+
+        Concurrent callers must converge on the same ``Project.id``
+        rather than producing duplicate nodes/documents.
+
+        Args:
+            name: Human-readable project name.
+
+        Returns:
+            Resolved or newly created Project.
+        """
+        ...
+
+
+@runtime_checkable
 class SpaceResolver(Protocol):
     """Resolve or create spaces within a project."""
 
@@ -584,6 +603,7 @@ class AuditStore(Protocol):
 
 @runtime_checkable
 class MemoryStore(
+    ProjectResolver,
     SpaceResolver,
     Ingestor,
     ItemStore,
