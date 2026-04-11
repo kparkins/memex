@@ -124,6 +124,13 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
     await db.revisions.create_index(
         [("item_id", ASCENDING), ("created_at", DESCENDING)]
     )
+    # Denormalized space_id on revisions (me-revision-space-denorm Phase A).
+    # Enables scoped recall queries that filter by space without a join
+    # against items. Ordered (space_id, created_at) so timeline scans stay
+    # index-covered.
+    await db.revisions.create_index(
+        [("space_id", ASCENDING), ("created_at", DESCENDING)]
+    )
 
     # tags
     await db.tags.create_index(
@@ -166,6 +173,45 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
         "expires_at",
         expireAfterSeconds=WORKING_MEMORY_TTL_EXPIRE_AFTER_SECONDS,
     )
+
+
+# -- Migration: backfill revision.space_id -----------------------------------
+
+
+async def backfill_revision_space_id(db: AsyncDatabase) -> int:
+    """Denormalize ``item.space_id`` onto existing revision documents.
+
+    Idempotent one-shot migration for the ``me-revision-space-denorm``
+    Phase A denormalization. Iterates every item and writes its
+    ``space_id`` onto all of its revisions where the field is still
+    missing. Revisions whose parent item has a ``null`` ``space_id``
+    inherit that ``null`` verbatim: the migration never fabricates a
+    space for an item that has none.
+
+    Decision #28 (dev data expendable) allows fresh installs to simply
+    drop-and-reseed the revisions collection; this function is the
+    corresponding one-liner for instances that already hold data. It is
+    safe to call on an empty database: the items cursor is empty and
+    no writes occur.
+
+    Args:
+        db: Target ``AsyncDatabase`` with ``items`` and ``revisions``
+            collections.
+
+    Returns:
+        Total number of revision documents updated.
+    """
+    total_updated = 0
+    cursor = db.items.find({}, {"_id": 1, "space_id": 1})
+    async for item_doc in cursor:
+        item_id = item_doc["_id"]
+        space_id = item_doc.get("space_id")
+        result = await db.revisions.update_many(
+            {"item_id": item_id, "space_id": {"$exists": False}},
+            {"$set": {"space_id": space_id}},
+        )
+        total_updated += result.modified_count
+    return total_updated
 
 
 # -- Store class --------------------------------------------------------------
@@ -374,8 +420,11 @@ class MongoStore:
         # Item
         await self._db.items.insert_one(_to_doc(item), session=session)
 
-        # Revision
-        await self._db.revisions.insert_one(_to_doc(revision), session=session)
+        # Revision (denormalize item.space_id onto the revision doc so
+        # space-scoped queries can filter without a join)
+        rev_doc = _to_doc(revision)
+        rev_doc["space_id"] = item.space_id
+        await self._db.revisions.insert_one(rev_doc, session=session)
 
         # Tags + TagAssignments
         assignments: list[TagAssignment] = []
@@ -617,8 +666,19 @@ class MongoStore:
                 tag_id = tag_doc["id"]
                 prev_revision_id = tag_doc["revision_id"]
 
-                # Insert new revision
-                await self._db.revisions.insert_one(_to_doc(revision), session=session)
+                # Load the item to denormalize space_id onto the new revision
+                item_doc = await self._db.items.find_one(
+                    {"_id": item_id},
+                    {"space_id": 1},
+                    session=session,
+                )
+                if item_doc is None:
+                    raise ValueError(f"Item {item_id} not found")
+
+                # Insert new revision with denormalized space_id
+                rev_doc = _to_doc(revision)
+                rev_doc["space_id"] = item_doc.get("space_id")
+                await self._db.revisions.insert_one(rev_doc, session=session)
 
                 # SUPERSEDES edge
                 supersedes_edge = Edge(

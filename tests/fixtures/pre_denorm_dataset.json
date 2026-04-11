@@ -1,0 +1,31 @@
+{
+  "_comment": "Pre-denormalization snapshot for me-revision-space-denorm Phase A. Revisions intentionally lack the space_id field to simulate an instance created before the denormalization migration. Five items span three spaces, and item item-orphan has a NULL space_id (edge case: the migration must inherit that null from the parent item rather than crash or fabricate a space). Fixture was hand-authored; do not regenerate.",
+  "spaces": [
+    {"_id": "space-a", "id": "space-a", "project_id": "proj-1", "name": "alpha", "_parent_key": "__ROOT__"},
+    {"_id": "space-b", "id": "space-b", "project_id": "proj-1", "name": "beta", "_parent_key": "__ROOT__"},
+    {"_id": "space-c", "id": "space-c", "project_id": "proj-1", "name": "gamma", "_parent_key": "__ROOT__"}
+  ],
+  "items": [
+    {"_id": "item-1", "id": "item-1", "space_id": "space-a", "name": "note-1", "kind": "fact", "deprecated": false},
+    {"_id": "item-2", "id": "item-2", "space_id": "space-a", "name": "note-2", "kind": "decision", "deprecated": false},
+    {"_id": "item-3", "id": "item-3", "space_id": "space-b", "name": "note-3", "kind": "fact", "deprecated": false},
+    {"_id": "item-4", "id": "item-4", "space_id": "space-c", "name": "note-4", "kind": "reflection", "deprecated": false},
+    {"_id": "item-orphan", "id": "item-orphan", "space_id": null, "name": "orphan", "kind": "system", "deprecated": false}
+  ],
+  "revisions": [
+    {"_id": "rev-1a", "id": "rev-1a", "item_id": "item-1", "revision_number": 1, "content": "alpha one r1", "search_text": "alpha one r1"},
+    {"_id": "rev-1b", "id": "rev-1b", "item_id": "item-1", "revision_number": 2, "content": "alpha one r2", "search_text": "alpha one r2"},
+    {"_id": "rev-2", "id": "rev-2", "item_id": "item-2", "revision_number": 1, "content": "alpha two r1", "search_text": "alpha two r1"},
+    {"_id": "rev-3", "id": "rev-3", "item_id": "item-3", "revision_number": 1, "content": "beta three r1", "search_text": "beta three r1"},
+    {"_id": "rev-4", "id": "rev-4", "item_id": "item-4", "revision_number": 1, "content": "gamma four r1", "search_text": "gamma four r1"},
+    {"_id": "rev-orphan", "id": "rev-orphan", "item_id": "item-orphan", "revision_number": 1, "content": "orphan r1", "search_text": "orphan r1"}
+  ],
+  "expected_post_migration_space_ids": {
+    "rev-1a": "space-a",
+    "rev-1b": "space-a",
+    "rev-2": "space-a",
+    "rev-3": "space-b",
+    "rev-4": "space-c",
+    "rev-orphan": null
+  }
+}
