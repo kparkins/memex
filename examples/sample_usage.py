@@ -22,7 +22,7 @@ from redis.asyncio import Redis
 from memex import Memex
 from memex.config import Neo4jSettings, RedisSettings
 from memex.domain.edges import EdgeType
-from memex.domain.models import ItemKind, Project, Revision
+from memex.domain.models import ItemKind, Revision
 from memex.orchestration.ingest import (
     ArtifactSpec,
     EdgeSpec,
@@ -49,11 +49,10 @@ SPACE_NAME = "engineering"
 
 async def facade_demo() -> None:
     """Demonstrate the high-level Memex facade."""
-    async with Memex.from_env() as m:
-        # Ensure project exists via direct store access
-        existing = await m.store.get_project_by_name(PROJECT_ID)
-        if existing is None:
-            await m.store.create_project(Project(name=PROJECT_ID))
+    m = Memex.from_env()
+    try:
+        # Ensure project exists (idempotent)
+        await m.create_project(PROJECT_ID)
 
         # Ingest a memory
         result = await m.ingest(
@@ -91,6 +90,8 @@ async def facade_demo() -> None:
         # Look up by path
         item = await m.get_item_by_path(PROJECT_ID, SPACE_NAME, "facade-fact", "fact")
         logger.info("Facade lookup: %s", item.name if item else "not found")
+    finally:
+        await m.close()
 
 
 # ---------------------------------------------------------------------------

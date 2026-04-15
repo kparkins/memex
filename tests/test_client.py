@@ -487,8 +487,8 @@ class TestMemexRevise:
         store.revise_item.assert_awaited_once()
 
 
-class TestMemexGetOrCreateProject:
-    """Verify Memex.get_or_create_project delegates and is idempotent."""
+class TestMemexCreateProject:
+    """Verify Memex.create_project delegates and is idempotent."""
 
     @pytest.mark.asyncio
     async def test_delegates_to_store_resolve_project(self) -> None:
@@ -496,7 +496,7 @@ class TestMemexGetOrCreateProject:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        project = await m.get_or_create_project(PROJECT_NAME)
+        project = await m.create_project(PROJECT_NAME)
 
         assert project.id == PROJECT_ID
         assert project.name == PROJECT_NAME
@@ -508,8 +508,8 @@ class TestMemexGetOrCreateProject:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        first = await m.get_or_create_project(PROJECT_NAME)
-        second = await m.get_or_create_project(PROJECT_NAME)
+        first = await m.create_project(PROJECT_NAME)
+        second = await m.create_project(PROJECT_NAME)
 
         assert first.id == second.id
         assert first.name == second.name
@@ -521,9 +521,37 @@ class TestMemexGetOrCreateProject:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        result = await m.get_or_create_project(PROJECT_NAME)
+        result = await m.create_project(PROJECT_NAME)
 
         assert isinstance(result, Project)
+
+
+class TestMemexGetProject:
+    """Verify Memex.get_project delegates to store.get_project_by_name."""
+
+    @pytest.mark.asyncio
+    async def test_returns_project_when_found(self) -> None:
+        """get_project returns the store's Project when one exists."""
+        store = _mock_store()
+        found = Project(id="p-1", name=PROJECT_NAME)
+        store.get_project_by_name.return_value = found
+        m = _make_memex(store=store)
+
+        result = await m.get_project(PROJECT_NAME)
+
+        assert result is found
+        store.get_project_by_name.assert_awaited_once_with(PROJECT_NAME)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_missing(self) -> None:
+        """get_project returns None when the store has no such project."""
+        store = _mock_store()
+        store.get_project_by_name.return_value = None
+        m = _make_memex(store=store)
+
+        result = await m.get_project("missing")
+
+        assert result is None
 
 
 class TestMemexGetItem:
@@ -552,8 +580,8 @@ class TestMemexGetItem:
         assert result is None
 
 
-class TestMemexGetOrCreateSpace:
-    """Verify Memex.get_or_create_space delegates and is idempotent."""
+class TestMemexCreateSpace:
+    """Verify Memex.create_space delegates and is idempotent."""
 
     @pytest.mark.asyncio
     async def test_delegates_to_store_resolve_space(self) -> None:
@@ -561,7 +589,7 @@ class TestMemexGetOrCreateSpace:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        space = await m.get_or_create_space(SPACE_NAME, PROJECT_ID)
+        space = await m.create_space(SPACE_NAME, PROJECT_ID)
 
         assert space.id == "sp-1"
         assert space.name == SPACE_NAME
@@ -578,7 +606,7 @@ class TestMemexGetOrCreateSpace:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        await m.get_or_create_space(SPACE_NAME, PROJECT_ID, parent_space_id="sp-root")
+        await m.create_space(SPACE_NAME, PROJECT_ID, parent_space_id="sp-root")
 
         store.resolve_space.assert_awaited_once_with(
             project_id=PROJECT_ID,
@@ -592,13 +620,41 @@ class TestMemexGetOrCreateSpace:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        first = await m.get_or_create_space(SPACE_NAME, PROJECT_ID)
-        second = await m.get_or_create_space(SPACE_NAME, PROJECT_ID)
+        first = await m.create_space(SPACE_NAME, PROJECT_ID)
+        second = await m.create_space(SPACE_NAME, PROJECT_ID)
 
         assert first.id == second.id
         assert first.project_id == second.project_id
         assert first.name == second.name
         assert store.resolve_space.await_count == 2
+
+
+class TestMemexGetSpace:
+    """Verify Memex.get_space delegates to store.find_space."""
+
+    @pytest.mark.asyncio
+    async def test_returns_space_when_found(self) -> None:
+        """get_space returns the store's Space when one exists."""
+        store = _mock_store()
+        found = Space(id="sp-1", project_id=PROJECT_ID, name=SPACE_NAME)
+        store.find_space.return_value = found
+        m = _make_memex(store=store)
+
+        result = await m.get_space(SPACE_NAME, PROJECT_ID)
+
+        assert result is found
+        store.find_space.assert_awaited_once_with(PROJECT_ID, SPACE_NAME)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_missing(self) -> None:
+        """get_space returns None when the store has no such space."""
+        store = _mock_store()
+        store.find_space.return_value = None
+        m = _make_memex(store=store)
+
+        result = await m.get_space("nope", PROJECT_ID)
+
+        assert result is None
 
 
 class TestMemexGetItemByPath:
@@ -626,17 +682,6 @@ class TestMemexGetItemByPath:
         result = await m.get_item_by_path(PROJECT_ID, "nope", "item", "fact")
 
         assert result is None
-
-
-class TestMemexStoreProperty:
-    """Verify the store property exposes the underlying store."""
-
-    def test_store_property(self) -> None:
-        """store property returns the injected store."""
-        store = _mock_store()
-        m = _make_memex(store=store)
-
-        assert m.store is store
 
 
 class TestMemexClose:
@@ -671,25 +716,6 @@ class TestMemexClose:
 
         await m.close()
         await m.close()  # second call is no-op
-
-
-class TestMemexContextManager:
-    """Verify async context manager behavior."""
-
-    @pytest.mark.asyncio
-    async def test_context_manager(self) -> None:
-        """Async with closes on exit."""
-        m = _make_memex()
-        driver = AsyncMock()
-        redis = AsyncMock()
-        m._driver = driver
-        m._redis = redis
-
-        async with m:
-            pass
-
-        driver.close.assert_awaited_once()
-        redis.aclose.assert_awaited_once()
 
 
 class TestMemexFromSettings:

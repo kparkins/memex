@@ -661,17 +661,16 @@ uv run python examples/sample_usage.py
 ```python
 import asyncio
 from memex import Memex
-from memex.domain.models import ItemKind, Project
+from memex.domain.models import ItemKind
 from memex.orchestration.ingest import IngestParams, ReviseParams, EdgeSpec
 from memex.domain.edges import EdgeType
 
 async def main():
     # Connect to Neo4j + Redis using environment variables
-    async with Memex.from_env() as m:
-
-        # Ensure project exists
-        if await m.store.get_project_by_name("my-project") is None:
-            await m.store.create_project(Project(name="my-project"))
+    m = Memex.from_env()
+    try:
+        # Ensure project exists (idempotent)
+        await m.create_project("my-project")
 
         # --- Ingest a fact ---
         result = await m.ingest(IngestParams(
@@ -716,6 +715,8 @@ async def main():
             "my-project", "engineering", "cache-ttl", "fact"
         )
         print(f"Found: {item.name}" if item else "Not found")
+    finally:
+        await m.close()
 
 asyncio.run(main())
 ```
