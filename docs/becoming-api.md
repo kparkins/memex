@@ -16,7 +16,7 @@ defined in `memex.conventions` (see `BECOMING_PROJECT_NAME`,
 
 ## Project helpers
 
-### `Memex.get_or_create_project(name) -> Project`
+### `Memex.create_project(name) -> Project`
 
 Idempotently resolve or create a `Project` by human-readable name.
 Delegates to the store's atomic `resolve_project` primitive so
@@ -34,11 +34,11 @@ Returns the resolved or newly created `Project` domain model.
 
 Used by the Phase D bootstrap routine `be-bootstrap-memex-project`
 to provision the canonical becoming Project on first boot, before
-any `get_or_create_space` calls that require a `Project.id`.
+any `create_space` calls that require a `Project.id`.
 
 ## Space helpers
 
-### `Memex.get_or_create_space(name, project_id, parent_space_id=None) -> Space`
+### `Memex.create_space(name, project_id, parent_space_id=None) -> Space`
 
 Idempotently resolve or create a `Space` within a project. Delegates
 to the store's atomic `resolve_space` primitive so concurrent callers
@@ -136,8 +136,8 @@ async def snapshot_card(
     artifact_location = f"mongodb://becoming/card_snapshots/{snapshot_id}"
 
     # 2. Resolve the target Space via the canonical naming constants.
-    project = await memex.get_or_create_project(BECOMING_PROJECT_NAME)
-    space = await memex.get_or_create_space(project.id, KB_SPACE)
+    project = await memex.create_project(BECOMING_PROJECT_NAME)
+    space = await memex.create_space(project.id, KB_SPACE)
 
     # 3. Materialize the memex triple (Item + Revision + Artifact).
     item, _artifact = await attach_card_artifact(

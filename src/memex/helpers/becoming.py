@@ -1,7 +1,7 @@
 """Helpers used by the becoming agent when talking to memex.
 
-Seed module for downstream work (``get_or_create_project``,
-``get_or_create_space``, ``attach_card_artifact``). Pulls the
+Seed module for downstream work (``create_project``,
+``create_space``, ``attach_card_artifact``). Pulls the
 canonical Project and Space names from :mod:`memex.conventions`
 so call sites never hard-code strings.
 """
@@ -24,8 +24,8 @@ def default_space_pairs() -> tuple[tuple[str, str], ...]:
 
     Bootstrap routines iterate this tuple to seed the canonical
     Project and its three Spaces on first boot. Each pair feeds a
-    ``get_or_create_project`` call followed by a
-    ``get_or_create_space`` call downstream.
+    ``create_project`` call followed by a
+    ``create_space`` call downstream.
 
     Returns:
         Ordered tuple of ``(project_name, space_name)`` pairs, one per

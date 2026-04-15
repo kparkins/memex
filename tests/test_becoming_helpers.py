@@ -3,8 +3,8 @@
 Covers every helper that the becoming agent consumes from memex:
 
 - ``memex.helpers.becoming.default_space_pairs``
-- ``Memex.get_or_create_project`` (idempotent project bootstrap)
-- ``Memex.get_or_create_space`` (idempotent space bootstrap)
+- ``Memex.create_project`` (idempotent project bootstrap)
+- ``Memex.create_space`` (idempotent space bootstrap)
 - ``Memex.recall_scoped`` without ``include_edges`` (plain scoped recall)
 - ``Memex.recall_scoped`` with ``include_edges=True`` (cross-Space edge
   traversal, including the U7 pre-seeded-edge assertion)
@@ -458,19 +458,19 @@ class TestDefaultSpacePairs:
         assert NUTRITION_SPACE in space_names
 
 
-# -- TestGetOrCreateProject ---------------------------------------------------
+# -- TestCreateProject ---------------------------------------------------
 
 
-class TestGetOrCreateProject:
-    """Verify ``Memex.get_or_create_project`` is idempotent and delegates."""
+class TestCreateProject:
+    """Verify ``Memex.create_project`` is idempotent and delegates."""
 
     @pytest.mark.asyncio
     async def test_delegates_to_store_resolve_project(self) -> None:
-        """``get_or_create_project`` forwards the name to the store."""
+        """``create_project`` forwards the name to the store."""
         store = _mock_store()
         m = _make_memex(store=store)
 
-        project = await m.get_or_create_project(_PROJECT_NAME)
+        project = await m.create_project(_PROJECT_NAME)
 
         assert project.id == _PROJECT_ID
         assert project.name == _PROJECT_NAME
@@ -481,7 +481,7 @@ class TestGetOrCreateProject:
         """Returned value is a ``Project`` instance."""
         m = _make_memex()
 
-        result = await m.get_or_create_project(_PROJECT_NAME)
+        result = await m.create_project(_PROJECT_NAME)
 
         assert isinstance(result, Project)
 
@@ -491,8 +491,8 @@ class TestGetOrCreateProject:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        first = await m.get_or_create_project(_PROJECT_NAME)
-        second = await m.get_or_create_project(_PROJECT_NAME)
+        first = await m.create_project(_PROJECT_NAME)
+        second = await m.create_project(_PROJECT_NAME)
 
         assert first.id == second.id
         assert store.resolve_project.await_count == 2
@@ -503,25 +503,25 @@ class TestGetOrCreateProject:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        project = await m.get_or_create_project(BECOMING_PROJECT_NAME)
+        project = await m.create_project(BECOMING_PROJECT_NAME)
 
         store.resolve_project.assert_awaited_once_with(name=BECOMING_PROJECT_NAME)
         assert project.name == BECOMING_PROJECT_NAME
 
 
-# -- TestGetOrCreateSpace -----------------------------------------------------
+# -- TestCreateSpace -----------------------------------------------------
 
 
-class TestGetOrCreateSpace:
-    """Verify ``Memex.get_or_create_space`` is idempotent and delegates."""
+class TestCreateSpace:
+    """Verify ``Memex.create_space`` is idempotent and delegates."""
 
     @pytest.mark.asyncio
     async def test_delegates_to_store_resolve_space(self) -> None:
-        """``get_or_create_space`` forwards project_id and name."""
+        """``create_space`` forwards project_id and name."""
         store = _mock_store()
         m = _make_memex(store=store)
 
-        space = await m.get_or_create_space(AGENT_MEMORY_SPACE, _PROJECT_ID)
+        space = await m.create_space(AGENT_MEMORY_SPACE, _PROJECT_ID)
 
         store.resolve_space.assert_awaited_once_with(
             project_id=_PROJECT_ID,
@@ -536,7 +536,7 @@ class TestGetOrCreateSpace:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        await m.get_or_create_space(KB_SPACE, _PROJECT_ID, parent_space_id="sp-root")
+        await m.create_space(KB_SPACE, _PROJECT_ID, parent_space_id="sp-root")
 
         store.resolve_space.assert_awaited_once_with(
             project_id=_PROJECT_ID,
@@ -550,8 +550,8 @@ class TestGetOrCreateSpace:
         store = _mock_store()
         m = _make_memex(store=store)
 
-        first = await m.get_or_create_space(AGENT_MEMORY_SPACE, _PROJECT_ID)
-        second = await m.get_or_create_space(AGENT_MEMORY_SPACE, _PROJECT_ID)
+        first = await m.create_space(AGENT_MEMORY_SPACE, _PROJECT_ID)
+        second = await m.create_space(AGENT_MEMORY_SPACE, _PROJECT_ID)
 
         assert first.id == second.id
         assert store.resolve_space.await_count == 2
@@ -563,7 +563,7 @@ class TestGetOrCreateSpace:
         m = _make_memex(store=store)
 
         for space_name in BECOMING_SPACE_NAMES:
-            await m.get_or_create_space(space_name, _PROJECT_ID)
+            await m.create_space(space_name, _PROJECT_ID)
 
         assert store.resolve_space.await_count == len(BECOMING_SPACE_NAMES)
 

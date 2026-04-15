@@ -7,15 +7,17 @@ Typical usage::
 
     from memex import Memex
 
-    async with Memex.from_env() as m:
+    m = Memex.from_env()
+    try:
         result = await m.ingest(params)
+    finally:
+        await m.close()
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from types import TracebackType
 from typing import TYPE_CHECKING
 
 from memex.config import MemexSettings
@@ -242,11 +244,6 @@ class Memex:
 
     # -- Public API ---------------------------------------------------------
 
-    @property
-    def store(self) -> MemoryStore:
-        """Direct access to the underlying memory store."""
-        return self._store
-
     async def ingest(
         self,
         params: IngestParams,
@@ -384,7 +381,18 @@ class Memex:
         """
         return await self._ingest_service.revise(params)
 
-    async def get_or_create_project(self, name: str) -> Project:
+    async def get_project(self, name: str) -> Project | None:
+        """Look up a project by name.
+
+        Args:
+            name: Human-readable project name.
+
+        Returns:
+            Project if found, None otherwise.
+        """
+        return await self._store.get_project_by_name(name)
+
+    async def create_project(self, name: str) -> Project:
         """Idempotently resolve or create a ``Project`` by name.
 
         Delegates to the store's atomic ``resolve_project`` primitive,
@@ -393,8 +401,7 @@ class Memex:
         return a Project with the same ``id``.
 
         Args:
-            name: Human-readable project name (e.g. the becoming
-                Project name from ``memex.conventions``).
+            name: Human-readable project name.
 
         Returns:
             The resolved or newly created Project.
@@ -412,7 +419,23 @@ class Memex:
         """
         return await self._store.get_item(item_id)
 
-    async def get_or_create_space(
+    async def get_space(
+        self,
+        name: str,
+        project_id: str,
+    ) -> Space | None:
+        """Look up a top-level space by name within a project.
+
+        Args:
+            name: Space name (used in kref paths).
+            project_id: ID of the owning project.
+
+        Returns:
+            Space if found, None otherwise.
+        """
+        return await self._store.find_space(project_id, name)
+
+    async def create_space(
         self,
         name: str,
         project_id: str,
@@ -523,18 +546,3 @@ class Memex:
                     edges.append(edge)
 
         return edges
-
-    # -- Async context manager ----------------------------------------------
-
-    async def __aenter__(self) -> Memex:
-        """Enter the async context manager."""
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> None:
-        """Exit the context manager and close connections."""
-        await self.close()
