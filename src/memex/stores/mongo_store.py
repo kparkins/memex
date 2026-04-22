@@ -24,6 +24,7 @@ from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.asynchronous.database import AsyncDatabase
+from pymongo.errors import OperationFailure
 from pymongo.operations import SearchIndexModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
@@ -80,31 +81,75 @@ _LEXICAL_INDEX_DEFINITION: dict[str, Any] = {
                 "type": "string",
                 "analyzer": _DEFAULT_LEXICAL_ANALYZER,
             },
+            # `_id` must be indexed as a `token` so ``wait_for_doc_indexed``
+            # can poll mongot freshness with an ``equals`` filter. Without
+            # this mapping mongot rejects the query with "Path '_id' needs
+            # to be indexed as token".
+            "_id": {
+                "type": "token",
+            },
         },
     }
 }
 
-_VECTOR_INDEX_DEFINITION: dict[str, Any] = {
-    "fields": [
-        {
-            "type": "vector",
-            "path": _REVISION_EMBEDDING_FIELD,
-            "numDimensions": _DEFAULT_EMBEDDING_DIMENSIONS,
-            "similarity": _VECTOR_SIMILARITY_COSINE,
-        }
-    ]
-}
+def _build_vector_index_definition(dimensions: int) -> dict[str, Any]:
+    """Return a vectorSearch index definition pinned to ``dimensions``.
 
+    Args:
+        dimensions: Vector size the index should accept. Must match
+            the embedding model's output size.
+
+    Returns:
+        A definition dict suitable for a ``SearchIndexModel`` of type
+        ``vectorSearch``.
+    """
+    return {
+        "fields": [
+            {
+                "type": "vector",
+                "path": _REVISION_EMBEDDING_FIELD,
+                "numDimensions": dimensions,
+                "similarity": _VECTOR_SIMILARITY_COSINE,
+            }
+        ]
+    }
+
+
+def build_search_index_definitions(
+    dimensions: int = _DEFAULT_EMBEDDING_DIMENSIONS,
+) -> tuple[dict[str, Any], ...]:
+    """Return the lexical + vector search index specs for a given dimension.
+
+    Args:
+        dimensions: Target vector index dimensionality. Defaults to
+            ``1536`` (OpenAI ``text-embedding-3-small``) for backwards
+            compatibility.
+
+    Returns:
+        Tuple of two specs: the lexical ``$search`` index and the
+        vector ``$vectorSearch`` index, both tagged with ``name``,
+        ``definition``, and (for the vector one) ``type``.
+    """
+    return (
+        {
+            "name": FULLTEXT_INDEX_NAME,
+            "definition": _LEXICAL_INDEX_DEFINITION,
+        },
+        {
+            "name": VECTOR_INDEX_NAME,
+            "type": _VECTOR_SEARCH_INDEX_TYPE,
+            "definition": _build_vector_index_definition(dimensions),
+        },
+    )
+
+
+# Default specs sized for the built-in OpenAI embedding model. Kept as a
+# module-level constant so existing callers (and tests that index into
+# it) continue to work without any changes; callers that need a
+# different vector size should use ``build_search_index_definitions``
+# or pass ``dimensions=`` to :func:`ensure_search_indexes`.
 SEARCH_INDEX_DEFINITIONS: tuple[dict[str, Any], ...] = (
-    {
-        "name": FULLTEXT_INDEX_NAME,
-        "definition": _LEXICAL_INDEX_DEFINITION,
-    },
-    {
-        "name": VECTOR_INDEX_NAME,
-        "type": _VECTOR_SEARCH_INDEX_TYPE,
-        "definition": _VECTOR_INDEX_DEFINITION,
-    },
+    build_search_index_definitions(_DEFAULT_EMBEDDING_DIMENSIONS)
 )
 
 _DEPENDENCY_EDGE_TYPES: frozenset[str] = frozenset(
@@ -296,6 +341,78 @@ class SearchIndexBuildError(RuntimeError):
         self.message = message
 
 
+_DOC_INDEX_WAIT_TIMEOUT_SECONDS = 15.0
+_DOC_INDEX_POLL_INTERVAL_SECONDS = 0.25
+
+
+async def wait_for_doc_indexed(
+    coll: AsyncCollection[Mapping[str, Any]],
+    doc_id: str,
+    *,
+    index_name: str = FULLTEXT_INDEX_NAME,
+    timeout_s: float = _DOC_INDEX_WAIT_TIMEOUT_SECONDS,
+) -> bool:
+    """Block until mongot has indexed a specific document and can serve it.
+
+    Atlas Search / mongot is eventually consistent: a write committed to
+    the primary is not immediately visible to ``$search`` or
+    ``$vectorSearch`` queries -- the mongot sidecar pulls writes from
+    the change stream and rebuilds Lucene segments asynchronously. For
+    demos and tests that ingest-then-query within the same process,
+    callers need a way to wait for that catch-up before querying.
+
+    This polls the lexical index with an ``equals`` filter on ``_id``;
+    because mongot shares the same replication cursor across index
+    types on the same collection, fulltext visibility is a reliable
+    proxy for vector visibility as well.
+
+    Args:
+        coll: Collection whose index should be polled.
+        doc_id: ``_id`` of the just-inserted document to wait on.
+        index_name: Lexical search index to probe. Defaults to the
+            ``revision_search_text`` index provisioned by
+            :func:`ensure_search_indexes`.
+        timeout_s: Maximum wall-clock seconds to wait.
+
+    Returns:
+        ``True`` if the document became visible within the timeout,
+        ``False`` otherwise. Callers that require strict consistency
+        should treat ``False`` as an error; demos can proceed anyway
+        (the lexical-only branch will still work, just without the
+        just-written revision).
+    """
+    deadline = time.monotonic() + timeout_s
+    pipeline = [
+        {
+            "$search": {
+                "index": index_name,
+                "equals": {"path": "_id", "value": doc_id},
+            }
+        },
+        {"$limit": 1},
+        {"$project": {"_id": 1}},
+    ]
+    while time.monotonic() < deadline:
+        try:
+            cursor = await coll.aggregate(pipeline)
+            hits = await cursor.to_list(length=1)
+            if hits:
+                return True
+        except OperationFailure as exc:
+            # After an ``updateSearchIndex`` call, mongot keeps serving
+            # the old definition until it finishes rebuilding. Queries
+            # against a mapping that only exists in the new definition
+            # fail with errors like "Path '_id' needs to be indexed as
+            # token". Treat those as "not ready yet" and keep polling.
+            logger.debug(
+                "wait_for_doc_indexed: index %r not ready yet (%s); retrying",
+                index_name,
+                exc,
+            )
+        await asyncio.sleep(_DOC_INDEX_POLL_INTERVAL_SECONDS)
+    return False
+
+
 async def wait_until_queryable(
     coll: AsyncCollection[Mapping[str, Any]],
     name: str,
@@ -347,10 +464,15 @@ async def _list_existing_search_indexes(
     return existing
 
 
-async def ensure_search_indexes(db: AsyncDatabase[Mapping[str, Any]]) -> None:
+async def ensure_search_indexes(
+    db: AsyncDatabase[Mapping[str, Any]],
+    *,
+    dimensions: int = _DEFAULT_EMBEDDING_DIMENSIONS,
+) -> None:
     """Idempotently provision Memex search indexes on the revisions collection.
 
-    For each canonical index in :data:`SEARCH_INDEX_DEFINITIONS`:
+    Uses :func:`build_search_index_definitions` to size the vector
+    index to the requested ``dimensions``. For each canonical index:
 
     * If the index does not exist, create it via ``createSearchIndexes``.
     * If the index exists with a definition that matches the canonical
@@ -367,15 +489,19 @@ async def ensure_search_indexes(db: AsyncDatabase[Mapping[str, Any]]) -> None:
 
     Args:
         db: AsyncDatabase handle rooted at the Memex database.
+        dimensions: Embedding vector size. Must match what your
+            configured embedding model produces. Defaults to ``1536``
+            for OpenAI ``text-embedding-3-small``.
 
     Raises:
         SearchIndexBuildError: If an existing index reports ``FAILED``.
     """
     coll = db.revisions
     existing = await _list_existing_search_indexes(coll)
+    specs = build_search_index_definitions(dimensions)
 
     to_create: list[SearchIndexModel] = []
-    for spec in SEARCH_INDEX_DEFINITIONS:
+    for spec in specs:
         name = spec["name"]
         current = existing.get(name)
         if current is None:

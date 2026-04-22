@@ -65,11 +65,18 @@ class TestVectorSearchEmbed:
         mock_embed.assert_awaited_once_with(
             model="text-embedding-3-small",
             input=["test text"],
+            encoding_format="float",
             dimensions=1536,
         )
 
     async def test_custom_model_and_dimensions(self) -> None:
-        """Custom model and dimensions are forwarded to the provider."""
+        """Custom (non-OpenAI-v3) models don't receive the dimensions kwarg.
+
+        Providers like Ollama / OpenAI-compatible local servers reject
+        unknown parameters, so ``dimensions`` is forwarded only for
+        OpenAI and Azure ``text-embedding-3-*``. The model name still
+        flows through.
+        """
         fake_response = AsyncMock()
         fake_response.data = [{"embedding": [0.5]}]
 
@@ -90,7 +97,56 @@ class TestVectorSearchEmbed:
         mock_embed.assert_awaited_once_with(
             model="custom-model",
             input=["test"],
-            dimensions=768,
+            encoding_format="float",
+        )
+
+    async def test_dimensions_forwarded_for_openai_v3(self) -> None:
+        """OpenAI text-embedding-3-* receives the dimensions kwarg."""
+        fake_response = AsyncMock()
+        fake_response.data = [{"embedding": [0.5]}]
+
+        with patch(
+            "memex.llm.client.litellm.aembedding",
+            return_value=fake_response,
+        ) as mock_embed:
+            driver = AsyncMock()
+            searcher = VectorSearch(
+                driver,
+                embedding_client=LiteLLMEmbeddingClient(),
+                model="text-embedding-3-large",
+                dimensions=3072,
+            )
+            await searcher.embed("test")
+
+        mock_embed.assert_awaited_once_with(
+            model="text-embedding-3-large",
+            input=["test"],
+            encoding_format="float",
+            dimensions=3072,
+        )
+
+    async def test_api_base_forwarded_when_set(self) -> None:
+        """An api_base override reaches litellm for local-server routing."""
+        fake_response = AsyncMock()
+        fake_response.data = [{"embedding": [0.5]}]
+
+        with patch(
+            "memex.llm.client.litellm.aembedding",
+            return_value=fake_response,
+        ) as mock_embed:
+            client = LiteLLMEmbeddingClient()
+            await client.embed(
+                "test",
+                model="openai/local-model",
+                dimensions=768,
+                api_base="http://localhost:1234/v1",
+            )
+
+        mock_embed.assert_awaited_once_with(
+            model="openai/local-model",
+            input=["test"],
+            encoding_format="float",
+            api_base="http://localhost:1234/v1",
         )
 
     async def test_raises_runtime_error_on_failure(self) -> None:

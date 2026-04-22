@@ -14,6 +14,21 @@ Run:
 Environment overrides (all optional):
     MEMEX_MONGO__URI     -- defaults to mongodb://localhost:27017
     MEMEX_MONGO__DATABASE -- defaults to "memex"
+
+Connecting from the host to the docker-compose cluster:
+    The bundled ``docker-compose-mongo.yml`` enables authentication
+    and initializes a replica set whose sole member is registered
+    with the Docker-internal hostname ``mongod.search-community``.
+    When connecting from the host machine, SDAM discovery will try
+    to reach that hostname and fail DNS resolution. Set the URI to
+    use a direct connection and the admin credentials shipped in
+    the compose file:
+
+        export MEMEX_MONGO__URI='mongodb://admin:admin@localhost:27017/?directConnection=true&authSource=admin'
+
+    Alternatively, add ``127.0.0.1 mongod.search-community`` to
+    ``/etc/hosts`` (then ``directConnection`` is not required) and
+    still supply the admin credentials in the URI.
 """
 
 from __future__ import annotations
@@ -38,6 +53,7 @@ from memex.stores.mongo_store import (
     VECTOR_INDEX_NAME,
     ensure_indexes,
     ensure_search_indexes,
+    wait_for_doc_indexed,
     wait_until_queryable,
 )
 
@@ -62,13 +78,13 @@ async def setup_mongo(settings: MemexSettings) -> None:
     try:
         db = client[settings.mongo.database]
         await ensure_indexes(db)
-        await ensure_search_indexes(db)
+        await ensure_search_indexes(db, dimensions=settings.embedding.dimensions)
         for index_name in (FULLTEXT_INDEX_NAME, VECTOR_INDEX_NAME):
             logger.info("Waiting for search index %r to become queryable", index_name)
             await wait_until_queryable(db.revisions, index_name)
         logger.info("MongoDB indexes ready.")
     finally:
-        client.close()
+        await client.close()
 
 
 async def ingest_examples(m: Memex) -> str:
@@ -147,12 +163,16 @@ async def ingest_examples(m: Memex) -> str:
     return auth.revision.id
 
 
-async def ingest_with_edge(m: Memex, target_revision_id: str) -> None:
+async def ingest_with_edge(m: Memex, target_revision_id: str) -> str:
     """Ingest a reflection that SUPPORTS an earlier revision.
 
     Args:
         m: Live Memex facade.
         target_revision_id: Revision the reflection should reference.
+
+    Returns:
+        The revision id of the reflection (useful for waiting on
+        mongot to index the last write before issuing recall).
     """
     result = await m.ingest(
         IngestParams(
@@ -179,6 +199,7 @@ async def ingest_with_edge(m: Memex, target_revision_id: str) -> None:
         "Ingested reflection with SUPPORTS edge -> %s",
         result.item.id[:8],
     )
+    return result.revision.id
 
 
 async def recall_demo(m: Memex) -> None:
@@ -238,6 +259,94 @@ async def revise_demo(m: Memex) -> None:
     )
 
 
+async def reset_demo_data(settings: MemexSettings) -> None:
+    """Delete every document linked to ``PROJECT_ID`` so reruns stay clean.
+
+    Scopes deletion to this demo's project only -- never drops the
+    database. Deletes in dependency order (edges -> tag assignments ->
+    tags -> revisions -> items -> spaces -> project) so the store's
+    referential layout is left consistent for any sibling data.
+
+    Args:
+        settings: Resolved Memex settings (Mongo URI + database name).
+    """
+    client: AsyncMongoClient = AsyncMongoClient(settings.mongo.uri)
+    try:
+        db = client[settings.mongo.database]
+
+        space_ids = [
+            doc["_id"]
+            async for doc in db.spaces.find(
+                {"project_id": PROJECT_ID}, {"_id": 1}
+            )
+        ]
+        item_ids = [
+            doc["_id"]
+            async for doc in db.items.find(
+                {"space_id": {"$in": space_ids}}, {"_id": 1}
+            )
+        ]
+        revision_ids = [
+            doc["_id"]
+            async for doc in db.revisions.find(
+                {"item_id": {"$in": item_ids}}, {"_id": 1}
+            )
+        ]
+
+        await db.edges.delete_many(
+            {
+                "$or": [
+                    {"source_revision_id": {"$in": revision_ids}},
+                    {"target_revision_id": {"$in": revision_ids}},
+                ]
+            }
+        )
+        await db.tag_assignments.delete_many({"item_id": {"$in": item_ids}})
+        await db.tags.delete_many({"item_id": {"$in": item_ids}})
+        await db.artifacts.delete_many({"revision_id": {"$in": revision_ids}})
+        await db.revisions.delete_many({"item_id": {"$in": item_ids}})
+        await db.items.delete_many({"space_id": {"$in": space_ids}})
+        await db.spaces.delete_many({"project_id": PROJECT_ID})
+        await db.projects.delete_many({"_id": PROJECT_ID})
+
+        logger.info(
+            "Reset demo scope %s: %d space(s), %d item(s), %d revision(s)",
+            PROJECT_ID,
+            len(space_ids),
+            len(item_ids),
+            len(revision_ids),
+        )
+    finally:
+        await client.close()
+
+
+async def wait_for_mongot_catchup(settings: MemexSettings, revision_id: str) -> None:
+    """Block until mongot has indexed ``revision_id`` so recall is stable.
+
+    Atlas Search / mongot is eventually consistent -- writes become
+    visible to ``$search`` and ``$vectorSearch`` only after mongot has
+    pulled them from the oplog and rebuilt Lucene segments. This demo
+    runs ingest and recall in the same process back-to-back, so we
+    wait on the most recently written revision before querying.
+
+    Args:
+        settings: Resolved Memex settings (used for Mongo URI and db).
+        revision_id: The id of a recently inserted revision to wait on.
+    """
+    client: AsyncMongoClient = AsyncMongoClient(settings.mongo.uri)
+    try:
+        coll = client[settings.mongo.database].revisions
+        indexed = await wait_for_doc_indexed(coll, revision_id)
+        if not indexed:
+            logger.warning(
+                "Revision %s was not indexed within the timeout; "
+                "recall may not yet see it.",
+                revision_id[:8],
+            )
+    finally:
+        await client.close()
+
+
 async def main() -> None:
     """Run the MongoDB end-to-end demo."""
     settings = MemexSettings(backend="mongo")
@@ -245,13 +354,19 @@ async def main() -> None:
     logger.info("--- Provisioning MongoDB indexes ---")
     await setup_mongo(settings)
 
+    logger.info("--- Resetting demo scope ---")
+    await reset_demo_data(settings)
+
     m = Memex.from_settings(settings)
     try:
         await m.create_project(PROJECT_ID)
 
         logger.info("--- Ingesting memories ---")
         auth_revision_id = await ingest_examples(m)
-        await ingest_with_edge(m, auth_revision_id)
+        last_revision_id = await ingest_with_edge(m, auth_revision_id)
+
+        logger.info("--- Waiting for mongot to index new revisions ---")
+        await wait_for_mongot_catchup(settings, last_revision_id)
 
         logger.info("--- Hybrid recall ($rankFusion) ---")
         await recall_demo(m)

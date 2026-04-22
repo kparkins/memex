@@ -217,6 +217,7 @@ class EnrichmentService:
                 embed_text,
                 model=embed_cfg.model,
                 dimensions=embed_cfg.dimensions,
+                api_base=embed_cfg.api_base,
             )
 
             await self._store.update_revision_enrichment(

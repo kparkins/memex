@@ -1,6 +1,13 @@
 # Memex: Graph-Native Cognitive Memory for AI Agents
 
-Memex is a Python reference implementation of the architecture described in [*Graph-Native Cognitive Memory for AI Agents* (Park, 2026)](https://arxiv.org/pdf/2603.17244). It gives AI agents persistent, versioned, searchable long-term memory backed by a Neo4j knowledge graph and a Redis working-memory buffer. Agents interact with Memex through a Python SDK or an MCP (Model Context Protocol) tool surface.
+Memex is a Python reference implementation of the architecture described in [*Graph-Native Cognitive Memory for AI Agents* (Park, 2026)](https://arxiv.org/pdf/2603.17244). It gives AI agents persistent, versioned, searchable long-term memory with a pluggable persistence layer. Agents interact with Memex through a Python SDK or an MCP (Model Context Protocol) tool surface.
+
+Memex supports two interchangeable backends behind a single facade:
+
+- **Neo4j + Redis** -- the reference stack. Neo4j stores the long-term memory graph and serves BM25 + vector retrieval; Redis is the working-memory session buffer and consolidation event feed.
+- **MongoDB 8.1** -- a single-database alternative. The same collections hold the memory graph, Atlas Search (fulltext) and Atlas Vector Search indexes, working-memory sessions (TTL-expiring documents), and the consolidation event feed. Hybrid recall uses MongoDB's server-side `$rankFusion` Reciprocal Rank Fusion stage.
+
+Both backends implement the same `MemoryStore` and `SearchStrategy` protocols, so application code is written once against the `Memex` facade and the deployment picks the storage stack via configuration (`MEMEX_BACKEND=neo4j` or `MEMEX_BACKEND=mongo`).
 
 ---
 
@@ -75,35 +82,48 @@ Large language models are stateless. Every conversation starts from scratch. Mem
                               MCP tools / Python SDK
                                        |
                          +-------------v--------------+
-                         |    Memex Orchestrator       |
-                         |    (Python / async)         |
-                         +------+-------------+-------+
-                                |             |
-                   +------------+             +----------------+
-                   |                                           |
-            +------v-------+                          +-------v--------+
-            |    Redis     |                          |     Neo4j      |
-            |  working     |                          |   long-term    |
-            |  memory      |                          |  memory graph  |
-            +--------------+                          +-------+--------+
-                                                              |
-                                         +--------------------+-------------------+
-                                         |                                        |
-                                  +------v-------+                        +-------v--------+
-                                  |  Artifact    |                        |  LLM Adapters  |
-                                  |  storage     |                        |  (litellm)     |
-                                  |  local/S3    |                        |  enrich, embed |
-                                  +--------------+                        +----------------+
+                         |    Memex Orchestrator      |
+                         |    (Python / async)        |
+                         +-------------+--------------+
+                                       |
+                        MemoryStore + SearchStrategy protocols
+                                       |
+            +--------------------------+--------------------------+
+            |                                                     |
+   Backend A: Neo4j + Redis                            Backend B: MongoDB 8.1
+   +---------------------+                             +-------------------------+
+   |   Neo4j             |                             |  mongod  (replica set)  |
+   |   long-term graph   |                             |  + domain collections   |
+   |   BM25 + vector     |                             |  + working_memory (TTL) |
+   +---------------------+                             |  + events               |
+            +                                          +-----------+-------------+
+   +--------+------------+                                         |
+   |   Redis             |                             +-----------v-------------+
+   |   working memory    |                             |  mongot                 |
+   |   event stream      |                             |  Atlas Search +         |
+   +---------------------+                             |  Vector Search indexes  |
+                                                       +-------------------------+
+
+                           Shared orchestrator concerns
+                                       |
+                   +-------------------+--------------------+
+                   |                                        |
+           +-------v--------+                       +-------v--------+
+           |  Artifact      |                       |  LLM Adapters  |
+           |  storage       |                       |  (litellm)     |
+           |  local/S3      |                       |  enrich, embed |
+           +----------------+                       +----------------+
 ```
 
-**Key rule:** The orchestrator is the only component that talks to Redis, Neo4j, artifact storage, or LLM providers. Agents never touch backends directly.
+**Key rule:** The orchestrator is the only component that talks to the storage backend, artifact storage, or LLM providers. Agents never touch backends directly, and the choice of backend is invisible to application code.
 
 ### Component Responsibilities
 
 | Component | Role |
 |-----------|------|
-| **Neo4j** | Long-term memory graph. Stores all items, revisions, tags, edges, and artifacts. Provides fulltext (BM25) and vector indexes for retrieval. Source of truth. |
-| **Redis** | Two jobs: (1) working-memory session buffer (bounded, TTL-expiring message lists per session), and (2) consolidation event feed (Redis Streams) consumed by Dream State. |
+| **Neo4j** (backend A) | Long-term memory graph. Stores items, revisions, tags, edges, artifacts. Provides fulltext (BM25) and vector indexes for retrieval. |
+| **Redis** (backend A) | Working-memory session buffer (bounded, TTL-expiring message lists) and consolidation event feed (Redis Streams) consumed by Dream State. |
+| **MongoDB + mongot** (backend B) | One database hosts every collection: `projects`, `spaces`, `items`, `revisions`, `tags`, `tag_assignments`, `artifacts`, `edges`, `audit_reports`, `working_memory` (TTL index), and `events`. `mongot` hosts the `revision_search_text` (Atlas Search) and `revision_embedding` (Atlas Vector Search) indexes. Hybrid recall uses the MongoDB 8.1 `$rankFusion` aggregation stage. |
 | **LLM Adapters** | Abstracted behind `LLMClient` and `EmbeddingClient` protocols. Default implementation uses [litellm](https://github.com/BerriAI/litellm) so any provider (OpenAI, Anthropic, local models) works. Used for enrichment extraction and Dream State assessment. |
 | **Artifact Storage** | External file storage (local filesystem or cloud). The graph stores only a pointer (`location` URI), never raw bytes. |
 
@@ -111,9 +131,9 @@ Large language models are stateless. Every conversation starts from scratch. Mem
 
 ## Data Model
 
-The graph stores five node types and several relationship types.
+The domain types are backend-agnostic Pydantic models. Each backend persists them with whatever primitive fits best: Neo4j stores nodes and relationships; MongoDB stores documents in per-type collections plus explicit edge documents. The *semantics* are identical.
 
-### Nodes
+### Nodes (Neo4j) / Collections (MongoDB)
 
 ```
 (:Item {id, space_id, name, kind, deprecated, created_at})
@@ -128,6 +148,12 @@ The graph stores five node types and several relationship types.
 
 (:Revision)--[:HAS_ARTIFACT]-->(:Artifact {id, name, location, media_type, size_bytes})
 ```
+
+On the MongoDB backend, the same structure is realized as:
+
+- `items`, `revisions`, `tags`, `tag_assignments`, `artifacts` -- one document per domain object, `_id` mapped from the domain `id`.
+- `edges` -- one document per typed edge (source/target revision ids, `edge_type`, confidence, metadata).
+- `revisions.space_id` -- denormalized copy of `items.space_id` so scoped recall stays index-covered without a `$lookup`.
 
 ### Edges Between Revisions
 
@@ -189,31 +215,36 @@ Agent calls memex_ingest (MCP) or m.ingest() (SDK)
 +----------------------------------------------------------+
     |
     v
-+-- Atomic Graph Write (single Neo4j transaction) ---------+
-|  1. Resolve or create Space                              |
-|  2. Create Item node                                     |
-|  3. Create Revision node (with search_text)              |
-|  4. Create Tag nodes (default: "active") pointing to rev |
-|  5. Create Artifact pointer nodes (if any)               |
-|  6. Create Edge relationships (if any)                   |
-|  7. Create Bundle membership edge (if any)               |
-+----------------------------------------------------------+
++-- Atomic Memory-Unit Write (single backend transaction) -+
+|  Neo4j: one Cypher transaction; MongoDB: one              |
+|  start_session + start_transaction on the replica set.    |
+|  1. Resolve or create Space                               |
+|  2. Create Item                                           |
+|  3. Create Revision (with search_text, denorm space_id)   |
+|  4. Create Tag(s) (default: "active") pointing to rev     |
+|  5. Create Artifact pointer records (if any)              |
+|  6. Create Edge records (if any)                          |
+|  7. Create Bundle membership edge (if any)                |
++-----------------------------------------------------------+
     |
     v
 +-- Post-Commit (non-blocking, failures don't break ingest) --+
-|  1. Publish events to Redis Stream (revision.created, etc)   |
-|  2. Buffer message in Redis working memory (if session_id)   |
-|  3. Run hybrid recall to return immediate context            |
-+--------------------------------------------------------------+
+|  1. Publish events to the consolidation event feed          |
+|     (Redis Stream for backend A, `events` collection for    |
+|      backend B; both consumed by Dream State)               |
+|  2. Buffer message in the working-memory backend            |
+|     (Redis list for A, TTL-indexed doc for B)               |
+|  3. Run hybrid recall to return immediate context           |
++-------------------------------------------------------------+
     |
     v
 +-- Async Enrichment (fire-and-forget background task) --------+
-|  1. LLM extracts: summary, topics, keywords, facts, events, |
+|  1. LLM extracts: summary, topics, keywords, facts, events,  |
 |     implications, embedding_text_override                    |
 |  2. Privacy hooks run again on enrichment output             |
 |  3. Enriched search_text built from all metadata fields      |
 |  4. Embedding generated via configured provider              |
-|  5. Revision node updated in Neo4j with enrichments          |
+|  5. Revision updated in the backend with enrichments         |
 +--------------------------------------------------------------+
 ```
 
@@ -251,9 +282,9 @@ The critical property: **the primary write always completes without waiting for 
 
 ## Read Path: Recalling Memories
 
-Recall uses a **hybrid retrieval pipeline** that fuses BM25 fulltext search and vector similarity search.
+Recall is a **hybrid retrieval pipeline** that combines BM25 fulltext and vector similarity. The scoring formulas differ by backend, but both honour the paper's architectural separation: graph traversal is *not* fused into the ranker. Agents invoke `get_dependencies`, `analyze_impact`, `get_provenance_summary`, and friends explicitly when they need structural reasoning (see [§8.4 of the paper](https://arxiv.org/pdf/2603.17244)).
 
-### Retrieval Pipeline
+### Shared Query Processing
 
 ```
 Agent query
@@ -265,8 +296,11 @@ Agent query
 |  3. Apply fuzzy matching (~1 edit distance) to       |
 |     terms longer than 2 characters                   |
 +------------------------------------------------------+
-    |
-    v
+```
+
+### Neo4j Hybrid Pipeline (`memex.retrieval.hybrid.HybridSearch`)
+
+```
 +-- Dual-Branch Search (single UNION ALL Cypher) ------+
 |                                                       |
 |  Branch 1: BM25 Fulltext                             |
@@ -283,30 +317,60 @@ Agent query
 +------------------------------------------------------+
     |
     v
-+-- Fusion Scoring ------------------------------------+
-|                                                       |
-|  For each candidate revision:                        |
-|    s_lex = BM25 score                                |
-|    s_vec = beta * cosine_similarity  (beta = 0.85)   |
-|                                                       |
-|    Type weight w(m):                                 |
-|      item match   = 1.0                              |
-|      revision match = 0.9                            |
-|      artifact match = 0.8                            |
-|                                                       |
-|    S(q, m) = w(m) * max(s_lex, s_vec)                |
-|                                                       |
++-- Max-Fusion Scoring --------------------------------+
+|  s_lex = BM25 score                                  |
+|  s_vec = beta * cosine_similarity  (beta = 0.85)     |
+|  Type weight w(m):                                   |
+|    item match   = 1.0                                |
+|    revision match = 0.9                              |
+|    artifact match = 0.8                              |
+|  S(q, m) = w(m) * max(s_lex, s_vec)                  |
 +------------------------------------------------------+
-    |
-    v
-+-- Deduplication and Limiting ------------------------+
-|  Sort by S(q, m) descending                          |
-|  Enforce memory_limit on unique items (default 3)    |
-+------------------------------------------------------+
-    |
-    v
+```
+
+This follows the paper's max-fusion rule verbatim.
+
+### MongoDB Hybrid Pipeline (`memex.retrieval.mongo_hybrid.MongoHybridSearch`)
+
+On MongoDB 8.1, Memex uses the server-side `$rankFusion` aggregation stage, which runs both branches as named sub-pipelines and fuses them via Reciprocal Rank Fusion (RRF):
+
+```
+aggregate([
+  {
+    "$rankFusion": {
+      "input": {
+        "pipelines": {
+          "vectorPipeline":  [ { "$vectorSearch": { ... } } ],
+          "fullTextPipeline":[ { "$search":       { ... } },
+                               { "$limit": lim }            ]
+        }
+      },
+      "combination": {
+        "weights": {
+          "vectorPipeline":   beta,  // 0.85 by default
+          "fullTextPipeline": 1.0
+        }
+      },
+      "scoreDetails": true
+    }
+  },
+  { "$addFields": { "_score": { "$meta": "score" },
+                    "_score_details": { "$meta": "scoreDetails" } } },
+  // post-fusion $lookup on items + $match for deprecated filter
+])
+```
+
+RRF score per document is `sum(weight / (60 + rank_i))` across contributing pipelines. Memex then applies the same type weight `w(m)` post-fusion, so the final score is `w(m) * RRF(q, m)`. Single-branch requests (query only or embedding only) skip `$rankFusion` entirely and run the corresponding pipeline directly, because `$rankFusion` requires multiple input pipelines.
+
+Space-scoped recall pushes the `$match { space_id: { $in: [...] } }` stage *inside* each sub-pipeline so every per-branch rank is computed against the scoped candidate set, relying on the denormalized `revisions.space_id` field.
+
+### Deduplication and Limiting (both backends)
+
+```
+Sort by score descending
+Enforce memory_limit on unique items (default 3)
 Return ranked results with full metadata
-(revision content, summary, scores, search_mode)
+(revision content, summary, lexical_score, vector_score, search_mode)
 ```
 
 ### Multi-Query Reformulation (Optional)
@@ -569,15 +633,20 @@ src/memex/
     stores/                  # Persistence layer
         protocols.py         # Protocol interfaces (MemoryStore, SearchStrategy, etc.)
         neo4j_store.py       # Neo4j implementation of MemoryStore
-        neo4j_schema.py      # Index and constraint creation
-        redis_store.py       # Working memory buffer + consolidation event feed
+        neo4j_schema.py      # Neo4j index and constraint creation
+        redis_store.py       # Redis working memory buffer + consolidation event feed
+        mongo_store.py       # MongoDB implementation of MemoryStore
+                             # + ensure_indexes / ensure_search_indexes helpers
+        mongo_working_memory.py  # MongoDB TTL-backed working-memory buffer
+        mongo_event_feed.py      # MongoDB-backed consolidation event feed
 
     retrieval/               # Search and retrieval
         models.py            # SearchRequest, SearchResult, HybridResult, BM25Result
         strategy.py          # SearchStrategy protocol
         bm25.py              # BM25 fulltext search with query sanitization
         vector.py            # Vector similarity search
-        hybrid.py            # Hybrid fusion: S(q,m) = w(m) * max(s_lex, s_vec)
+        hybrid.py            # Neo4j hybrid fusion: S(q,m) = w(m) * max(s_lex, s_vec)
+        mongo_hybrid.py      # MongoDB $rankFusion hybrid: RRF + type weights
         multi_query.py       # Multi-query reformulation (3-4 LLM-generated variants)
 
     llm/                     # LLM integration
@@ -614,9 +683,27 @@ src/memex/
 ### Prerequisites
 
 - Python 3.11+
-- Docker (for Neo4j and Redis)
+- Docker (for whichever backing services you choose)
 
-### 1. Start the backing services
+### 1. Install Memex
+
+Install the core SDK:
+
+```bash
+uv sync
+```
+
+The MongoDB driver is an optional extra -- install it only if you plan to use backend B:
+
+```bash
+uv sync --extra mongo
+```
+
+### 2. Start a backend
+
+Pick one.
+
+#### Option A: Neo4j + Redis (reference backend)
 
 ```bash
 docker compose up -d
@@ -626,37 +713,53 @@ This starts:
 - **Neo4j 5.26** on `bolt://localhost:7687` (browser at `http://localhost:7474`)
 - **Redis 7** on `localhost:6379`
 
-### 2. Install Memex
+#### Option B: MongoDB 8.1 + mongot
 
 ```bash
-uv sync
+docker compose -f docker-compose-mongo.yml up -d
 ```
+
+This starts a MongoDB 8.1 replica set (`rs0`), a `mongo-init` container that creates the `mongotUser` service account, and the `mongot` sidecar that hosts Atlas Search and Vector Search indexes. Supporting files live under `docker/` (`mongod.conf`, `mongot.conf`, `init-mongo.sh`, `.env.example`).
+
+On first use, have the application call `memex.stores.mongo_store.ensure_indexes(db)` and `ensure_search_indexes(db)` to provision B-tree indexes and the two search indexes (`revision_search_text`, `revision_embedding`). Both are idempotent. Search-index creation is asynchronous on `mongot`; `wait_until_queryable(db.revisions, name)` blocks until each index is ready (see `examples/mongo_usage.py`).
 
 ### 3. Configure (optional)
 
-All settings are read from environment variables with the `MEMEX_` prefix. Defaults work for local development:
+All settings are read from environment variables with the `MEMEX_` prefix. Defaults work for local development. Select the backend via `MEMEX_BACKEND`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MEMEX_BACKEND` | `neo4j` | Backend selector: `neo4j` or `mongo` |
 | `MEMEX_NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
 | `MEMEX_NEO4J_USER` | `neo4j` | Neo4j username |
 | `MEMEX_NEO4J_PASSWORD` | `memex_dev_password` | Neo4j password |
 | `MEMEX_REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
+| `MEMEX_MONGO_URI` | `mongodb://localhost:27017` | MongoDB connection URI |
+| `MEMEX_MONGO_DATABASE` | `memex` | MongoDB database name |
 | `MEMEX_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model |
 | `MEMEX_EMBEDDING_DIMENSIONS` | `1536` | Embedding vector size |
+| `MEMEX_EMBEDDING_BETA` | `0.85` | Vector-branch weight in hybrid recall |
 | `MEMEX_ENRICHMENT_MODEL` | `gpt-4o-mini` | LLM for enrichment extraction |
 | `MEMEX_DREAM_BATCH_SIZE` | `20` | Revisions per Dream State batch |
 | `MEMEX_DREAM_MAX_DEPRECATION_RATIO` | `0.5` | Circuit breaker threshold |
 
-### 4. Run the example
+Each sub-settings class has its own single-underscore `env_prefix` (e.g. `MEMEX_NEO4J_`, `MEMEX_MONGO_`). The root `MemexSettings` additionally supports a double-underscore nested form (`MEMEX_NEO4J__URI`), so both work.
+
+### 4. Run an example
 
 ```bash
+# Neo4j + Redis
 uv run python examples/sample_usage.py
+
+# MongoDB (requires docker-compose-mongo.yml to be up)
+MEMEX_BACKEND=mongo uv run python examples/mongo_usage.py
 ```
 
 ---
 
 ## Example: Using the Python Library
+
+The facade picks up `MEMEX_BACKEND` from the environment, so the same code runs against either backend.
 
 ```python
 import asyncio
@@ -666,7 +769,7 @@ from memex.orchestration.ingest import IngestParams, ReviseParams, EdgeSpec
 from memex.domain.edges import EdgeType
 
 async def main():
-    # Connect to Neo4j + Redis using environment variables
+    # Picks up MEMEX_BACKEND=neo4j (default) or MEMEX_BACKEND=mongo from the environment.
     m = Memex.from_env()
     try:
         # Ensure project exists (idempotent)
@@ -721,6 +824,20 @@ async def main():
 asyncio.run(main())
 ```
 
+To force a specific backend in code (bypassing `MEMEX_BACKEND`), build settings explicitly:
+
+```python
+from memex.config import MemexSettings
+
+# MongoDB
+m = Memex.from_settings(MemexSettings(backend="mongo"))
+
+# Or reuse an existing pymongo client:
+from pymongo import AsyncMongoClient
+client = AsyncMongoClient("mongodb://localhost:27017")
+m = Memex.from_client(client, database="memex")
+```
+
 ---
 
 ## Example: Using the MCP Server
@@ -740,7 +857,10 @@ async def run_server():
     )
     redis_client = Redis.from_url("redis://localhost:6379/0")
 
-    # Creates a FastMCP server with all 23 tools registered
+    # Creates a FastMCP server with all 23 tools registered.
+    # The same MCP surface is available with the MongoDB backend -- just
+    # wire a MongoStore + MongoHybridSearch + MongoWorkingMemory in place
+    # of the Neo4j/Redis instances above.
     mcp = create_mcp_server(
         driver,
         redis_client=redis_client,

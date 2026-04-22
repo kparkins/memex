@@ -12,6 +12,7 @@ dependencies = [
     "litellm>=1.0",
     "orjson>=3.9",
     "mcp>=1.0",
+    "pymongo>=4.16.0",
 ]
 
 [project.optional-dependencies]

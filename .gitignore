@@ -8,6 +8,9 @@ build/
 dist/
 wheels/
 *.egg-info
+docs/2603.17244v1.pdf
+.DS_Store
+
 
 # Virtual environments
 .venv

@@ -57,7 +57,7 @@ services:
     restart: "no"
 
   mongod:
-    image: mongodb/mongodb-community-server:8.1.0
+    image: mongodb/mongodb-community-server:latest
     container_name: memex-mongod
     hostname: mongod.search-community
     environment:
@@ -100,7 +100,7 @@ services:
       start_period: 30s
 
   mongo-init:
-    image: mongodb/mongodb-community-server:8.1.0
+    image: mongodb/mongodb-community-server:latest
     container_name: memex-mongo-init
     environment:
       MONGO_HOST: mongod.search-community
@@ -119,7 +119,7 @@ services:
     restart: "no"
 
   mongot:
-    image: mongodb/mongodb-community-search:8.1.0
+    image: mongodb/mongodb-community-search:latest
     container_name: memex-mongot
     hostname: mongot.search-community
     ports:

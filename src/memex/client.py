@@ -20,9 +20,10 @@ import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from memex.config import MemexSettings
+from memex.config import EmbeddingSettings, MemexSettings
 from memex.domain.edges import Edge
 from memex.domain.models import Item, Project, Space
+from memex.llm.client import EmbeddingClient, LiteLLMEmbeddingClient
 from memex.orchestration.ingest import (
     IngestParams,
     IngestResult,
@@ -69,16 +70,22 @@ class Memex:
         *,
         working_memory: RedisWorkingMemory | None = None,
         event_feed: ConsolidationEventFeed | None = None,
+        embedding_client: EmbeddingClient | None = None,
+        embedding_settings: EmbeddingSettings | None = None,
     ) -> None:
         self._store = store
         self._search = search
         self._working_memory = working_memory
         self._event_feed = event_feed
+        self._embedding_client = embedding_client
+        self._embedding_settings = embedding_settings
         self._ingest_service = IngestService(
             store,
             search,
             working_memory=working_memory,
             event_feed=event_feed,
+            embedding_client=embedding_client,
+            embedding_settings=embedding_settings,
         )
         self._driver: AsyncDriver | None = None
         self._redis: Redis | None = None
@@ -141,6 +148,8 @@ class Memex:
             search,
             working_memory=wm,
             event_feed=ef,
+            embedding_client=LiteLLMEmbeddingClient(),
+            embedding_settings=settings.embedding,
         )
         instance._driver = driver
         instance._redis = redis_client
@@ -186,6 +195,8 @@ class Memex:
             search,
             working_memory=wm,
             event_feed=ef,
+            embedding_client=LiteLLMEmbeddingClient(),
+            embedding_settings=settings.embedding,
         )
         instance._mongo_client = mongo_client  # type: ignore[attr-defined]
         return instance
@@ -228,7 +239,14 @@ class Memex:
         )
         ef = MongoEventFeed(db["events"])
 
-        return cls(store, search, working_memory=wm, event_feed=ef)
+        return cls(
+            store,
+            search,
+            working_memory=wm,
+            event_feed=ef,
+            embedding_client=LiteLLMEmbeddingClient(),
+            embedding_settings=cfg.embedding,
+        )
 
     @classmethod
     def from_env(cls) -> Memex:
@@ -277,6 +295,8 @@ class Memex:
         Returns:
             Search results ordered by descending relevance.
         """
+        if query_embedding is None:
+            query_embedding = await self._embed_query(query)
         return await self._search.search(
             SearchRequest(
                 query=query,
@@ -285,6 +305,31 @@ class Memex:
                 query_embedding=query_embedding,
             )
         )
+
+    async def _embed_query(self, query: str) -> list[float] | None:
+        """Embed a recall query with the configured provider.
+
+        Returns ``None`` when no embedding client is wired, the query
+        is empty, or the provider errors out -- in which case recall
+        still runs the lexical-only branch.
+        """
+        if self._embedding_client is None or not query.strip():
+            return None
+        cfg = self._embedding_settings or EmbeddingSettings()
+        try:
+            vector = await self._embedding_client.embed(
+                query,
+                model=cfg.model,
+                dimensions=cfg.dimensions,
+                api_base=cfg.api_base,
+            )
+        except Exception:
+            logger.warning(
+                "Query embedding failed; falling back to lexical-only recall",
+                exc_info=True,
+            )
+            return None
+        return list(vector)
 
     async def recall_scoped(
         self,
@@ -500,7 +545,7 @@ class Memex:
             self._driver = None
         mongo_client = getattr(self, "_mongo_client", None)
         if mongo_client is not None:
-            mongo_client.close()
+            await mongo_client.close()
             self._mongo_client = None  # type: ignore[attr-defined]
 
     # -- Private helpers ------------------------------------------------------

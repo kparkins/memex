@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from memex.config import PrivacySettings, RetrievalSettings
+from memex.config import EmbeddingSettings, PrivacySettings, RetrievalSettings
+from memex.llm.client import EmbeddingClient
 from memex.domain import (
     Artifact,
     Edge,
@@ -221,6 +222,14 @@ class IngestService:
         search: Search strategy for recall context retrieval.
         working_memory: Redis session buffer (``None`` to skip).
         event_feed: Consolidation event feed (``None`` to skip).
+        embedding_client: Optional embedding provider. When set, ingest
+            and revise auto-generate an embedding for the revision
+            content when the caller does not supply one. Failures are
+            logged and the revision is persisted with
+            ``embedding=None`` rather than aborting the write.
+        embedding_settings: Model/dimensions/api_base used for
+            auto-embedding. Ignored when ``embedding_client`` is
+            ``None``.
     """
 
     def __init__(
@@ -230,11 +239,40 @@ class IngestService:
         *,
         working_memory: RedisWorkingMemory | None = None,
         event_feed: ConsolidationEventFeed | None = None,
+        embedding_client: EmbeddingClient | None = None,
+        embedding_settings: EmbeddingSettings | None = None,
     ) -> None:
         self._store = store
         self._search = search
         self._working_memory = working_memory
         self._event_feed = event_feed
+        self._embedding_client = embedding_client
+        self._embedding_settings = embedding_settings
+
+    async def _maybe_embed(self, text: str) -> tuple[float, ...] | None:
+        """Generate an embedding for ``text`` when a client is configured.
+
+        Returns ``None`` when no client was injected, when ``text`` is
+        empty, or when the provider errors out -- the latter is logged
+        at warning level so ingest continues to succeed.
+        """
+        if self._embedding_client is None or not text.strip():
+            return None
+        cfg = self._embedding_settings or EmbeddingSettings()
+        try:
+            vector = await self._embedding_client.embed(
+                text,
+                model=cfg.model,
+                dimensions=cfg.dimensions,
+                api_base=cfg.api_base,
+            )
+        except Exception:
+            logger.warning(
+                "Embedding generation failed; persisting revision without one",
+                exc_info=True,
+            )
+            return None
+        return tuple(vector)
 
     async def ingest(
         self,
@@ -277,12 +315,15 @@ class IngestService:
             name=params.item_name,
             kind=ItemKind(params.item_kind),
         )
+        embedding = params.embedding
+        if embedding is None:
+            embedding = await self._maybe_embed(sanitized_search)
         revision = Revision(
             item_id=item.id,
             revision_number=1,
             content=sanitized_content,
             search_text=sanitized_search,
-            embedding=params.embedding,
+            embedding=embedding,
         )
         tags = [
             Tag(item_id=item.id, name=name, revision_id=revision.id)
@@ -350,9 +391,7 @@ class IngestService:
             recall_context = await self._search.search(
                 SearchRequest(
                     query=sanitized_search,
-                    query_embedding=(
-                        list(params.embedding) if params.embedding else None
-                    ),
+                    query_embedding=list(embedding) if embedding else None,
                     limit=retrieval.context_top_k,
                     memory_limit=retrieval.memory_limit,
                     type_weights={
@@ -413,11 +452,13 @@ class IngestService:
         revisions = await self._store.get_revisions_for_item(params.item_id)
         next_number = max((r.revision_number for r in revisions), default=0) + 1
 
+        embedding = await self._maybe_embed(sanitized_search)
         revision = Revision(
             item_id=params.item_id,
             revision_number=next_number,
             content=sanitized_content,
             search_text=sanitized_search,
+            embedding=embedding,
         )
 
         persisted, assignment = await self._store.revise_item(
