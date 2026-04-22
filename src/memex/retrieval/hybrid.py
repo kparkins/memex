@@ -1,8 +1,13 @@
 """Hybrid scoring and retrieval fusion.
 
-Combines BM25 fulltext and vector similarity search branches
-via a UNION ALL Cypher query, then applies the paper's fusion
-formula: ``S(q,m) = w(m) * max(s_lex(m), s_vec(m))``.
+Combines BM25 fulltext and vector similarity search branches via
+a UNION ALL Cypher query, then applies the paper's fusion formula
+``S(q,m) = w(m) * max(s_lex(m), s_vec(m))``. Both branch scores are
+first passed through the Okapi saturation transform ``s / (s + k)``
+so CombMAX compares two ``[0, 1)`` confidence-midpoint signals
+directly, with no scalar calibration factor. ``k_lex`` is sourced
+from :attr:`SearchRequest.lexical_saturation_k`; ``k_vec`` from
+:attr:`SearchRequest.vector_saturation_k`.
 
 The fulltext and vector branches are executed in a single Cypher
 query (UNION ALL) before fusion per FR-7, with deduplication and
@@ -23,6 +28,7 @@ from memex.retrieval.models import (
     MatchSource,
     SearchMode,
     SearchRequest,
+    saturate_score,
 )
 from memex.stores.neo4j_schema import NodeLabel, RelType
 
@@ -41,8 +47,10 @@ def compute_fused_score(
     ``S(q, m) = w(m) * max(s_lex(m), s_vec(m))``
 
     Args:
-        lexical_score: BM25 score (``s_lex``).
-        vector_score: Beta-calibrated cosine similarity (``s_vec``).
+        lexical_score: Saturated BM25 score in ``[0, 1)`` (``s_lex``).
+        vector_score: Saturated cosine similarity in ``[0, 1)``
+            (``s_vec``). Both branches are Okapi-saturated upstream
+            so they share the same scale here.
         type_weight: Type weight ``w(m)`` for the match source.
 
     Returns:
@@ -181,7 +189,8 @@ class HybridSearch:
         candidates = await self._execute_and_collect(
             cypher,
             params,
-            request.beta,
+            request.lexical_saturation_k,
+            request.vector_saturation_k,
         )
 
         return self._fuse_and_limit(
@@ -236,17 +245,22 @@ class HybridSearch:
         self,
         cypher: str,
         params: dict[str, Any],
-        beta: float,
+        k_lex: float,
+        k_vec: float,
     ) -> dict[str, dict[str, Any]]:
         """Run the Cypher query and collect candidates by revision ID.
 
         Deduplicates across UNION ALL branches, keeping the best score
-        per branch for each revision.
+        per branch for each revision. Raw BM25 and raw cosine are both
+        passed through the Okapi saturation transform ``s / (s + k)``
+        so CombMAX fusion compares calibrated ``[0, 1)`` signals and
+        neither branch can dominate on scale alone.
 
         Args:
             cypher: Cypher query string.
             params: Query parameters.
-            beta: Vector score calibration factor.
+            k_lex: Lexical saturation midpoint.
+            k_vec: Vector saturation midpoint.
 
         Returns:
             Dict keyed by revision ID with collected score data.
@@ -273,12 +287,12 @@ class HybridSearch:
                 if source == "lexical":
                     entry["lexical_score"] = max(
                         entry["lexical_score"],
-                        raw_score,
+                        saturate_score(raw_score, k_lex),
                     )
                 else:
                     entry["vector_score"] = max(
                         entry["vector_score"],
-                        beta * raw_score,
+                        saturate_score(raw_score, k_vec),
                     )
 
         return candidates

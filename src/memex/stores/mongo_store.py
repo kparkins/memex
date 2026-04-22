@@ -61,10 +61,12 @@ SEARCH_INDEX_WAIT_TIMEOUT_SECONDS = 120.0
 
 _SEARCH_INDEX_POLL_INTERVAL_SECONDS = 1.0
 _DEFAULT_EMBEDDING_DIMENSIONS = 1536
-_REVISION_CONTENT_FIELD = "content"
-_REVISION_TITLE_FIELD = "title"
+_REVISION_SEARCH_TEXT_FIELD = "search_text"
 _REVISION_EMBEDDING_FIELD = "embedding"
-_DEFAULT_LEXICAL_ANALYZER = "lucene.standard"
+# Porter-stemming English analyzer: folds morphological variants so that
+# query terms like "caching" match indexed tokens like "cache". Matches
+# the intent of Neo4j's fulltext index on the same ``search_text`` field.
+_DEFAULT_LEXICAL_ANALYZER = "lucene.english"
 _VECTOR_SEARCH_INDEX_TYPE = "vectorSearch"
 _VECTOR_SIMILARITY_COSINE = "cosine"
 _SEARCH_INDEX_STATUS_FAILED = "FAILED"
@@ -73,11 +75,11 @@ _LEXICAL_INDEX_DEFINITION: dict[str, Any] = {
     "mappings": {
         "dynamic": False,
         "fields": {
-            _REVISION_CONTENT_FIELD: {
-                "type": "string",
-                "analyzer": _DEFAULT_LEXICAL_ANALYZER,
-            },
-            _REVISION_TITLE_FIELD: {
+            # The $search pipeline in ``memex.retrieval.mongo_hybrid``
+            # targets ``search_text``; keeping the domain-canonical field
+            # (also used by the Neo4j fulltext index) as the single
+            # indexed text surface.
+            _REVISION_SEARCH_TEXT_FIELD: {
                 "type": "string",
                 "analyzer": _DEFAULT_LEXICAL_ANALYZER,
             },

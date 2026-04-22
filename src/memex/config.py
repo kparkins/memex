@@ -83,8 +83,6 @@ class EmbeddingSettings(BaseSettings):
         dimensions: Output vector size. Must match what the configured
             model actually produces; the MongoDB vector index is built
             to this size.
-        beta: Cosine-similarity calibration factor applied to raw
-            vector scores in the Neo4j hybrid search path.
         api_base: Optional base URL forwarded to litellm. Required for
             OpenAI-compatible local servers, e.g.
             ``"http://localhost:1234/v1"`` for LM Studio.
@@ -94,7 +92,6 @@ class EmbeddingSettings(BaseSettings):
 
     model: str = "text-embedding-3-small"
     dimensions: int = 1536
-    beta: float = 0.85
     api_base: str | None = None
 
 

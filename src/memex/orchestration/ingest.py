@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from memex.config import EmbeddingSettings, PrivacySettings, RetrievalSettings
-from memex.llm.client import EmbeddingClient
 from memex.domain import (
     Artifact,
     Edge,
@@ -31,6 +30,7 @@ from memex.domain import (
     Tag,
     TagAssignment,
 )
+from memex.llm.client import EmbeddingClient
 from memex.orchestration.events import (
     publish_after_ingest,
     publish_revision_created,

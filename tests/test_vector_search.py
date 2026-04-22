@@ -318,46 +318,54 @@ class TestVectorSearch:
         )
 
 
-# -- Integration tests: beta calibration -----------------------------------
+# -- Integration tests: vector saturation calibration ---------------------
 
 
-class TestBetaCalibration:
-    """Tests for beta-calibrated cosine similarity scoring."""
+class TestVectorSaturation:
+    """Tests for Okapi-saturated cosine similarity scoring.
 
-    async def test_default_beta_applied(self, vector_env: dict[str, Any]) -> None:
-        """Default beta=0.85 is applied: score = 0.85 * raw_score."""
+    Vector scores are calibrated via ``cos / (cos + k)`` so the
+    CombMAX fusion step compares signals on the same ``[0, 1)`` scale
+    as the saturated lexical branch.
+    """
+
+    async def test_default_saturation_applied(
+        self, vector_env: dict[str, Any]
+    ) -> None:
+        """Default ``vector_saturation_k=0.5``: score = cos / (cos + 0.5)."""
         searcher: VectorSearch = vector_env["searcher"]
         results = await searcher.search(
             SearchRequest(query_embedding=vector_env["query_embedding"]),
         )
         for r in results:
-            assert abs(r.score - 0.85 * r.raw_score) < 1e-9
+            expected = r.raw_score / (r.raw_score + 0.5)
+            assert abs(r.score - expected) < 1e-9
 
-    async def test_custom_beta_applied(self, vector_env: dict[str, Any]) -> None:
-        """Custom beta value scales the raw cosine score."""
+    async def test_custom_saturation_k(self, vector_env: dict[str, Any]) -> None:
+        """Custom ``vector_saturation_k`` shifts the confidence midpoint."""
         searcher: VectorSearch = vector_env["searcher"]
+        k = 0.2
         results = await searcher.search(
             SearchRequest(
                 query_embedding=vector_env["query_embedding"],
-                beta=0.5,
+                vector_saturation_k=k,
             ),
         )
         for r in results:
-            assert abs(r.score - 0.5 * r.raw_score) < 1e-9
+            expected = r.raw_score / (r.raw_score + k)
+            assert abs(r.score - expected) < 1e-9
 
-    async def test_beta_one_preserves_raw_score(
+    async def test_saturation_midpoint_maps_to_half(
         self, vector_env: dict[str, Any]
     ) -> None:
-        """beta=1.0 means calibrated score equals raw cosine score."""
+        """A raw cosine equal to ``k`` saturates to ``0.5`` (midpoint)."""
         searcher: VectorSearch = vector_env["searcher"]
         results = await searcher.search(
-            SearchRequest(
-                query_embedding=vector_env["query_embedding"],
-                beta=1.0,
-            ),
+            SearchRequest(query_embedding=vector_env["query_embedding"]),
         )
         for r in results:
-            assert abs(r.score - r.raw_score) < 1e-9
+            if abs(r.raw_score - 0.5) < 1e-3:
+                assert abs(r.score - 0.5) < 1e-3
 
 
 # -- Integration tests: deprecated-item exclusion --------------------------

@@ -33,9 +33,9 @@ from memex.orchestration.ingest import (
 )
 from memex.orchestration.lookup import get_item_by_path
 from memex.retrieval.models import (
+    ScopedRecallResult,
     SearchRequest,
     SearchResult,
-    ScopedRecallResult,
 )
 from memex.retrieval.strategy import SearchStrategy
 from memex.stores.protocols import MemoryStore

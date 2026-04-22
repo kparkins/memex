@@ -1,9 +1,11 @@
 """Vector similarity retrieval over Neo4j revision embeddings.
 
-Provides beta-calibrated cosine similarity search against the
-``revision_embedding`` vector index created by
-:func:`memex.stores.neo4j_schema.ensure_schema`, with configurable
-embedding generation via an injectable ``EmbeddingClient``.
+Provides cosine similarity search against the ``revision_embedding``
+vector index created by :func:`memex.stores.neo4j_schema.ensure_schema`,
+with scores mapped onto the ``[0, 1)`` CombMAX confidence-midpoint
+scale via Okapi saturation (``cos / (cos + k_vec)``) so hybrid fusion
+operates on calibrated signals. Embedding generation is configurable
+via an injectable ``EmbeddingClient``.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from neo4j import AsyncDriver
 
 from memex.domain.models import ItemKind, Revision
 from memex.llm.client import EmbeddingClient
-from memex.retrieval.models import SearchRequest, VectorResult
+from memex.retrieval.models import SearchRequest, VectorResult, saturate_score
 from memex.stores.neo4j_schema import NodeLabel, RelType
 
 _VECTOR_INDEX_NAME = "revision_embedding"
@@ -70,16 +72,19 @@ class VectorSearch:
         """Execute a vector similarity search over revision embeddings.
 
         Queries the ``revision_embedding`` vector index with the provided
-        embedding, applies beta calibration to the raw cosine similarity
-        score per FR-7 (``s_vec = beta * cosine``), and filters deprecated
-        items in Cypher before returning results.
+        embedding, applies the Okapi saturation transform
+        ``cos / (cos + k_vec)`` to the raw cosine similarity (so the
+        returned score shares the ``[0, 1)`` CombMAX confidence-midpoint
+        semantics), and filters deprecated items in Cypher before
+        returning results.
 
         Args:
-            request: Search parameters (uses ``query_embedding``, ``beta``,
-                ``limit``, ``include_deprecated``).
+            request: Search parameters (uses ``query_embedding``,
+                ``vector_saturation_k``, ``limit``,
+                ``include_deprecated``).
 
         Returns:
-            VectorResults ordered by descending calibrated score.
+            VectorResults ordered by descending saturated score.
         """
         if not request.query_embedding:
             return []
@@ -109,11 +114,12 @@ class VectorSearch:
                 top_k=top_k,
                 lim=request.limit,
             )
+            k_vec = request.vector_saturation_k
             return [
                 VectorResult(
                     revision=Revision.model_validate(dict(rec["r"])),
                     raw_score=float(rec["score"]),
-                    score=request.beta * float(rec["score"]),
+                    score=saturate_score(float(rec["score"]), k_vec),
                     item_id=str(rec["item_id"]),
                     item_kind=ItemKind(str(rec["item_kind"])),
                 )

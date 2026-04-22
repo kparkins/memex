@@ -1,7 +1,8 @@
 """Tests for :class:`MongoHybridSearch` space-scoped recall.
 
 Covers the ``space_ids`` filter added for ``me-recall-scoped`` Phase A
-and the MongoDB 8.1 ``$rankFusion``-based hybrid pipeline:
+and the ``$unionWith``-based hybrid pipeline that fuses branches via
+the paper's max formula in Python:
 
 - Lexical-only and vector-only single-branch pipelines emit the optional
   ``$match`` stage restricting revisions to the requested space ids.
@@ -9,13 +10,14 @@ and the MongoDB 8.1 ``$rankFusion``-based hybrid pipeline:
   space's revisions.
 - Passing ``None`` for ``space_ids`` preserves cross-space behaviour
   (no filter stage emitted).
-- Hybrid mode emits a single ``$rankFusion`` stage whose nested
-  vector and lexical sub-pipelines each carry the space filter.
+- Hybrid mode emits a single aggregation whose main pipeline runs the
+  lexical branch and ``$unionWith``s the vector branch, with the space
+  filter present on both branches.
 
 A minimal in-memory fake collection simulates enough aggregation
 pipeline semantics (``$search`` / ``$vectorSearch`` as passthrough plus
 ``$addFields`` / ``$match`` / ``$lookup`` / ``$unwind`` / ``$limit`` /
-``$rankFusion``) to exercise :class:`MongoHybridSearch.search` end-to-end
+``$unionWith``) to exercise :class:`MongoHybridSearch.search` end-to-end
 without a live MongoDB. External dependencies are mocked per project
 convention.
 """
@@ -37,9 +39,6 @@ _SPACE_BETA = "space-beta"
 _LEXICAL_SCORE = 1.0
 _VECTOR_SCORE = 0.5
 _DEFAULT_EMBEDDING_DIM = 4
-_RRF_K = 60
-_VECTOR_PIPELINE_NAME = "vectorPipeline"
-_LEXICAL_PIPELINE_NAME = "fullTextPipeline"
 
 
 # -- Helpers -----------------------------------------------------------------
@@ -195,8 +194,8 @@ class _FakeRevisions:
     ) -> list[dict[str, Any]]:
         """Recursively execute pipeline stages against the seeded data.
 
-        Pulled out as a helper so the ``$rankFusion`` simulator can
-        replay each named sub-pipeline through the same dispatcher.
+        Pulled out as a helper so the ``$unionWith`` simulator can
+        replay its inner pipeline through the same dispatcher.
 
         Args:
             pipeline: Pipeline stages to evaluate.
@@ -214,10 +213,10 @@ class _FakeRevisions:
     ) -> list[dict[str, Any]]:
         """Return the initial document set for a pipeline's first stage.
 
-        ``$search``, ``$vectorSearch``, and ``$rankFusion`` each return a
-        full pass over the seeded revisions, with branch-specific
-        ``_lex_seed``/``_vec_seed`` annotations attached so the
-        downstream ``$addFields`` stage can resolve ``$meta`` fields.
+        ``$search`` and ``$vectorSearch`` each return a full pass over
+        the seeded revisions, with branch-specific ``_lex_seed`` /
+        ``_vec_seed`` annotations attached so the downstream
+        ``$addFields`` stage can resolve ``$meta`` fields.
 
         Args:
             pipeline: Pipeline whose first stage selects the seed set.
@@ -228,8 +227,6 @@ class _FakeRevisions:
         if not pipeline:
             return []
         head = pipeline[0]
-        if "$rankFusion" in head:
-            return self._apply_rank_fusion(head["$rankFusion"])
         docs = [dict(doc) for doc in self.revisions.values()]
         if "$search" in head:
             for doc in docs:
@@ -265,92 +262,10 @@ class _FakeRevisions:
             return _apply_unwind(docs, stage["$unwind"])
         if "$limit" in stage:
             return docs[: stage["$limit"]]
+        if "$unionWith" in stage:
+            inner = self._run_stages(stage["$unionWith"]["pipeline"])
+            return docs + inner
         raise AssertionError(f"Unsupported pipeline stage: {stage!r}")
-
-    def _apply_rank_fusion(
-        self, spec: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        """Simulate the ``$rankFusion`` stage via in-memory RRF.
-
-        Runs each named sub-pipeline through ``_run_stages``, ranks
-        the results by descending raw score per branch, then fuses
-        via ``score = sum(weight / (k + rank))`` -- the same formula
-        used by Atlas' real implementation. Each output document
-        carries ``_rrf_score`` and ``_rrf_details`` so the downstream
-        ``$addFields`` stage can resolve ``{$meta: "score"}`` and
-        ``{$meta: "scoreDetails"}``.
-
-        Args:
-            spec: The ``$rankFusion`` stage specification.
-
-        Returns:
-            Fused documents ordered by descending RRF score.
-        """
-        pipelines: dict[str, list[dict[str, Any]]] = spec["input"]["pipelines"]
-        weights: dict[str, float] = spec.get("combination", {}).get("weights", {})
-        merged: dict[str, dict[str, Any]] = {}
-        details_by_id: dict[str, list[dict[str, Any]]] = {}
-        scores_by_id: dict[str, float] = {}
-
-        for name, sub_pipeline in pipelines.items():
-            branch_docs = self._run_stages(sub_pipeline)
-            self._post_process_branch(
-                branch_docs, name, weights, merged, details_by_id, scores_by_id
-            )
-
-        for doc_id, doc in merged.items():
-            doc["_rrf_score"] = scores_by_id[doc_id]
-            doc["_rrf_details"] = {"details": details_by_id[doc_id]}
-
-        return sorted(
-            merged.values(),
-            key=lambda d: d["_rrf_score"],
-            reverse=True,
-        )
-
-    @staticmethod
-    def _post_process_branch(
-        branch_docs: list[dict[str, Any]],
-        name: str,
-        weights: dict[str, float],
-        merged: dict[str, dict[str, Any]],
-        details_by_id: dict[str, list[dict[str, Any]]],
-        scores_by_id: dict[str, float],
-    ) -> None:
-        """Score one ``$rankFusion`` sub-pipeline and merge into accumulators.
-
-        Args:
-            branch_docs: Documents produced by the sub-pipeline.
-            name: Pipeline name (e.g. ``"vectorPipeline"``).
-            weights: Per-pipeline weights from the ``$rankFusion`` spec.
-            merged: Mutable union keyed by doc ``_id``.
-            details_by_id: Mutable mapping from doc ``_id`` to its
-                accumulated per-branch detail entries.
-            scores_by_id: Mutable mapping from doc ``_id`` to its
-                accumulated RRF score.
-        """
-        weight = weights.get(name, 1.0)
-        score_field = "_lex_seed" if name == _LEXICAL_PIPELINE_NAME else "_vec_seed"
-        ranked = sorted(
-            branch_docs,
-            key=lambda d: d.get(score_field, 0.0),
-            reverse=True,
-        )
-        for rank, doc in enumerate(ranked, start=1):
-            raw_value = float(doc.get(score_field, 0.0))
-            doc_id = doc["_id"]
-            merged.setdefault(doc_id, dict(doc))
-            details_by_id.setdefault(doc_id, []).append(
-                {
-                    "inputPipelineName": name,
-                    "rank": rank,
-                    "weight": weight,
-                    "value": raw_value,
-                }
-            )
-            scores_by_id[doc_id] = scores_by_id.get(doc_id, 0.0) + weight / (
-                _RRF_K + rank
-            )
 
     @staticmethod
     def _apply_add_fields(
@@ -363,8 +278,9 @@ class _FakeRevisions:
 
         * ``searchScore`` -- per-doc lexical seed.
         * ``vectorSearchScore`` -- per-doc vector seed.
-        * ``score`` -- ``$rankFusion`` fused score.
-        * ``scoreDetails`` -- ``$rankFusion`` detail breakdown.
+
+        Non-meta values (plain strings such as the ``_source`` branch
+        tag) are stored verbatim.
         """
         for doc in docs:
             for key, value in fields.items():
@@ -374,10 +290,6 @@ class _FakeRevisions:
                         doc[key] = doc.get("_lex_seed", 0.0)
                     elif meta_key == "vectorSearchScore":
                         doc[key] = doc.get("_vec_seed", 0.0)
-                    elif meta_key == "score":
-                        doc[key] = doc.get("_rrf_score", 0.0)
-                    elif meta_key == "scoreDetails":
-                        doc[key] = doc.get("_rrf_details", {"details": []})
                     else:
                         doc[key] = 0.0
                 else:
@@ -668,17 +580,19 @@ async def test_scoped_recall_filters_vector_branch() -> None:
     assert rev_ids == {"rev-alpha"}
 
 
-# -- Tests: hybrid mode delegates to $rankFusion -----------------------------
+# -- Tests: hybrid mode unions lexical + vector branches ---------------------
 
 
 @pytest.mark.asyncio
-async def test_hybrid_mode_emits_single_rank_fusion_stage() -> None:
-    """Hybrid mode emits one outer aggregation containing ``$rankFusion``.
+async def test_hybrid_mode_emits_single_union_with_stage() -> None:
+    """Hybrid mode emits one aggregation that unions the two branches.
 
-    Regression guard for the migration off the per-branch ``asyncio.gather``
-    fan-out: with both a query string and an embedding, exactly one
-    aggregation must run, and its first stage must be ``$rankFusion``
-    with both expected named sub-pipelines.
+    Regression guard for the migration off both the original
+    ``asyncio.gather`` fan-out and the subsequent ``$rankFusion``
+    server-side RRF: with both a query string and an embedding,
+    exactly one aggregation must run. Its main pipeline starts with
+    ``$search`` (the lexical branch), and a later stage must be a
+    ``$unionWith`` whose inner pipeline runs ``$vectorSearch``.
     """
     alpha_rev = _make_revision_doc(
         "rev-alpha",
@@ -700,18 +614,23 @@ async def test_hybrid_mode_emits_single_rank_fusion_stage() -> None:
 
     assert len(fake.last_pipelines) == 1
     pipeline = fake.last_pipelines[0]
-    assert "$rankFusion" in pipeline[0]
-    pipelines = pipeline[0]["$rankFusion"]["input"]["pipelines"]
-    assert set(pipelines.keys()) == {_VECTOR_PIPELINE_NAME, _LEXICAL_PIPELINE_NAME}
+    assert "$search" in pipeline[0]
+
+    union_stages = [stage for stage in pipeline if "$unionWith" in stage]
+    assert len(union_stages) == 1
+    inner = union_stages[0]["$unionWith"]["pipeline"]
+    assert "$vectorSearch" in inner[0]
 
 
 @pytest.mark.asyncio
-async def test_scoped_recall_filters_rank_fusion_sub_pipelines() -> None:
-    """Hybrid scoped recall pushes the space filter into both sub-pipelines.
+async def test_scoped_recall_filters_union_branches() -> None:
+    """Hybrid scoped recall pushes the space filter into both branches.
 
-    The space ``$match`` stage must appear inside each named pipeline so
-    every per-branch rank is computed against the scoped candidate set;
-    a post-fusion filter would change which items reach the RRF window.
+    The space ``$match`` stage must appear in the lexical branch (the
+    main pipeline) and in the vector branch (the ``$unionWith`` inner
+    pipeline); a post-union filter would still work but placing it in
+    each branch lets the server prune candidates earlier and matches
+    the Neo4j backend's per-branch scoping.
     """
     alpha_rev = _make_revision_doc(
         "rev-alpha",
@@ -742,10 +661,17 @@ async def test_scoped_recall_filters_rank_fusion_sub_pipelines() -> None:
         )
     )
 
-    pipelines = fake.last_pipelines[0][0]["$rankFusion"]["input"]["pipelines"]
-    for sub_pipeline in pipelines.values():
-        space_stages = _collect_space_match_stages(sub_pipeline)
-        assert len(space_stages) == 1
+    pipeline = fake.last_pipelines[0]
+    union_stage = next(stage for stage in pipeline if "$unionWith" in stage)
+    lexical_before_union: list[dict[str, Any]] = []
+    for stage in pipeline:
+        if "$unionWith" in stage:
+            break
+        lexical_before_union.append(stage)
+    vector_branch = union_stage["$unionWith"]["pipeline"]
+
+    assert len(_collect_space_match_stages(lexical_before_union)) == 1
+    assert len(_collect_space_match_stages(vector_branch)) == 1
 
     rev_ids = {r.revision.id for r in results}
     assert rev_ids == {"rev-alpha"}

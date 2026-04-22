@@ -46,6 +46,35 @@ DEFAULT_TYPE_WEIGHTS: dict[MatchSource, float] = {
 """Default per-source type weights matching :class:`memex.config.RetrievalSettings`."""
 
 
+def saturate_score(score: float, k: float) -> float:
+    """Apply Okapi-style saturation ``s / (s + k)`` to a raw score.
+
+    Maps a non-negative raw score onto ``[0, 1)`` while preserving
+    ordering. Strictly monotonic: ``0 -> 0``, ``s = k -> 0.5`` (the
+    "confidence midpoint"), ``s -> inf`` asymptotes to ``1``.
+
+    Used to calibrate both CombMAX branches onto the same scale so a
+    single inflated score in either modality cannot hijack the ``max``
+    -- the failure mode Bruch et al. 2023 identify in CombMAX with
+    poorly-calibrated retrievers. Lexical BM25 (``[0, inf)``) and
+    vector cosine (``[0, 1]``) are both transformed through this
+    single shape; the per-branch ``k`` encodes "raw score at which
+    this branch is 50 percent confident the document is relevant."
+
+    Args:
+        score: Raw branch score. Must be non-negative; negative inputs
+            would fall outside ``[0, 1]`` and are not produced by BM25
+            or cosine-similarity pipelines in practice.
+        k: Saturation midpoint constant. Positive. Sourced from
+            :attr:`SearchRequest.lexical_saturation_k` or
+            :attr:`SearchRequest.vector_saturation_k` per branch.
+
+    Returns:
+        Saturated score in ``[0, 1)``.
+    """
+    return score / (score + k)
+
+
 class SearchRequest(BaseModel, frozen=True):
     """Common input for all search strategies.
 
@@ -56,7 +85,23 @@ class SearchRequest(BaseModel, frozen=True):
             (hybrid ``context_top_k``).
         memory_limit: Max unique items in the hybrid result set.
         include_deprecated: If True, include results from deprecated items.
-        beta: Calibration factor for cosine similarity.
+        lexical_saturation_k: Okapi-style saturation midpoint applied
+            to raw BM25 scores before CombMAX fusion. A BM25 score
+            equal to ``k`` maps to ``0.5`` under the ``s / (s + k)``
+            transform (the "confidence midpoint"); larger scores
+            asymptote toward ``1``. Compresses the unbounded
+            ``[0, inf)`` BM25 range onto ``[0, 1]``.
+        vector_saturation_k: Okapi-style saturation midpoint applied
+            to raw cosine similarity. A cosine value equal to ``k``
+            maps to ``0.5`` under the ``cos / (cos + k)`` transform;
+            higher values asymptote toward ``1``. Replaces the older
+            linear ``beta * cos`` calibration so both branches share
+            identical ``s / (s + k)`` shape and CombMAX compares a
+            lexical "confidence midpoint" against a vector "confidence
+            midpoint" directly -- no scalar fudge factor. Default
+            ``0.5`` anchors the midpoint at raw cosine ``0.5``, which
+            is roughly where typical sentence-embedding models cross
+            from "unrelated" to "related" content.
         type_weights: Per-source type weights for hybrid fusion.
         space_ids: Optional whitelist of space ids to restrict recall to.
             When provided, only revisions whose denormalized ``space_id``
@@ -70,7 +115,8 @@ class SearchRequest(BaseModel, frozen=True):
     limit: int = Field(default=10, ge=1, le=100)
     memory_limit: int = Field(default=3, ge=1, le=100)
     include_deprecated: bool = False
-    beta: float = 0.85
+    lexical_saturation_k: float = Field(default=1.0, gt=0.0)
+    vector_saturation_k: float = Field(default=0.5, gt=0.0)
     type_weights: dict[MatchSource, float] = Field(
         default_factory=lambda: dict(DEFAULT_TYPE_WEIGHTS)
     )
@@ -137,9 +183,11 @@ class HybridResult(SearchResult, frozen=True):
     sibling reranking per FR-7.
 
     Args:
-        lexical_score: BM25 score (0.0 if not matched lexically).
-        vector_score: Beta-calibrated cosine similarity
-            (0.0 if not matched by vector).
+        lexical_score: Saturated BM25 score in ``[0, 1)``
+            (0.0 if not matched lexically).
+        vector_score: Saturated cosine similarity in ``[0, 1)``
+            (0.0 if not matched by vector). Both branch scores share
+            the same scale via Okapi saturation.
         match_source: Source of the match for type weight selection.
         search_mode: Which search branches were active.
     """
