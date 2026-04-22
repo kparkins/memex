@@ -1,0 +1,154 @@
+name: memex-mongo-search
+
+services:
+  # Service to generate keyfile and password file if they don't exist
+  setup-generator:
+    image: alpine:latest
+    container_name: memex-setup-generator
+    volumes:
+      - auth-files:/auth
+    environment:
+      - MONGOT_PASSWORD=${MONGOT_PASSWORD:-mongot}
+      - MONGO_ADMIN_PASSWORD=${MONGO_ADMIN_PASSWORD:-admin}
+      # Optional: Voyage API Key for auto-embedding features
+      # - VOYAGE_API_KEY=${VOYAGE_API_KEY}
+    command: >
+      sh -c "
+        echo 'Setting up security files...';
+        echo 'Admin password: [HIDDEN]';
+        echo 'Mongot password: [HIDDEN]';
+
+        # Generate keyfile if it doesn't exist
+        if [ ! -f /auth/keyfile ]; then
+          echo 'Generating keyfile...';
+          apk add --no-cache openssl;
+          openssl rand -base64 756 > /auth/keyfile;
+          chmod 400 /auth/keyfile;
+          chown 1000:1000 /auth/keyfile;
+          echo 'Keyfile generated successfully';
+        else
+          echo 'Keyfile already exists, skipping generation';
+        fi;
+
+        # Create password file if it doesn't exist
+        if [ ! -f /auth/passwordFile ]; then
+          echo 'Creating password file...';
+          echo -n \"$$MONGOT_PASSWORD\" > /auth/passwordFile;
+          chmod 600 /auth/passwordFile;
+          chown 1000:1000 /auth/passwordFile;
+          echo 'Password file created successfully';
+        else
+          echo 'Password file already exists, skipping creation';
+        fi;
+
+        # If VOYAGE_API_KEY is provided, create the query and indexing key files
+        if [ -n \"$$VOYAGE_API_KEY\" ]; then
+          echo 'Creating Voyage API key files...';
+          echo -n \"$$VOYAGE_API_KEY\" > /auth/voyage-api-query-key;
+          echo -n \"$$VOYAGE_API_KEY\" > /auth/voyage-api-indexing-key;
+          chmod 600 /auth/voyage-api-query-key /auth/voyage-api-indexing-key;
+          chown 1000:1000 /auth/voyage-api-query-key /auth/voyage-api-indexing-key;
+          echo 'Voyage API key files created successfully';
+        else
+          echo 'No VOYAGE_API_KEY provided, skipping Voyage API key file creation';
+        fi;
+        echo 'Setup completed successfully';
+      "
+    restart: "no"
+
+  mongod:
+    image: mongodb/mongodb-community-server:8.1.0
+    container_name: memex-mongod
+    hostname: mongod.search-community
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ADMIN_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ADMIN_PASSWORD:-admin}
+      MONGODB_INITDB_ROOT_USERNAME: ${MONGO_ADMIN_USERNAME:-admin}
+      MONGODB_INITDB_ROOT_PASSWORD: ${MONGO_ADMIN_PASSWORD:-admin}
+      MONGOT_PASSWORD: ${MONGOT_PASSWORD:-mongot}
+      MONGO_ADMIN_PASSWORD: ${MONGO_ADMIN_PASSWORD:-admin}
+    command: ["--config", "/etc/mongod.conf"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongod_data:/data/db
+      - mongod_configdb:/data/configdb
+      - ./docker/mongod.conf:/etc/mongod.conf:ro
+      - auth-files:/auth
+    depends_on:
+      setup-generator:
+        condition: service_completed_successfully
+    networks:
+      - search-community
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "--username",
+          "${MONGO_ADMIN_USERNAME:-admin}",
+          "--password",
+          "${MONGO_ADMIN_PASSWORD:-admin}",
+          "--authenticationDatabase",
+          "admin",
+          "--eval",
+          "db.adminCommand('ping')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mongo-init:
+    image: mongodb/mongodb-community-server:8.1.0
+    container_name: memex-mongo-init
+    environment:
+      MONGO_HOST: mongod.search-community
+      MONGO_PORT: 27017
+      MONGODB_INITDB_ROOT_USERNAME: ${MONGO_ADMIN_USERNAME:-admin}
+      MONGODB_INITDB_ROOT_PASSWORD: ${MONGO_ADMIN_PASSWORD:-admin}
+      MONGOT_PASSWORD: ${MONGOT_PASSWORD:-mongot}
+    command: ["/bin/sh", "/init-scripts/init-mongo.sh"]
+    volumes:
+      - ./docker/init-mongo.sh:/init-scripts/init-mongo.sh:ro
+    depends_on:
+      mongod:
+        condition: service_healthy
+    networks:
+      - search-community
+    restart: "no"
+
+  mongot:
+    image: mongodb/mongodb-community-search:8.1.0
+    container_name: memex-mongot
+    hostname: mongot.search-community
+    ports:
+      - "27028:27028"  # gRPC server port
+      - "8080:8080"    # Health check port
+      - "9946:9946"    # Metrics port
+    volumes:
+      - mongot_data:/data/mongot
+      - ./docker/mongot.conf:/mongot-community/config.default.yml:ro
+      - auth-files:/auth
+    networks:
+      - search-community
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://mongot:9946/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  mongod_data:
+  mongod_configdb:
+  mongot_data:
+  auth-files:
+
+networks:
+  search-community:
+    name: memex-search-community
+    driver: bridge

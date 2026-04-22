@@ -1,8 +1,13 @@
 """MongoDB Atlas hybrid retrieval strategy.
 
-Combines Atlas Search (fulltext) and Atlas Vector Search branches
-via concurrent aggregation pipelines, then applies the paper's fusion
-formula: ``S(q,m) = w(m) * max(s_lex(m), beta * s_vec(m))``.
+Combines Atlas Search (fulltext) and Atlas Vector Search via the
+MongoDB 8.1 ``$rankFusion`` aggregation stage, which performs server-side
+Reciprocal Rank Fusion (RRF) using the formula
+``weight * (1 / (60 + rank))`` summed across the input pipelines.
+
+When only one branch is active (lexical or vector), the corresponding
+single-branch pipeline runs directly because ``$rankFusion`` requires
+multiple input pipelines.
 
 Satisfies the same :class:`~memex.retrieval.strategy.SearchStrategy`
 protocol as the Neo4j-based :class:`~memex.retrieval.hybrid.HybridSearch`.
@@ -10,7 +15,6 @@ protocol as the Neo4j-based :class:`~memex.retrieval.hybrid.HybridSearch`.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -19,7 +23,6 @@ from pymongo.asynchronous.collection import AsyncCollection
 
 from memex.domain.models import ItemKind, Revision
 from memex.retrieval.bm25 import build_search_query
-from memex.retrieval.hybrid import compute_fused_score
 from memex.retrieval.models import (
     DEFAULT_TYPE_WEIGHTS,
     HybridResult,
@@ -31,11 +34,29 @@ from memex.stores.mongo_store import FULLTEXT_INDEX_NAME, VECTOR_INDEX_NAME
 
 logger = logging.getLogger(__name__)
 
+# Pipeline names referenced by the ``$rankFusion`` stage and the
+# downstream ``scoreDetails`` parser. Keep in one place so a rename
+# stays consistent across emit and parse paths.
+_VECTOR_PIPELINE_NAME = "vectorPipeline"
+_LEXICAL_PIPELINE_NAME = "fullTextPipeline"
+
+# Weight assigned to the lexical pipeline in ``combination.weights``.
+# The vector pipeline weight is taken from ``SearchRequest.beta``, which
+# preserves the existing semantics of ``beta`` as the vector calibration
+# factor relative to the lexical baseline.
+_LEXICAL_PIPELINE_WEIGHT = 1.0
+
+# Vector-search overfetch factors. Atlas vector search distinguishes
+# ``numCandidates`` (the HNSW exploration width) from ``limit`` (the
+# returned set). We overfetch the limit when deprecation may filter
+# results downstream, then overfetch the candidate pool relative to
+# the limit to maintain recall.
 _DEPRECATED_OVERFETCH_FACTOR = 2
+_VECTOR_NUM_CANDIDATES_FACTOR = 2
 
 # Internal fields injected by aggregation pipelines, stripped before
 # converting MongoDB documents to domain Revision objects.
-_INTERNAL_FIELDS = frozenset({"_id", "_score", "_source", "_item"})
+_INTERNAL_FIELDS = frozenset({"_id", "_score", "_score_details", "_source", "_item"})
 
 
 def _build_revision(doc: dict[str, Any]) -> Revision:
@@ -104,19 +125,85 @@ def _space_filter_stage(
     return {"$match": {"space_id": {"$in": list(space_ids)}}}
 
 
+def _extract_branch_scores(
+    score_details: dict[str, Any] | None,
+) -> tuple[float, float]:
+    """Pull per-branch raw scores from a ``$rankFusion`` ``scoreDetails`` doc.
+
+    Atlas reports each contributing pipeline's raw score (BM25 score
+    for ``$search``, cosine similarity for ``$vectorSearch``) under
+    ``scoreDetails.details[i].value`` keyed by ``inputPipelineName``.
+    Pipelines that did not surface the document are omitted, so we
+    default the missing branch's score to zero.
+
+    Args:
+        score_details: The ``scoreDetails`` document attached by the
+            ``$rankFusion`` stage. ``None`` is treated as "no detail".
+
+    Returns:
+        Tuple of (lexical_score, vector_score). Either may be 0.0 when
+        the corresponding branch did not contribute.
+    """
+    lexical_score = 0.0
+    vector_score = 0.0
+    if not score_details:
+        return lexical_score, vector_score
+    for entry in score_details.get("details", []):
+        name = entry.get("inputPipelineName")
+        value = float(entry.get("value", 0.0))
+        if name == _LEXICAL_PIPELINE_NAME:
+            lexical_score = value
+        elif name == _VECTOR_PIPELINE_NAME:
+            vector_score = value
+    return lexical_score, vector_score
+
+
+def _limit_unique_items(
+    results: list[HybridResult],
+    memory_limit: int,
+) -> list[HybridResult]:
+    """Cap the result set by the number of unique owning items.
+
+    Mirrors the de-duplication semantics of the Neo4j hybrid path: once
+    ``memory_limit`` distinct items have been seen, additional revisions
+    of already-seen items are still kept (so siblings can be reranked
+    client-side) but no new items are admitted.
+
+    Args:
+        results: Candidate hybrid results, already sorted by descending
+            fused score.
+        memory_limit: Max distinct items to admit.
+
+    Returns:
+        The pruned result list.
+    """
+    seen_items: set[str] = set()
+    limited: list[HybridResult] = []
+    for r in results:
+        if r.item_id not in seen_items:
+            if len(seen_items) >= memory_limit:
+                break
+            seen_items.add(r.item_id)
+        limited.append(r)
+    return limited
+
+
 class MongoHybridSearch:
     """Hybrid retrieval strategy for MongoDB Atlas Search + Vector Search.
 
     Satisfies :class:`~memex.retrieval.strategy.SearchStrategy`.
 
-    Runs Atlas fulltext and/or vector search branches via separate
-    aggregation pipelines (concurrently when both are active), then
-    fuses results using ``S(q,m) = w(m) * max(s_lex, beta * s_vec)``.
+    For hybrid requests (both a query string and an embedding), emits a
+    single ``$rankFusion`` aggregation that runs the lexical and vector
+    branches as named sub-pipelines and fuses them server-side via
+    Reciprocal Rank Fusion. For lexical-only or vector-only requests,
+    runs the corresponding single-branch pipeline directly.
 
     Args:
         revisions_collection: pymongo async collection for revisions.
         items_collection: pymongo async collection for items.
-        type_weights: Per-source type weights for fusion scoring.
+        type_weights: Per-source type weights applied post-fusion to
+            scale the RRF score by ``MatchSource``.
     """
 
     def __init__(
@@ -135,7 +222,8 @@ class MongoHybridSearch:
 
         Determines which branches to run based on the request contents:
         lexical-only when only query text is present, vector-only when
-        only an embedding is provided, or full hybrid when both exist.
+        only an embedding is provided, or full hybrid (via
+        ``$rankFusion``) when both exist.
 
         Args:
             request: Search parameters including query, embedding, limits.
@@ -156,56 +244,98 @@ class MongoHybridSearch:
             return []
 
         if has_lexical and has_vector:
-            search_mode = SearchMode.HYBRID
-        elif has_lexical:
-            search_mode = SearchMode.LEXICAL
-        else:
-            search_mode = SearchMode.VECTOR
+            return await self._run_rank_fusion(search_query, request, weights)
+        if has_lexical:
+            return await self._run_lexical_only(search_query, request, weights)
+        return await self._run_vector_only(request, weights)
 
-        dep_stages = _deprecated_filter_stages(
-            self._items_name, request.include_deprecated
-        )
-        space_stage = _space_filter_stage(request.space_ids)
-
-        candidates: dict[str, dict[str, Any]] = {}
-
-        if search_mode == SearchMode.HYBRID:
-            lex_docs, vec_docs = await asyncio.gather(
-                self._run_lexical(search_query, request, dep_stages, space_stage),
-                self._run_vector(request, dep_stages, space_stage),
-            )
-            self._collect(candidates, lex_docs, "lexical", request.beta)
-            self._collect(candidates, vec_docs, "vector", request.beta)
-        elif search_mode == SearchMode.LEXICAL:
-            lex_docs = await self._run_lexical(
-                search_query, request, dep_stages, space_stage
-            )
-            self._collect(candidates, lex_docs, "lexical", request.beta)
-        else:
-            vec_docs = await self._run_vector(request, dep_stages, space_stage)
-            self._collect(candidates, vec_docs, "vector", request.beta)
-
-        return _fuse_and_limit(candidates, weights, search_mode, request.memory_limit)
-
-    async def _run_lexical(
+    async def _run_rank_fusion(
         self,
         search_query: str,
         request: SearchRequest,
-        dep_stages: list[dict[str, Any]],
-        space_stage: dict[str, Any] | None,
-    ) -> list[dict[str, Any]]:
-        """Run the Atlas Search lexical pipeline.
+        weights: dict[MatchSource, float],
+    ) -> list[HybridResult]:
+        """Execute the ``$rankFusion`` hybrid pipeline.
+
+        Builds named lexical and vector sub-pipelines, applies the
+        space-id filter inside each branch (so every per-branch rank
+        is computed against the scoped candidate set), then fuses
+        server-side via RRF. Deprecated filtering happens after fusion
+        because the ``items.deprecated`` field is not denormalized
+        onto revisions.
 
         Args:
             search_query: Sanitized fulltext query string.
-            request: Search parameters for limit / deprecated settings.
-            dep_stages: Pre-built $lookup + $match stages.
-            space_stage: Optional ``$match`` stage restricting results to
-                a whitelist of denormalized ``space_id`` values.
+            request: Active ``SearchRequest``.
+            weights: Resolved per-source type weights.
 
         Returns:
-            List of raw aggregation result documents.
+            HybridResult list ordered by descending fused score,
+            limited to ``request.memory_limit`` unique items.
         """
+        space_stage = _space_filter_stage(request.space_ids)
+        dep_stages = _deprecated_filter_stages(
+            self._items_name, request.include_deprecated
+        )
+
+        vector_branch = self._build_vector_branch(request, space_stage)
+        lexical_branch = self._build_lexical_branch(
+            search_query, request, space_stage
+        )
+
+        pipeline: list[dict[str, Any]] = [
+            {
+                "$rankFusion": {
+                    "input": {
+                        "pipelines": {
+                            _VECTOR_PIPELINE_NAME: vector_branch,
+                            _LEXICAL_PIPELINE_NAME: lexical_branch,
+                        }
+                    },
+                    "combination": {
+                        "weights": {
+                            _VECTOR_PIPELINE_NAME: request.beta,
+                            _LEXICAL_PIPELINE_NAME: _LEXICAL_PIPELINE_WEIGHT,
+                        }
+                    },
+                    "scoreDetails": True,
+                }
+            },
+            {
+                "$addFields": {
+                    "_score": {"$meta": "score"},
+                    "_score_details": {"$meta": "scoreDetails"},
+                }
+            },
+        ]
+        pipeline.extend(dep_stages)
+
+        cursor = await self._revisions.aggregate(pipeline)
+        docs = [doc async for doc in cursor]
+        return self._build_fused_results(docs, weights, request.memory_limit)
+
+    async def _run_lexical_only(
+        self,
+        search_query: str,
+        request: SearchRequest,
+        weights: dict[MatchSource, float],
+    ) -> list[HybridResult]:
+        """Run the lexical-only Atlas Search pipeline.
+
+        Args:
+            search_query: Sanitized fulltext query string.
+            request: Active ``SearchRequest``.
+            weights: Resolved per-source type weights.
+
+        Returns:
+            HybridResult list with ``search_mode=LEXICAL``, ordered by
+            descending score.
+        """
+        space_stage = _space_filter_stage(request.space_ids)
+        dep_stages = _deprecated_filter_stages(
+            self._items_name, request.include_deprecated
+        )
+
         pipeline: list[dict[str, Any]] = [
             {
                 "$search": {
@@ -217,41 +347,47 @@ class MongoHybridSearch:
                     },
                 }
             },
-            {
-                "$addFields": {
-                    "_score": {"$meta": "searchScore"},
-                    "_source": "lexical",
-                }
-            },
+            {"$addFields": {"_score": {"$meta": "searchScore"}}},
         ]
         if space_stage is not None:
             pipeline.append(space_stage)
         pipeline.extend(dep_stages)
         pipeline.append({"$limit": request.limit})
-        cursor = await self._revisions.aggregate(pipeline)
-        return [doc async for doc in cursor]
 
-    async def _run_vector(
+        cursor = await self._revisions.aggregate(pipeline)
+        docs = [doc async for doc in cursor]
+        return self._build_single_branch_results(
+            docs,
+            weights,
+            SearchMode.LEXICAL,
+            branch="lexical",
+            memory_limit=request.memory_limit,
+        )
+
+    async def _run_vector_only(
         self,
         request: SearchRequest,
-        dep_stages: list[dict[str, Any]],
-        space_stage: dict[str, Any] | None,
-    ) -> list[dict[str, Any]]:
-        """Run the Atlas Vector Search pipeline.
+        weights: dict[MatchSource, float],
+    ) -> list[HybridResult]:
+        """Run the vector-only Atlas Vector Search pipeline.
 
-        ``$vectorSearch`` must be the first stage in the pipeline
-        (MongoDB requirement), so the space filter is applied as the
-        immediately-following ``$match`` stage.
+        ``$vectorSearch`` must be the first stage (MongoDB requirement),
+        so the optional space-id filter is the immediately-following
+        ``$match`` stage.
 
         Args:
-            request: Search parameters (embedding, limit, deprecated).
-            dep_stages: Pre-built $lookup + $match stages.
-            space_stage: Optional ``$match`` stage restricting results to
-                a whitelist of denormalized ``space_id`` values.
+            request: Active ``SearchRequest``.
+            weights: Resolved per-source type weights.
 
         Returns:
-            List of raw aggregation result documents.
+            HybridResult list with ``search_mode=VECTOR``, ordered by
+            descending score.
         """
+        space_stage = _space_filter_stage(request.space_ids)
+        dep_stages = _deprecated_filter_stages(
+            self._items_name, request.include_deprecated
+        )
+
         top_k = (
             request.limit
             if request.include_deprecated
@@ -263,111 +399,184 @@ class MongoHybridSearch:
                     "index": VECTOR_INDEX_NAME,
                     "path": "embedding",
                     "queryVector": request.query_embedding,
-                    "numCandidates": top_k * _DEPRECATED_OVERFETCH_FACTOR,
+                    "numCandidates": top_k * _VECTOR_NUM_CANDIDATES_FACTOR,
                     "limit": top_k,
                 }
             },
-            {
-                "$addFields": {
-                    "_score": {"$meta": "vectorSearchScore"},
-                    "_source": "vector",
-                }
-            },
+            {"$addFields": {"_score": {"$meta": "vectorSearchScore"}}},
         ]
         if space_stage is not None:
             pipeline.append(space_stage)
         pipeline.extend(dep_stages)
+
         cursor = await self._revisions.aggregate(pipeline)
-        return [doc async for doc in cursor]
+        docs = [doc async for doc in cursor]
+        return self._build_single_branch_results(
+            docs,
+            weights,
+            SearchMode.VECTOR,
+            branch="vector",
+            memory_limit=request.memory_limit,
+        )
 
     @staticmethod
-    def _collect(
-        candidates: dict[str, dict[str, Any]],
-        docs: list[dict[str, Any]],
-        source: str,
-        beta: float,
-    ) -> None:
-        """Merge pipeline results into the candidates dict.
-
-        Deduplicates by revision ID, keeping the best score per branch.
+    def _build_vector_branch(
+        request: SearchRequest,
+        space_stage: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Build the inner vector sub-pipeline for ``$rankFusion``.
 
         Args:
-            candidates: Mutable accumulator keyed by revision ID.
-            docs: Raw aggregation result documents.
-            source: Branch label (``"lexical"`` or ``"vector"``).
-            beta: Vector score calibration factor.
+            request: Active ``SearchRequest``.
+            space_stage: Optional space-id filter stage to apply after
+                ``$vectorSearch``.
+
+        Returns:
+            Sub-pipeline stages.
         """
+        top_k = request.limit
+        branch: list[dict[str, Any]] = [
+            {
+                "$vectorSearch": {
+                    "index": VECTOR_INDEX_NAME,
+                    "path": "embedding",
+                    "queryVector": request.query_embedding,
+                    "numCandidates": top_k * _VECTOR_NUM_CANDIDATES_FACTOR,
+                    "limit": top_k,
+                }
+            }
+        ]
+        if space_stage is not None:
+            branch.append(space_stage)
+        return branch
+
+    @staticmethod
+    def _build_lexical_branch(
+        search_query: str,
+        request: SearchRequest,
+        space_stage: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Build the inner lexical sub-pipeline for ``$rankFusion``.
+
+        Args:
+            search_query: Sanitized fulltext query string.
+            request: Active ``SearchRequest``.
+            space_stage: Optional space-id filter stage to apply after
+                ``$search``.
+
+        Returns:
+            Sub-pipeline stages.
+        """
+        branch: list[dict[str, Any]] = [
+            {
+                "$search": {
+                    "index": FULLTEXT_INDEX_NAME,
+                    "text": {
+                        "query": search_query,
+                        "path": "search_text",
+                        "fuzzy": {"maxEdits": 1, "prefixLength": 2},
+                    },
+                }
+            }
+        ]
+        if space_stage is not None:
+            branch.append(space_stage)
+        branch.append({"$limit": request.limit})
+        return branch
+
+    def _build_fused_results(
+        self,
+        docs: list[dict[str, Any]],
+        weights: dict[MatchSource, float],
+        memory_limit: int,
+    ) -> list[HybridResult]:
+        """Convert ``$rankFusion`` documents into HybridResult instances.
+
+        The RRF score from ``{$meta: "score"}`` is multiplied by the
+        per-source type weight (currently always ``REVISION`` since
+        only revisions are matched), and per-branch raw scores are
+        recovered from the ``scoreDetails`` payload so callers can
+        still inspect the lexical/vector contribution.
+
+        Args:
+            docs: Raw aggregation result documents.
+            weights: Resolved per-source type weights.
+            memory_limit: Max distinct items in the output.
+
+        Returns:
+            HybridResult list ordered by descending fused score.
+        """
+        match_source = MatchSource.REVISION
+        type_weight = weights.get(match_source, DEFAULT_TYPE_WEIGHTS[match_source])
+        results: list[HybridResult] = []
         for doc in docs:
             rev = _build_revision(doc)
-            rev_id = rev.id
-            raw_score = float(doc["_score"])
             item_doc = doc["_item"]
-
-            if rev_id not in candidates:
-                candidates[rev_id] = {
-                    "revision": rev,
-                    "item_id": str(item_doc["_id"]),
-                    "item_kind": ItemKind(str(item_doc["kind"])),
-                    "match_source": MatchSource.REVISION,
-                    "lexical_score": 0.0,
-                    "vector_score": 0.0,
-                }
-
-            entry = candidates[rev_id]
-            if source == "lexical":
-                entry["lexical_score"] = max(entry["lexical_score"], raw_score)
-            else:
-                entry["vector_score"] = max(entry["vector_score"], beta * raw_score)
-
-
-def _fuse_and_limit(
-    candidates: dict[str, dict[str, Any]],
-    weights: dict[MatchSource, float],
-    search_mode: SearchMode,
-    memory_limit: int,
-) -> list[HybridResult]:
-    """Apply fusion scoring, sort, and enforce memory_limit.
-
-    Args:
-        candidates: Raw candidate dict keyed by revision ID.
-        weights: Per-source type weights.
-        search_mode: Active search mode for metadata.
-        memory_limit: Max unique items in the output.
-
-    Returns:
-        Sorted, limited HybridResult list.
-    """
-    results: list[HybridResult] = []
-    for entry in candidates.values():
-        source: MatchSource = entry["match_source"]
-        w = weights.get(source, 0.9)
-        fused = compute_fused_score(
-            entry["lexical_score"],
-            entry["vector_score"],
-            w,
-        )
-        results.append(
-            HybridResult(
-                revision=entry["revision"],
-                item_id=entry["item_id"],
-                item_kind=entry["item_kind"],
-                score=fused,
-                lexical_score=entry["lexical_score"],
-                vector_score=entry["vector_score"],
-                match_source=source,
-                search_mode=search_mode,
+            rrf_score = float(doc.get("_score", 0.0))
+            lexical_score, vector_score = _extract_branch_scores(
+                doc.get("_score_details")
             )
-        )
+            results.append(
+                HybridResult(
+                    revision=rev,
+                    item_id=str(item_doc["_id"]),
+                    item_kind=ItemKind(str(item_doc["kind"])),
+                    score=type_weight * rrf_score,
+                    lexical_score=lexical_score,
+                    vector_score=vector_score,
+                    match_source=match_source,
+                    search_mode=SearchMode.HYBRID,
+                )
+            )
+        results.sort(key=lambda r: r.score, reverse=True)
+        return _limit_unique_items(results, memory_limit)
 
-    results.sort(key=lambda r: r.score, reverse=True)
+    def _build_single_branch_results(
+        self,
+        docs: list[dict[str, Any]],
+        weights: dict[MatchSource, float],
+        search_mode: SearchMode,
+        *,
+        branch: str,
+        memory_limit: int,
+    ) -> list[HybridResult]:
+        """Convert single-branch documents into HybridResult instances.
 
-    seen_items: set[str] = set()
-    limited: list[HybridResult] = []
-    for r in results:
-        if r.item_id not in seen_items:
-            if len(seen_items) >= memory_limit:
-                break
-            seen_items.add(r.item_id)
-        limited.append(r)
+        Mirrors :meth:`_build_fused_results` but populates only the
+        active branch's score on each result; the other branch's
+        score is zero.
 
-    return limited
+        Args:
+            docs: Raw aggregation result documents.
+            weights: Resolved per-source type weights.
+            search_mode: ``LEXICAL`` or ``VECTOR``.
+            branch: ``"lexical"`` or ``"vector"`` -- selects which
+                ``HybridResult`` field receives the raw score.
+            memory_limit: Max distinct items in the output.
+
+        Returns:
+            HybridResult list ordered by descending score.
+        """
+        match_source = MatchSource.REVISION
+        type_weight = weights.get(match_source, DEFAULT_TYPE_WEIGHTS[match_source])
+        results: list[HybridResult] = []
+        for doc in docs:
+            rev = _build_revision(doc)
+            item_doc = doc["_item"]
+            raw_score = float(doc.get("_score", 0.0))
+            lexical_score = raw_score if branch == "lexical" else 0.0
+            vector_score = raw_score if branch == "vector" else 0.0
+            results.append(
+                HybridResult(
+                    revision=rev,
+                    item_id=str(item_doc["_id"]),
+                    item_kind=ItemKind(str(item_doc["kind"])),
+                    score=type_weight * raw_score,
+                    lexical_score=lexical_score,
+                    vector_score=vector_score,
+                    match_source=match_source,
+                    search_mode=search_mode,
+                )
+            )
+        results.sort(key=lambda r: r.score, reverse=True)
+        return _limit_unique_items(results, memory_limit)

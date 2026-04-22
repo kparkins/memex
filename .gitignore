@@ -1,4 +1,7 @@
 # Python-generated files
+.claude/
+.serena/
+.omc/
 __pycache__/
 *.py[oc]
 build/
