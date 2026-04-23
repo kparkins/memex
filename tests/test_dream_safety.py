@@ -27,7 +27,6 @@ from memex.orchestration.dream_collector import (
 )
 from memex.orchestration.dream_executor import DreamStateExecutor, ExecutionReport
 from memex.orchestration.dream_pipeline import (
-    DreamAuditReport,
     DreamStatePipeline,
     apply_circuit_breaker,
     compute_deprecation_ratio,
@@ -369,7 +368,7 @@ class TestDryRunMode:
 
         stored = await env.store.get_audit_report(report.report_id)
         assert stored is not None
-        assert stored["dry_run"] is True
+        assert stored.dry_run is True
 
 
 # -- Integration tests: circuit breaker -------------------------------------
@@ -582,8 +581,8 @@ class TestAuditReportPersistence:
 
         stored = await env.store.get_audit_report(report.report_id)
         assert stored is not None
-        assert stored["report_id"] == report.report_id
-        assert stored["project_id"] == env.project.id
+        assert stored.report_id == report.report_id
+        assert stored.project_id == env.project.id
 
     @pytest.mark.asyncio
     async def test_report_contains_all_fields(self, env) -> None:
@@ -615,15 +614,15 @@ class TestAuditReportPersistence:
 
         stored = await env.store.get_audit_report(report.report_id)
         assert stored is not None
-        assert stored["dry_run"] is False
-        assert stored["revisions_inspected"] == 1
-        assert stored["circuit_breaker_tripped"] is False
-        assert stored["deprecation_ratio"] == 0.0
-        assert stored["max_deprecation_ratio"] == 0.5
-        assert len(stored["actions_recommended"]) == 1
-        assert stored["execution"] is not None
-        assert stored["execution"]["total"] == 1
-        assert stored["execution"]["succeeded"] == 1
+        assert stored.dry_run is False
+        assert stored.revisions_inspected == 1
+        assert stored.circuit_breaker_tripped is False
+        assert stored.deprecation_ratio == 0.0
+        assert stored.max_deprecation_ratio == 0.5
+        assert len(stored.actions_recommended) == 1
+        assert stored.execution is not None
+        assert stored.execution.total == 1
+        assert stored.execution.succeeded == 1
 
     @pytest.mark.asyncio
     async def test_report_not_found_returns_none(self, env) -> None:
@@ -654,7 +653,7 @@ class TestAuditReportPersistence:
 
         reports = await env.store.list_audit_reports(env.project.id)
         assert len(reports) == 2
-        ids = [r["report_id"] for r in reports]
+        ids = [r.report_id for r in reports]
         assert report1.report_id in ids
         assert report2.report_id in ids
 
@@ -680,10 +679,9 @@ class TestAuditReportPersistence:
 
         stored = await env.store.get_audit_report(report.report_id)
         assert stored is not None
-        restored = DreamAuditReport.model_validate(stored)
-        assert restored.report_id == report.report_id
-        assert restored.project_id == report.project_id
-        assert restored.dry_run == report.dry_run
+        assert stored.report_id == report.report_id
+        assert stored.project_id == report.project_id
+        assert stored.dry_run == report.dry_run
 
     @pytest.mark.asyncio
     async def test_report_captures_circuit_breaker_state(self, env) -> None:
@@ -719,11 +717,12 @@ class TestAuditReportPersistence:
 
         stored = await env.store.get_audit_report(report.report_id)
         assert stored is not None
-        assert stored["circuit_breaker_tripped"] is True
-        assert stored["deprecation_ratio"] == pytest.approx(2 / 3)
+        assert stored.circuit_breaker_tripped is True
+        assert stored.deprecation_ratio == pytest.approx(2 / 3)
         # All 3 actions recommended, but only 1 executed
-        assert len(stored["actions_recommended"]) == 3
-        assert stored["execution"]["total"] == 1
+        assert len(stored.actions_recommended) == 3
+        assert stored.execution is not None
+        assert stored.execution.total == 1
 
 
 # -- R6: Dream State model config ------------------------------------------

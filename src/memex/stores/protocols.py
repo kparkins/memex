@@ -11,12 +11,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
+from memex.learning.judgments import QueryJudgment
+from memex.learning.profiles import RetrievalProfile
+
+if TYPE_CHECKING:
+    from memex.learning.calibration_pipeline import CalibrationAuditReport
+    from memex.orchestration.dream_pipeline import DreamAuditReport
 
 
 @dataclass(frozen=True)
@@ -569,14 +575,14 @@ class AuditStore(Protocol):
         """
         ...
 
-    async def get_audit_report(self, report_id: str) -> dict[str, object] | None:
+    async def get_audit_report(self, report_id: str) -> DreamAuditReport | None:
         """Retrieve a Dream State audit report by ID.
 
         Args:
             report_id: Unique report identifier.
 
         Returns:
-            Deserialized report dict, or None if not found.
+            Parsed DreamAuditReport, or None if not found.
         """
         ...
 
@@ -585,7 +591,7 @@ class AuditStore(Protocol):
         project_id: str,
         *,
         limit: int = 50,
-    ) -> list[dict[str, object]]:
+    ) -> list[DreamAuditReport]:
         """List Dream State audit reports for a project.
 
         Args:
@@ -593,7 +599,193 @@ class AuditStore(Protocol):
             limit: Maximum number of reports to return.
 
         Returns:
-            List of report dicts, newest first.
+            Parsed DreamAuditReport list, newest first.
+        """
+        ...
+
+
+@runtime_checkable
+class RetrievalProfileStore(Protocol):
+    """Retrieval calibration profile persistence."""
+
+    async def get_retrieval_profile(self, project_id: str) -> RetrievalProfile | None:
+        """Retrieve the active retrieval profile for a project.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The active RetrievalProfile, or None if none has been saved.
+        """
+        ...
+
+    async def save_retrieval_profile(self, profile: RetrievalProfile) -> None:
+        """Persist a retrieval profile as the active profile for its project.
+
+        Implementations must atomically replace any existing active
+        profile for ``profile.project_id``. The incoming profile's
+        ``previous`` field is expected to carry the one-level rollback
+        trail (depth truncated to 1 by the caller).
+
+        Args:
+            profile: Profile to persist.
+        """
+        ...
+
+    async def save_shadow_profile(self, profile: RetrievalProfile) -> None:
+        """Persist a shadow (staged) profile for its project.
+
+        Shadow profiles do not affect recall; they are held until an
+        explicit ``promote_shadow`` call moves them to active. Saving
+        a shadow replaces any existing shadow for the same project.
+
+        Args:
+            profile: Profile to stage. Its ``project_id`` is the key.
+        """
+        ...
+
+    async def get_shadow_profile(
+        self,
+        project_id: str,
+    ) -> RetrievalProfile | None:
+        """Retrieve the staged shadow profile for a project.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The staged profile, or None if none exists.
+        """
+        ...
+
+    async def clear_shadow_profile(self, project_id: str) -> None:
+        """Remove the staged shadow profile for a project.
+
+        Idempotent -- clearing when no shadow exists is a no-op.
+
+        Args:
+            project_id: Project identifier.
+        """
+        ...
+
+    async def rollback_retrieval_profile(
+        self,
+        project_id: str,
+    ) -> RetrievalProfile | None:
+        """Revert the active profile to its ``previous`` generation.
+
+        If the active profile has a ``previous`` field, atomically
+        replace the active profile with ``previous`` and set the new
+        active's ``previous`` to ``None`` (single-level rollback, no
+        deeper history). If no active profile exists or ``previous``
+        is ``None``, returns ``None`` and leaves state untouched.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The new active profile (which was previously
+            ``.previous``), or None when rollback is impossible.
+        """
+        ...
+
+
+@runtime_checkable
+class CalibrationAuditStore(Protocol):
+    """Persistence for retrieval-calibration audit reports."""
+
+    async def save_calibration_report(self, report: BaseModel) -> None:
+        """Persist one calibration-pipeline run report.
+
+        Args:
+            report: Pydantic model carrying report fields; in
+                practice a :class:`CalibrationAuditReport`.
+        """
+        ...
+
+    async def get_calibration_report(
+        self,
+        report_id: str,
+    ) -> CalibrationAuditReport | None:
+        """Retrieve a calibration audit report by ID.
+
+        Args:
+            report_id: Unique report identifier.
+
+        Returns:
+            Parsed CalibrationAuditReport, or None if not found.
+        """
+        ...
+
+    async def list_calibration_reports(
+        self,
+        project_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[CalibrationAuditReport]:
+        """List calibration audit reports for a project.
+
+        Args:
+            project_id: Project to query.
+            limit: Maximum number to return.
+
+        Returns:
+            Parsed CalibrationAuditReport list, newest first.
+        """
+        ...
+
+
+@runtime_checkable
+class JudgmentStore(Protocol):
+    """Persistence for query judgments used by retrieval calibration."""
+
+    async def save_judgment(self, judgment: QueryJudgment) -> None:
+        """Persist a query judgment (create or replace by id).
+
+        Args:
+            judgment: Judgment to persist. Implementations upsert
+                by ``judgment.id``; re-saving the same id
+                replaces the existing document.
+        """
+        ...
+
+    async def get_recent_judgments(
+        self,
+        project_id: str,
+        *,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> list[QueryJudgment]:
+        """Retrieve recent judgments for a project, newest first.
+
+        Args:
+            project_id: Project to query.
+            since: If given, only include judgments with
+                ``created_at >= since``.
+            limit: Maximum number to return.
+
+        Returns:
+            Judgments ordered by ``created_at`` DESC.
+        """
+        ...
+
+    async def get_labeled_judgments(
+        self,
+        project_id: str,
+        *,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> list[QueryJudgment]:
+        """Retrieve labeled judgments for a project, newest labels first.
+
+        Args:
+            project_id: Project to query.
+            since: If given, only include judgments with
+                ``labeled_at >= since``.
+            limit: Maximum number to return.
+
+        Returns:
+            Judgments ordered by ``labeled_at`` DESC.
         """
         ...
 
@@ -612,6 +804,9 @@ class MemoryStore(
     EdgeStore,
     TemporalResolver,
     AuditStore,
+    CalibrationAuditStore,
+    RetrievalProfileStore,
+    JudgmentStore,
     NameLookupStore,
     Protocol,
 ):

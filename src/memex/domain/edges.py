@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from memex.domain.utils import UtcDatetime, new_id, utcnow
 
@@ -58,7 +58,9 @@ class Edge(BaseModel):
         context: Optional contextual information about the edge.
     """
 
-    id: str = Field(default_factory=new_id)
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(default_factory=new_id, alias="_id")
     source_revision_id: str
     target_revision_id: str
     edge_type: EdgeType
@@ -68,7 +70,7 @@ class Edge(BaseModel):
     context: str | None = None
 
 
-class TagAssignment(BaseModel, frozen=True):
+class TagAssignment(BaseModel):
     """Timestamped record of a tag-to-revision assignment.
 
     Each time a tag pointer is moved, a new TagAssignment is created.
@@ -84,7 +86,9 @@ class TagAssignment(BaseModel, frozen=True):
         assigned_at: When the tag was pointed to this revision (UTC).
     """
 
-    id: str = Field(default_factory=new_id)
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    id: str = Field(default_factory=new_id, alias="_id")
     tag_id: str
     item_id: str
     revision_id: str

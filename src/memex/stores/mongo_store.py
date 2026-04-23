@@ -6,7 +6,8 @@ as a swappable alternative to the Neo4j backend. All collections use
 
 Collections:
     projects, spaces, items, revisions, tags, tag_assignments,
-    artifacts, edges, audit_reports
+    artifacts, edges, audit_reports, retrieval_profiles,
+    retrieval_profiles_shadow, calibration_reports, judgments
 """
 
 from __future__ import annotations
@@ -29,7 +30,11 @@ from pymongo.operations import SearchIndexModel
 
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
-from memex.domain.utils import format_utc, new_id, utcnow
+from memex.domain.utils import new_id, utcnow
+from memex.learning.calibration_pipeline import CalibrationAuditReport
+from memex.learning.judgments import QueryJudgment
+from memex.learning.profiles import RetrievalProfile
+from memex.orchestration.dream_pipeline import DreamAuditReport
 from memex.stores.protocols import EnrichmentUpdate
 
 logger = logging.getLogger(__name__)
@@ -38,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 MAX_TRAVERSAL_DEPTH = 20
 _MIN_TRAVERSAL_DEPTH = 1
-_ROOT_SENTINEL = "__ROOT__"
 
 # TTL index semantics: when expireAfterSeconds is 0 and the indexed field is
 # a BSON Date, MongoDB expires each document at its own stored timestamp.
@@ -159,21 +163,7 @@ _DEPENDENCY_EDGE_TYPES: frozenset[str] = frozenset(
 )
 
 
-# -- Serialization helpers ----------------------------------------------------
-
-
-def _to_doc(model: BaseModel) -> dict[str, Any]:
-    """Serialize a Pydantic model to a MongoDB document with ``_id``.
-
-    Args:
-        model: Domain model instance to serialize.
-
-    Returns:
-        Dict suitable for MongoDB insert with ``_id`` set.
-    """
-    doc = model.model_dump(mode="json")
-    doc["_id"] = doc["id"]
-    return doc
+# -- Helpers ------------------------------------------------------------------
 
 
 def _validate_traversal_depth(depth: int) -> None:
@@ -207,9 +197,15 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
     # projects
     await db.projects.create_index("name", unique=True)
 
-    # spaces -- compound for resolve_space upsert
+    # spaces -- compound for resolve_space upsert. MongoDB's unique index
+    # treats ``null`` as a value, so root-level spaces (parent_space_id=None)
+    # still collide on duplicates.
     await db.spaces.create_index(
-        [("project_id", ASCENDING), ("name", ASCENDING), ("_parent_key", ASCENDING)],
+        [
+            ("project_id", ASCENDING),
+            ("name", ASCENDING),
+            ("parent_space_id", ASCENDING),
+        ],
         unique=True,
     )
 
@@ -274,6 +270,31 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
     await db.working_memory.create_index(
         "expires_at",
         expireAfterSeconds=WORKING_MEMORY_TTL_EXPIRE_AFTER_SECONDS,
+    )
+
+    # judgments -- compound for efficient project-scoped recency queries.
+    # The labeled_at index is a partial index over documents that actually
+    # carry a labeled_at date so pending (labeled_at absent) judgments are
+    # skipped entirely, shrinking the index and making ``$exists: True``
+    # queries index-covered.
+    await db.judgments.create_index(
+        [("project_id", ASCENDING), ("created_at", DESCENDING)]
+    )
+    await db.judgments.create_index(
+        [("project_id", ASCENDING), ("labeled_at", DESCENDING)],
+        partialFilterExpression={"labeled_at": {"$type": "date"}},
+    )
+
+    # calibration_reports
+    await db.calibration_reports.create_index(
+        [("project_id", ASCENDING), ("timestamp", DESCENDING)]
+    )
+
+    # events -- Dream State consolidation event feed (MongoEventFeed).
+    # Compound on (project_id, _id) so read_since can filter by project
+    # and range-scan the monotonic ObjectId cursor in a single index seek.
+    await db.events.create_index(
+        [("project_id", ASCENDING), ("_id", ASCENDING)]
     )
 
 
@@ -557,7 +578,9 @@ class MongoStore:
         Returns:
             The persisted Project instance.
         """
-        await self._db.projects.insert_one(_to_doc(project))
+        await self._db.projects.insert_one(
+            project.model_dump(by_alias=True, mode="python")
+        )
         return project
 
     async def get_project_by_name(self, name: str) -> Project | None:
@@ -588,12 +611,10 @@ class MongoStore:
             Resolved or newly created Project.
         """
         now = utcnow()
-        new_id_val = new_id()
         on_insert: dict[str, Any] = {
-            "_id": new_id_val,
-            "id": new_id_val,
+            "_id": new_id(),
             "name": name,
-            "created_at": format_utc(now),
+            "created_at": now,
             "metadata": {},
         }
         doc = await self._db.projects.find_one_and_update(
@@ -625,25 +646,20 @@ class MongoStore:
         Returns:
             Resolved or newly created Space.
         """
-        parent_key = parent_space_id or _ROOT_SENTINEL
         now = utcnow()
-        new_id_val = new_id()
 
         filter_doc = {
             "project_id": project_id,
             "name": space_name,
-            "_parent_key": parent_key,
+            "parent_space_id": parent_space_id,
         }
         on_insert: dict[str, Any] = {
-            "_id": new_id_val,
-            "id": new_id_val,
+            "_id": new_id(),
             "project_id": project_id,
             "name": space_name,
-            "_parent_key": parent_key,
-            "created_at": format_utc(now),
+            "parent_space_id": parent_space_id,
+            "created_at": now,
         }
-        if parent_space_id is not None:
-            on_insert["parent_space_id"] = parent_space_id
 
         doc = await self._db.spaces.find_one_and_update(
             filter_doc,
@@ -683,12 +699,11 @@ class MongoStore:
         Returns:
             Space if found, None otherwise.
         """
-        parent_key = parent_space_id or _ROOT_SENTINEL
         doc = await self._db.spaces.find_one(
             {
                 "project_id": project_id,
                 "name": space_name,
-                "_parent_key": parent_key,
+                "parent_space_id": parent_space_id,
             }
         )
         if doc is None:
@@ -758,11 +773,13 @@ class MongoStore:
             Tuple of (tag_assignments, bundle_edge).
         """
         # Item
-        await self._db.items.insert_one(_to_doc(item), session=session)
+        await self._db.items.insert_one(
+            item.model_dump(by_alias=True, mode="python"), session=session
+        )
 
         # Revision (denormalize item.space_id onto the revision doc so
         # space-scoped queries can filter without a join)
-        rev_doc = _to_doc(revision)
+        rev_doc = revision.model_dump(by_alias=True, mode="python")
         rev_doc["space_id"] = item.space_id
         await self._db.revisions.insert_one(rev_doc, session=session)
 
@@ -774,11 +791,15 @@ class MongoStore:
 
         # Artifacts
         for artifact in artifacts:
-            await self._db.artifacts.insert_one(_to_doc(artifact), session=session)
+            await self._db.artifacts.insert_one(
+                artifact.model_dump(by_alias=True, mode="python"), session=session
+            )
 
         # Domain edges
         for edge in edges:
-            await self._db.edges.insert_one(_to_doc(edge), session=session)
+            await self._db.edges.insert_one(
+                edge.model_dump(by_alias=True, mode="python"), session=session
+            )
 
         # Bundle membership
         bundle_edge: Edge | None = None
@@ -794,7 +815,10 @@ class MongoStore:
                     target_revision_id=bundle_rev["id"],
                     edge_type=EdgeType.BUNDLES,
                 )
-                await self._db.edges.insert_one(_to_doc(bundle_edge), session=session)
+                await self._db.edges.insert_one(
+                    bundle_edge.model_dump(by_alias=True, mode="python"),
+                    session=session,
+                )
 
         return assignments, bundle_edge
 
@@ -812,13 +836,17 @@ class MongoStore:
         Returns:
             The TagAssignment recording the initial assignment.
         """
-        await self._db.tags.insert_one(_to_doc(tag), session=session)
+        await self._db.tags.insert_one(
+            tag.model_dump(by_alias=True, mode="python"), session=session
+        )
         ta = TagAssignment(
             tag_id=tag.id,
             item_id=tag.item_id,
             revision_id=tag.revision_id,
         )
-        await self._db.tag_assignments.insert_one(_to_doc(ta), session=session)
+        await self._db.tag_assignments.insert_one(
+            ta.model_dump(by_alias=True, mode="python"), session=session
+        )
         return ta
 
     # -- Item -----------------------------------------------------------------
@@ -873,7 +901,7 @@ class MongoStore:
         now = datetime.now(UTC)
         doc = await self._db.items.find_one_and_update(
             {"_id": item_id},
-            {"$set": {"deprecated": True, "deprecated_at": format_utc(now)}},
+            {"$set": {"deprecated": True, "deprecated_at": now}},
             return_document=ReturnDocument.AFTER,
         )
         if doc is None:
@@ -1016,7 +1044,7 @@ class MongoStore:
                     raise ValueError(f"Item {item_id} not found")
 
                 # Insert new revision with denormalized space_id
-                rev_doc = _to_doc(revision)
+                rev_doc = revision.model_dump(by_alias=True, mode="python")
                 rev_doc["space_id"] = item_doc.get("space_id")
                 await self._db.revisions.insert_one(rev_doc, session=session)
 
@@ -1027,7 +1055,8 @@ class MongoStore:
                     edge_type=EdgeType.SUPERSEDES,
                 )
                 await self._db.edges.insert_one(
-                    _to_doc(supersedes_edge), session=session
+                    supersedes_edge.model_dump(by_alias=True, mode="python"),
+                    session=session,
                 )
 
                 # Move tag pointer
@@ -1169,7 +1198,7 @@ class MongoStore:
             {
                 "$set": {
                     "revision_id": new_revision_id,
-                    "updated_at": format_utc(timestamp),
+                    "updated_at": timestamp,
                 }
             },
             session=session,
@@ -1180,7 +1209,9 @@ class MongoStore:
             revision_id=new_revision_id,
             assigned_at=timestamp,
         )
-        await self._db.tag_assignments.insert_one(_to_doc(ta), session=session)
+        await self._db.tag_assignments.insert_one(
+            ta.model_dump(by_alias=True, mode="python"), session=session
+        )
         return ta
 
     # -- Edge -----------------------------------------------------------------
@@ -1194,7 +1225,9 @@ class MongoStore:
         Returns:
             The persisted Edge instance.
         """
-        await self._db.edges.insert_one(_to_doc(edge))
+        await self._db.edges.insert_one(
+            edge.model_dump(by_alias=True, mode="python")
+        )
         return edge
 
     async def get_edges(
@@ -1411,9 +1444,8 @@ class MongoStore:
         Returns:
             The most recent Revision at or before the timestamp.
         """
-        ts_str = format_utc(timestamp)
         doc = await self._db.revisions.find_one(
-            {"item_id": item_id, "created_at": {"$lte": ts_str}},
+            {"item_id": item_id, "created_at": {"$lte": timestamp}},
             sort=[("created_at", DESCENDING)],
         )
         if doc is None:
@@ -1437,9 +1469,8 @@ class MongoStore:
         Returns:
             The Revision the tag pointed to, or None.
         """
-        ts_str = format_utc(timestamp)
         ta_doc = await self._db.tag_assignments.find_one(
-            {"tag_id": tag_id, "assigned_at": {"$lte": ts_str}},
+            {"tag_id": tag_id, "assigned_at": {"$lte": timestamp}},
             sort=[("assigned_at", DESCENDING)],
         )
         if ta_doc is None:
@@ -1651,9 +1682,13 @@ class MongoStore:
         if not collected_ids:
             return []
 
-        # Fetch revisions and sort by created_at
+        # Fetch revisions and sort by created_at. BFS traversal does not
+        # need vector embeddings; project them out so large payloads don't
+        # bloat the network round-trip.
         revisions: dict[str, Revision] = {}
-        async for doc in self._db.revisions.find({"_id": {"$in": collected_ids}}):
+        async for doc in self._db.revisions.find(
+            {"_id": {"$in": collected_ids}}, {"embedding": 0}
+        ):
             rev = Revision.model_validate(doc)
             revisions[rev.id] = rev
 
@@ -1668,36 +1703,34 @@ class MongoStore:
         """Persist a Dream State audit report.
 
         Stores the full report as a native BSON document using
-        ``report_id`` as ``_id``.
+        ``report_id`` as ``_id`` (via Pydantic alias).
 
         Args:
             report: Pydantic model with report fields.
         """
-        report_dict = report.model_dump(mode="json")
-        report_dict["_id"] = report_dict["report_id"]
-        await self._db.audit_reports.insert_one(report_dict)
+        doc = report.model_dump(by_alias=True, mode="python")
+        await self._db.audit_reports.insert_one(doc)
 
-    async def get_audit_report(self, report_id: str) -> dict[str, object] | None:
+    async def get_audit_report(self, report_id: str) -> DreamAuditReport | None:
         """Retrieve a Dream State audit report by ID.
 
         Args:
             report_id: Unique report identifier.
 
         Returns:
-            Deserialized report dict, or None if not found.
+            Parsed DreamAuditReport, or None if not found.
         """
         doc = await self._db.audit_reports.find_one({"_id": report_id})
         if doc is None:
             return None
-        doc.pop("_id", None)
-        return doc  # type: ignore[return-value]
+        return DreamAuditReport.model_validate(doc)
 
     async def list_audit_reports(
         self,
         project_id: str,
         *,
         limit: int = 50,
-    ) -> list[dict[str, object]]:
+    ) -> list[DreamAuditReport]:
         """List Dream State audit reports for a project.
 
         Args:
@@ -1705,15 +1738,264 @@ class MongoStore:
             limit: Maximum number of reports to return.
 
         Returns:
-            List of report dicts, newest first.
+            Parsed DreamAuditReport list, newest first.
         """
         cursor = (
             self._db.audit_reports.find({"project_id": project_id})
             .sort("timestamp", DESCENDING)
             .limit(limit)
         )
-        reports: list[dict[str, object]] = []
-        async for doc in cursor:
-            doc.pop("_id", None)
-            reports.append(doc)  # type: ignore[arg-type]
-        return reports
+        return [DreamAuditReport.model_validate(doc) async for doc in cursor]
+
+    # -- Retrieval profiles ---------------------------------------------------
+
+    async def save_retrieval_profile(self, profile: RetrievalProfile) -> None:
+        """Persist a retrieval profile as the active profile for its project.
+
+        Truncates ``profile.previous.previous`` to ``None`` before
+        persisting, capping the rollback trail at depth 1.  Atomically
+        replaces any existing profile document for the project via
+        ``_id``-keyed upsert.
+
+        Args:
+            profile: Profile to persist.
+        """
+        truncated_previous = (
+            profile.previous.model_copy(update={"previous": None})
+            if profile.previous is not None
+            else None
+        )
+        to_save = profile.model_copy(update={"previous": truncated_previous})
+        doc = to_save.model_dump(mode="python")
+        doc["_id"] = profile.project_id
+        await self._db.retrieval_profiles.replace_one(
+            {"_id": profile.project_id}, doc, upsert=True
+        )
+
+    async def get_retrieval_profile(
+        self, project_id: str
+    ) -> RetrievalProfile | None:
+        """Retrieve the active retrieval profile for a project.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The active RetrievalProfile, or None if none has been saved.
+        """
+        doc = await self._db.retrieval_profiles.find_one({"_id": project_id})
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return RetrievalProfile.model_validate(doc)
+
+    # -- Shadow profiles ------------------------------------------------------
+
+    async def save_shadow_profile(self, profile: RetrievalProfile) -> None:
+        """Persist a shadow (staged) profile for its project.
+
+        Shadow profiles do not affect recall; they are held until an
+        explicit ``promote_shadow`` call moves them to active. Saving
+        a shadow replaces any existing shadow for the same project.
+        Truncates ``previous.previous`` to ``None`` to cap depth.
+
+        Args:
+            profile: Profile to stage. Its ``project_id`` is the key.
+        """
+        truncated_previous = (
+            profile.previous.model_copy(update={"previous": None})
+            if profile.previous is not None
+            else None
+        )
+        to_save = profile.model_copy(update={"previous": truncated_previous})
+        doc = to_save.model_dump(mode="python")
+        doc["_id"] = profile.project_id
+        await self._db.retrieval_profiles_shadow.replace_one(
+            {"_id": profile.project_id}, doc, upsert=True
+        )
+
+    async def get_shadow_profile(
+        self,
+        project_id: str,
+    ) -> RetrievalProfile | None:
+        """Retrieve the staged shadow profile for a project.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The staged profile, or None if none exists.
+        """
+        doc = await self._db.retrieval_profiles_shadow.find_one(
+            {"_id": project_id}
+        )
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return RetrievalProfile.model_validate(doc)
+
+    async def clear_shadow_profile(self, project_id: str) -> None:
+        """Remove the staged shadow profile for a project.
+
+        Idempotent -- clearing when no shadow exists is a no-op.
+
+        Args:
+            project_id: Project identifier.
+        """
+        await self._db.retrieval_profiles_shadow.delete_one({"_id": project_id})
+
+    async def rollback_retrieval_profile(
+        self,
+        project_id: str,
+    ) -> RetrievalProfile | None:
+        """Revert the active profile to its ``previous`` generation.
+
+        If the active profile has a ``previous`` field, replaces the
+        active profile with ``previous`` (setting the new active's
+        ``previous`` to ``None`` for single-level rollback). If no
+        active profile exists or ``previous`` is ``None``, returns
+        ``None`` and leaves state untouched.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The new active profile (which was previously ``.previous``),
+            or None when rollback is impossible.
+        """
+        active = await self.get_retrieval_profile(project_id)
+        if active is None or active.previous is None:
+            return None
+        reverted = active.previous.model_copy(update={"previous": None})
+        await self.save_retrieval_profile(reverted)
+        return reverted
+
+    # -- Calibration reports --------------------------------------------------
+
+    async def save_calibration_report(self, report: BaseModel) -> None:
+        """Persist a calibration audit report as a BSON document.
+
+        Stores the full report keyed by ``report_id`` as ``_id`` via
+        the Pydantic alias.
+
+        Args:
+            report: Pydantic model carrying report fields.
+        """
+        doc = report.model_dump(by_alias=True, mode="python")
+        await self._db.calibration_reports.insert_one(doc)
+
+    async def get_calibration_report(
+        self,
+        report_id: str,
+    ) -> CalibrationAuditReport | None:
+        """Retrieve a calibration audit report by ID.
+
+        Args:
+            report_id: Unique report identifier.
+
+        Returns:
+            Parsed CalibrationAuditReport, or None if not found.
+        """
+        doc = await self._db.calibration_reports.find_one({"_id": report_id})
+        if doc is None:
+            return None
+        return CalibrationAuditReport.model_validate(doc)
+
+    async def list_calibration_reports(
+        self,
+        project_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[CalibrationAuditReport]:
+        """List calibration audit reports for a project.
+
+        Args:
+            project_id: Project to query.
+            limit: Maximum number of reports to return.
+
+        Returns:
+            Parsed CalibrationAuditReport list, newest first.
+        """
+        cursor = (
+            self._db.calibration_reports.find({"project_id": project_id})
+            .sort("timestamp", DESCENDING)
+            .limit(limit)
+        )
+        return [
+            CalibrationAuditReport.model_validate(doc) async for doc in cursor
+        ]
+
+    # -- Judgments ------------------------------------------------------------
+
+    async def save_judgment(self, judgment: QueryJudgment) -> None:
+        """Persist a query judgment (create or replace by id).
+
+        Upserts by ``judgment.id`` so re-saving the same judgment
+        replaces the existing document atomically.
+
+        Args:
+            judgment: Judgment to persist.
+        """
+        doc = judgment.model_dump(by_alias=True, mode="python")
+        await self._db.judgments.replace_one(
+            {"_id": judgment.id}, doc, upsert=True
+        )
+
+    async def get_recent_judgments(
+        self,
+        project_id: str,
+        *,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> list[QueryJudgment]:
+        """Retrieve recent judgments for a project, newest first.
+
+        Args:
+            project_id: Project to query.
+            since: If given, only include judgments with
+                ``created_at >= since``.
+            limit: Maximum number to return.
+
+        Returns:
+            Judgments ordered by ``created_at`` DESC.
+        """
+        query: dict[str, object] = {"project_id": project_id}
+        if since is not None:
+            query["created_at"] = {"$gte": since}
+        cursor = (
+            self._db.judgments.find(query, {"query_embedding": 0})
+            .sort("created_at", DESCENDING)
+            .limit(limit)
+        )
+        return [QueryJudgment.model_validate(doc) async for doc in cursor]
+
+    async def get_labeled_judgments(
+        self,
+        project_id: str,
+        *,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> list[QueryJudgment]:
+        """Retrieve labeled judgments for a project, newest labels first.
+
+        Args:
+            project_id: Project to query.
+            since: If given, only include judgments with
+                ``labeled_at >= since``.
+            limit: Maximum number to return.
+
+        Returns:
+            Judgments ordered by ``labeled_at`` DESC.
+        """
+        query: dict[str, object] = {
+            "project_id": project_id,
+            "labeled_at": {"$exists": True},
+        }
+        if since is not None:
+            query["labeled_at"] = {"$gte": since}
+        cursor = (
+            self._db.judgments.find(query, {"query_embedding": 0})
+            .sort("labeled_at", DESCENDING)
+            .limit(limit)
+        )
+        return [QueryJudgment.model_validate(doc) async for doc in cursor]

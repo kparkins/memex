@@ -1345,7 +1345,11 @@ class MemexToolService:
         report = await self._store.get_audit_report(inp.report_id)
         if report is None:
             return {"found": False, "report_id": inp.report_id}
-        return {"found": True, "report_id": inp.report_id, "report": report}
+        return {
+            "found": True,
+            "report_id": inp.report_id,
+            "report": _serialize_audit_report(report),
+        }
 
     async def list_audit_reports(
         self,
@@ -1361,7 +1365,7 @@ class MemexToolService:
         """
         reports = await self._store.list_audit_reports(inp.project_id, limit=inp.limit)
         return {
-            "reports": reports,
+            "reports": [_serialize_audit_report(r) for r in reports],
             "count": len(reports),
             "project_id": inp.project_id,
         }

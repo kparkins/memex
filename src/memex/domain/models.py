@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from memex.domain.utils import UtcDatetime, new_id, utcnow
 
@@ -55,7 +55,9 @@ class Project(BaseModel):
         metadata: Arbitrary key-value metadata.
     """
 
-    id: str = Field(default_factory=new_id)
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(default_factory=new_id, alias="_id")
     name: str
     created_at: UtcDatetime = Field(default_factory=utcnow)
     metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
@@ -72,7 +74,9 @@ class Space(BaseModel):
         created_at: Creation timestamp (UTC).
     """
 
-    id: str = Field(default_factory=new_id)
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(default_factory=new_id, alias="_id")
     project_id: str
     name: str
     parent_space_id: str | None = None
@@ -95,7 +99,9 @@ class Item(BaseModel):
         created_at: Creation timestamp (UTC).
     """
 
-    id: str = Field(default_factory=new_id)
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(default_factory=new_id, alias="_id")
     space_id: str
     name: str
     kind: ItemKind
@@ -104,7 +110,7 @@ class Item(BaseModel):
     created_at: UtcDatetime = Field(default_factory=utcnow)
 
 
-class Revision(BaseModel, frozen=True):
+class Revision(BaseModel):
     """Immutable content snapshot of an item.
 
     Revisions are never modified after creation. Enrichment metadata
@@ -128,7 +134,9 @@ class Revision(BaseModel, frozen=True):
         embedding_text_override: Enrichment: override text for embedding.
     """
 
-    id: str = Field(default_factory=new_id)
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    id: str = Field(default_factory=new_id, alias="_id")
     item_id: str
     revision_number: int = Field(ge=1)
     content: str
@@ -162,7 +170,9 @@ class Tag(BaseModel):
         updated_at: Last update timestamp (UTC).
     """
 
-    id: str = Field(default_factory=new_id)
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(default_factory=new_id, alias="_id")
     item_id: str
     name: str
     revision_id: str
@@ -187,7 +197,9 @@ class Artifact(BaseModel):
         created_at: Creation timestamp (UTC).
     """
 
-    id: str = Field(default_factory=new_id)
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(default_factory=new_id, alias="_id")
     revision_id: str
     name: str
     location: str

@@ -8,7 +8,7 @@ Supports typed edge creation with metadata and filtered edge queries.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import orjson
 from neo4j import AsyncDriver, AsyncManagedTransaction, ResultSummary
@@ -17,8 +17,14 @@ from pydantic import BaseModel
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Artifact, Item, Project, Revision, Space, Tag
 from memex.domain.utils import format_utc, new_id, utcnow
+from memex.learning.judgments import QueryJudgment
+from memex.learning.profiles import RetrievalProfile
 from memex.stores.neo4j_schema import NodeLabel, RelType
 from memex.stores.protocols import EnrichmentUpdate, StorePersistenceError
+
+if TYPE_CHECKING:
+    from memex.learning.calibration_pipeline import CalibrationAuditReport
+    from memex.orchestration.dream_pipeline import DreamAuditReport
 
 # -- Serialization helpers ------------------------------------------------
 
@@ -1830,14 +1836,14 @@ class Neo4jStore:
             )
             await result.consume()
 
-    async def get_audit_report(self, report_id: str) -> dict[str, object] | None:
+    async def get_audit_report(self, report_id: str) -> DreamAuditReport | None:
         """Retrieve a Dream State audit report by ID.
 
         Args:
             report_id: Unique report identifier.
 
         Returns:
-            Deserialized report dict, or None if not found.
+            Parsed DreamAuditReport, or None if not found.
         """
         cypher = (
             f"MATCH (r:{NodeLabel.DREAM_AUDIT_REPORT} "
@@ -1848,15 +1854,14 @@ class Neo4jStore:
             record = await result.single()
             if record is None:
                 return None
-            raw: dict[str, object] = orjson.loads(record["data"])
-            return raw
+            return DreamAuditReport.model_validate(orjson.loads(record["data"]))
 
     async def list_audit_reports(
         self,
         project_id: str,
         *,
         limit: int = 50,
-    ) -> list[dict[str, object]]:
+    ) -> list[DreamAuditReport]:
         """List Dream State audit reports for a project.
 
         Args:
@@ -1864,7 +1869,7 @@ class Neo4jStore:
             limit: Maximum number of reports to return.
 
         Returns:
-            List of deserialized report dicts, newest first.
+            Parsed DreamAuditReport list, newest first.
         """
         cypher = (
             f"MATCH (r:{NodeLabel.DREAM_AUDIT_REPORT} "
@@ -1876,10 +1881,357 @@ class Neo4jStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(cypher, pid=project_id, limit=limit)
             records = await result.data()
-            reports: list[dict[str, object]] = [
-                orjson.loads(r["data"]) for r in records
+            return [
+                DreamAuditReport.model_validate(orjson.loads(r["data"]))
+                for r in records
             ]
-            return reports
+
+    # -- Retrieval profiles -----------------------------------------------
+
+    async def save_retrieval_profile(self, profile: RetrievalProfile) -> None:
+        """Persist a retrieval profile as the active profile for its project.
+
+        Uses MERGE to upsert a single node per project. The ``previous``
+        chain is truncated to depth-1 before serialization so the stored
+        blob never grows unboundedly.
+
+        Args:
+            profile: Profile to persist.
+        """
+        truncated_previous = (
+            profile.previous.model_copy(update={"previous": None})
+            if profile.previous is not None
+            else None
+        )
+        to_save = profile.model_copy(update={"previous": truncated_previous})
+        data_json = orjson.dumps(to_save.model_dump(mode="json")).decode("utf-8")
+
+        cypher = (
+            f"MERGE (p:{NodeLabel.RETRIEVAL_PROFILE} {{project_id: $pid}}) "
+            "SET p.generation = $gen, p.data = $data"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(
+                cypher,
+                pid=profile.project_id,
+                gen=profile.generation,
+                data=data_json,
+            )
+            await result.consume()
+
+    async def get_retrieval_profile(
+        self, project_id: str
+    ) -> RetrievalProfile | None:
+        """Retrieve the active retrieval profile for a project.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The active RetrievalProfile, or None if none has been saved.
+        """
+        cypher = (
+            f"MATCH (p:{NodeLabel.RETRIEVAL_PROFILE} {{project_id: $pid}}) "
+            "RETURN p.data AS data"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, pid=project_id)
+            record = await result.single()
+            if record is None:
+                return None
+            return RetrievalProfile.model_validate(orjson.loads(record["data"]))
+
+    # -- Shadow profiles --------------------------------------------------
+
+    async def save_shadow_profile(self, profile: RetrievalProfile) -> None:
+        """Persist a shadow (staged) profile for its project.
+
+        Shadow profiles do not affect recall; they are held until an
+        explicit ``promote_shadow`` call moves them to active. Saving
+        a shadow replaces any existing shadow for the same project.
+        Truncates ``previous.previous`` to ``None`` to cap depth.
+
+        Args:
+            profile: Profile to stage. Its ``project_id`` is the key.
+        """
+        truncated_previous = (
+            profile.previous.model_copy(update={"previous": None})
+            if profile.previous is not None
+            else None
+        )
+        to_save = profile.model_copy(update={"previous": truncated_previous})
+        data_json = orjson.dumps(to_save.model_dump(mode="json")).decode("utf-8")
+
+        cypher = (
+            f"MERGE (p:{NodeLabel.SHADOW_RETRIEVAL_PROFILE} "
+            "{{project_id: $pid}}) "
+            "SET p.generation = $gen, p.data = $data"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(
+                cypher,
+                pid=profile.project_id,
+                gen=profile.generation,
+                data=data_json,
+            )
+            await result.consume()
+
+    async def get_shadow_profile(
+        self,
+        project_id: str,
+    ) -> RetrievalProfile | None:
+        """Retrieve the staged shadow profile for a project.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The staged profile, or None if none exists.
+        """
+        cypher = (
+            f"MATCH (p:{NodeLabel.SHADOW_RETRIEVAL_PROFILE} "
+            "{{project_id: $pid}}) "
+            "RETURN p.data AS data"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, pid=project_id)
+            record = await result.single()
+            if record is None:
+                return None
+            return RetrievalProfile.model_validate(orjson.loads(record["data"]))
+
+    async def clear_shadow_profile(self, project_id: str) -> None:
+        """Remove the staged shadow profile for a project.
+
+        Idempotent -- clearing when no shadow exists is a no-op.
+
+        Args:
+            project_id: Project identifier.
+        """
+        cypher = (
+            f"MATCH (p:{NodeLabel.SHADOW_RETRIEVAL_PROFILE} "
+            "{{project_id: $pid}}) "
+            "DETACH DELETE p"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, pid=project_id)
+            await result.consume()
+
+    async def rollback_retrieval_profile(
+        self,
+        project_id: str,
+    ) -> RetrievalProfile | None:
+        """Revert the active profile to its ``previous`` generation.
+
+        If the active profile has a ``previous`` field, replaces the
+        active profile with ``previous`` (setting the new active's
+        ``previous`` to ``None`` for single-level rollback). If no
+        active profile exists or ``previous`` is ``None``, returns
+        ``None`` and leaves state untouched.
+
+        Args:
+            project_id: Project identifier.
+
+        Returns:
+            The new active profile (which was previously ``.previous``),
+            or None when rollback is impossible.
+        """
+        active = await self.get_retrieval_profile(project_id)
+        if active is None or active.previous is None:
+            return None
+        reverted = active.previous.model_copy(update={"previous": None})
+        await self.save_retrieval_profile(reverted)
+        return reverted
+
+    # -- Calibration reports ----------------------------------------------
+
+    async def save_calibration_report(self, report: BaseModel) -> None:
+        """Persist a calibration audit report as a graph node.
+
+        Stores indexed fields as node properties and the full report
+        as JSON in the ``data`` property.
+
+        Args:
+            report: Pydantic model with report_id, project_id, and
+                timestamp attributes.
+        """
+        report_dict = report.model_dump(mode="json")
+        data_json = orjson.dumps(report_dict).decode("utf-8")
+
+        cypher = (
+            f"CREATE (r:{NodeLabel.CALIBRATION_AUDIT_REPORT} {{"
+            "id: $id, project_id: $project_id, "
+            "timestamp: $timestamp, data: $data"
+            "})"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(
+                cypher,
+                id=report_dict["report_id"],
+                project_id=report_dict["project_id"],
+                timestamp=report_dict["timestamp"],
+                data=data_json,
+            )
+            await result.consume()
+
+    async def get_calibration_report(
+        self,
+        report_id: str,
+    ) -> CalibrationAuditReport | None:
+        """Retrieve a calibration audit report by ID.
+
+        Args:
+            report_id: Unique report identifier.
+
+        Returns:
+            Parsed CalibrationAuditReport, or None if not found.
+        """
+        cypher = (
+            f"MATCH (r:{NodeLabel.CALIBRATION_AUDIT_REPORT} "
+            "{id: $id}) RETURN r.data AS data"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, id=report_id)
+            record = await result.single()
+            if record is None:
+                return None
+            return CalibrationAuditReport.model_validate(orjson.loads(record["data"]))
+
+    async def list_calibration_reports(
+        self,
+        project_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[CalibrationAuditReport]:
+        """List calibration audit reports for a project.
+
+        Args:
+            project_id: Project to query.
+            limit: Maximum number of reports to return.
+
+        Returns:
+            Parsed CalibrationAuditReport list, newest first.
+        """
+        cypher = (
+            f"MATCH (r:{NodeLabel.CALIBRATION_AUDIT_REPORT} "
+            "{project_id: $pid}) "
+            "RETURN r.data AS data "
+            "ORDER BY r.timestamp DESC "
+            "LIMIT $limit"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, pid=project_id, limit=limit)
+            records = await result.data()
+            return [
+                CalibrationAuditReport.model_validate(orjson.loads(r["data"]))
+                for r in records
+            ]
+
+    # -- Judgments --------------------------------------------------------
+
+    async def save_judgment(self, judgment: QueryJudgment) -> None:
+        """Persist a query judgment node (idempotent upsert by id).
+
+        Uses MERGE on ``id`` so re-saving the same judgment replaces
+        the existing node without creating a duplicate.
+
+        Args:
+            judgment: Judgment to persist.
+        """
+        doc = judgment.model_dump(mode="json")
+        data_json = orjson.dumps(doc).decode("utf-8")
+        cypher = (
+            f"MERGE (j:{NodeLabel.QUERY_JUDGMENT} {{id: $jid}}) "
+            "SET j.project_id = $pid, "
+            "    j.created_at = $created_at, "
+            "    j.labeled_at = $labeled_at, "
+            "    j.data = $data"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(
+                cypher,
+                jid=judgment.id,
+                pid=judgment.project_id,
+                created_at=doc["created_at"],
+                labeled_at=doc.get("labeled_at"),
+                data=data_json,
+            )
+            await result.consume()
+
+    async def get_recent_judgments(
+        self,
+        project_id: str,
+        *,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> list[QueryJudgment]:
+        """Retrieve recent judgments for a project, newest first.
+
+        Args:
+            project_id: Project to query.
+            since: If given, only include judgments with
+                ``created_at >= since`` (ISO 8601 string comparison).
+            limit: Maximum number of judgments to return.
+
+        Returns:
+            Judgments ordered by ``created_at`` DESC.
+        """
+        cypher_parts = [
+            f"MATCH (j:{NodeLabel.QUERY_JUDGMENT} {{project_id: $pid}})",
+        ]
+        params: dict[str, Any] = {"pid": project_id, "limit": limit}
+        if since is not None:
+            cypher_parts.append("WHERE j.created_at >= $since")
+            params["since"] = since.isoformat()
+        cypher_parts.append(
+            "RETURN j.data AS data ORDER BY j.created_at DESC LIMIT $limit"
+        )
+        cypher = "\n".join(cypher_parts)
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, **params)
+            records = await result.data()
+        return [
+            QueryJudgment.model_validate(orjson.loads(rec["data"]))
+            for rec in records
+        ]
+
+    async def get_labeled_judgments(
+        self,
+        project_id: str,
+        *,
+        since: datetime | None = None,
+        limit: int = 500,
+    ) -> list[QueryJudgment]:
+        """Retrieve labeled judgments for a project, newest labels first.
+
+        Args:
+            project_id: Project to query.
+            since: If given, only include judgments with
+                ``labeled_at >= since`` (ISO 8601 string comparison).
+            limit: Maximum number of judgments to return.
+
+        Returns:
+            Judgments ordered by ``labeled_at`` DESC.
+        """
+        cypher_parts = [
+            f"MATCH (j:{NodeLabel.QUERY_JUDGMENT} {{project_id: $pid}})",
+            "WHERE j.labeled_at IS NOT NULL",
+        ]
+        params: dict[str, Any] = {"pid": project_id, "limit": limit}
+        if since is not None:
+            cypher_parts.append("AND j.labeled_at >= $since")
+            params["since"] = since.isoformat()
+        cypher_parts.append(
+            "RETURN j.data AS data ORDER BY j.labeled_at DESC LIMIT $limit"
+        )
+        cypher = "\n".join(cypher_parts)
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(cypher, **params)
+            records = await result.data()
+        return [
+            QueryJudgment.model_validate(orjson.loads(rec["data"]))
+            for rec in records
+        ]
 
     # -- Internal ---------------------------------------------------------
 

@@ -191,6 +191,9 @@ async def test_ensure_indexes_creates_working_memory_ttl_index() -> None:
         "artifacts",
         "edges",
         "audit_reports",
+        "calibration_reports",
+        "judgments",
+        "events",
     ):
         collection = MagicMock()
         collection.create_index = AsyncMock()
@@ -226,6 +229,9 @@ async def test_ensure_indexes_is_idempotent() -> None:
         "artifacts",
         "edges",
         "audit_reports",
+        "calibration_reports",
+        "judgments",
+        "events",
     ):
         collection = MagicMock()
         collection.create_index = AsyncMock()

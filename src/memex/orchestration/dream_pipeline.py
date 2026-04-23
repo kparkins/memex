@@ -12,7 +12,7 @@ import uuid
 from datetime import UTC, datetime
 
 import orjson
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from memex.config import DreamStateSettings
 from memex.llm.client import LLMClient
@@ -59,7 +59,9 @@ class DreamAuditReport(BaseModel, frozen=True):
         cursor_after: Stream cursor position after this run.
     """
 
-    report_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    report_id: str = Field(default_factory=lambda: str(uuid.uuid4()), alias="_id")
     project_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     dry_run: bool
