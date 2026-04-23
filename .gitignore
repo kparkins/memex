@@ -2,6 +2,7 @@
 .claude/
 .serena/
 .omc/
+.omx/
 __pycache__/
 *.py[oc]
 build/

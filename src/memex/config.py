@@ -95,6 +95,29 @@ class EmbeddingSettings(BaseSettings):
     api_base: str | None = None
 
 
+class LLMSettings(BaseSettings):
+    """LLM completion provider settings shared by learning labelers.
+
+    Args:
+        model: litellm model identifier, e.g. ``"gpt-4o-mini"`` for
+            OpenAI hosted, ``"openai/<model>"`` for any
+            OpenAI-compatible local server (LM Studio,
+            mlx-omni-server, vLLM), or ``"ollama/<model>"`` for a
+            native Ollama backend.
+        api_base: Optional base URL forwarded to litellm. Required for
+            OpenAI-compatible local servers, e.g.
+            ``"http://localhost:1234/v1"`` for LM Studio.
+        temperature: Sampling temperature; low values keep grading and
+            query synthesis deterministic.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="MEMEX_LLM_")
+
+    model: str = "gpt-4o-mini"
+    api_base: str | None = None
+    temperature: float = 0.1
+
+
 class RetrievalSettings(BaseSettings):
     """Hybrid retrieval tuning."""
 
@@ -189,6 +212,7 @@ class MemexSettings(BaseSettings):
     mongo: MongoSettings = MongoSettings()
     artifact_storage: ArtifactStorageSettings = ArtifactStorageSettings()
     embedding: EmbeddingSettings = EmbeddingSettings()
+    llm: LLMSettings = LLMSettings()
     retrieval: RetrievalSettings = RetrievalSettings()
     enrichment: EnrichmentSettings = EnrichmentSettings()
     dream_state: DreamStateSettings = DreamStateSettings()

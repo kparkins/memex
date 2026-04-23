@@ -22,7 +22,7 @@ from redis.asyncio import Redis
 from memex import Memex
 from memex.config import Neo4jSettings, RedisSettings
 from memex.domain.edges import EdgeType
-from memex.domain.models import ItemKind, Revision
+from memex.domain.models import ItemKind, Project, Revision
 from memex.orchestration.ingest import (
     ArtifactSpec,
     EdgeSpec,

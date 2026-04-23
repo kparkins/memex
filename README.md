@@ -5,7 +5,7 @@ Memex is a Python reference implementation of the architecture described in [*Gr
 Memex supports two interchangeable backends behind a single facade:
 
 - **Neo4j + Redis** -- the reference stack. Neo4j stores the long-term memory graph and serves BM25 + vector retrieval; Redis is the working-memory session buffer and consolidation event feed.
-- **MongoDB 8.1** -- a single-database alternative. The same collections hold the memory graph, Atlas Search (fulltext) and Atlas Vector Search indexes, working-memory sessions (TTL-expiring documents), and the consolidation event feed. Hybrid recall uses MongoDB's server-side `$rankFusion` Reciprocal Rank Fusion stage.
+- **MongoDB 8.1** -- a single-database alternative. The same collections hold the memory graph, Atlas Search (fulltext) and Atlas Vector Search indexes, working-memory sessions (TTL-expiring documents), and the consolidation event feed. Hybrid recall unions the two Atlas Search branches with `$unionWith` and applies the same CombMAX fusion used by the Neo4j backend.
 
 Both backends implement the same `MemoryStore` and `SearchStrategy` protocols, so application code is written once against the `Memex` facade and the deployment picks the storage stack via configuration (`MEMEX_BACKEND=neo4j` or `MEMEX_BACKEND=mongo`).
 
@@ -20,14 +20,15 @@ Both backends implement the same `MemoryStore` and `SearchStrategy` protocols, s
 5. [Addressing: kref:// URIs](#addressing-kref-uris)
 6. [Write Path: Ingesting Memories](#write-path-ingesting-memories)
 7. [Read Path: Recalling Memories](#read-path-recalling-memories)
-8. [Belief Revision: How Memories Change](#belief-revision-how-memories-change)
-9. [Dream State: Background Consolidation](#dream-state-background-consolidation)
-10. [Privacy and Security](#privacy-and-security)
-11. [MCP Tool Surface](#mcp-tool-surface)
-12. [Project Structure](#project-structure)
-13. [Getting Started](#getting-started)
-14. [Example: Using the Python Library](#example-using-the-python-library)
-15. [Example: Using the MCP Server](#example-using-the-mcp-server)
+8. [Retrieval Calibration](#retrieval-calibration)
+9. [Belief Revision: How Memories Change](#belief-revision-how-memories-change)
+10. [Dream State: Background Consolidation](#dream-state-background-consolidation)
+11. [Privacy and Security](#privacy-and-security)
+12. [MCP Tool Surface](#mcp-tool-surface)
+13. [Project Structure](#project-structure)
+14. [Getting Started](#getting-started)
+15. [Examples](#examples)
+16. [Example: Using the MCP Server](#example-using-the-mcp-server)
 
 ---
 
@@ -73,49 +74,84 @@ Large language models are stateless. Every conversation starts from scratch. Mem
 
 ## System Architecture
 
-```
-                         +----------------------------+
-                         |        AI Agents           |
-                         |  Claude, GPT, custom bots  |
-                         +-------------+--------------+
-                                       |
-                              MCP tools / Python SDK
-                                       |
-                         +-------------v--------------+
-                         |    Memex Orchestrator      |
-                         |    (Python / async)        |
-                         +-------------+--------------+
-                                       |
-                        MemoryStore + SearchStrategy protocols
-                                       |
-            +--------------------------+--------------------------+
-            |                                                     |
-   Backend A: Neo4j + Redis                            Backend B: MongoDB 8.1
-   +---------------------+                             +-------------------------+
-   |   Neo4j             |                             |  mongod  (replica set)  |
-   |   long-term graph   |                             |  + domain collections   |
-   |   BM25 + vector     |                             |  + working_memory (TTL) |
-   +---------------------+                             |  + events               |
-            +                                          +-----------+-------------+
-   +--------+------------+                                         |
-   |   Redis             |                             +-----------v-------------+
-   |   working memory    |                             |  mongot                 |
-   |   event stream      |                             |  Atlas Search +         |
-   +---------------------+                             |  Vector Search indexes  |
-                                                       +-------------------------+
+Memex is organized around a single logical pipeline. The storage layer is
+pluggable: any implementation of the `MemoryStore` + `SearchStrategy`
+protocols plugs into the same orchestrator. Today two implementations
+ship (Neo4j + Redis; MongoDB 8.1 + mongot), selected at startup via
+`MEMEX_BACKEND`.
 
-                           Shared orchestrator concerns
-                                       |
-                   +-------------------+--------------------+
-                   |                                        |
-           +-------v--------+                       +-------v--------+
-           |  Artifact      |                       |  LLM Adapters  |
-           |  storage       |                       |  (litellm)     |
-           |  local/S3      |                       |  enrich, embed |
-           +----------------+                       +----------------+
+```
+                +------------------------------------+
+                |             AI Agents              |
+                |     Claude, GPT, custom bots       |
+                +-----------------+------------------+
+                                  |
+                         MCP tools / Python SDK
+                                  |
+                +-----------------v------------------+
+                |         Memex Orchestrator         |
+                |   (async Python: ingest / recall   |
+                |    revise / consolidate / learn)   |
+                +-----------------+------------------+
+                                  |
+                     +------------+-----------+
+                     |                        |
+                     v                        v
+              Privacy hooks            LLM / Embedding
+              (PII + secrets)          adapters (litellm)
+                     |                        |
+                     +------------+-----------+
+                                  |
+                +-----------------v------------------+
+                |     MemoryStore  +  SearchStrategy |
+                |          protocol interfaces       |
+                +-----------------+------------------+
+                                  |
+                +-----------------v------------------+
+                |   Pluggable storage implementation |
+                |                                    |
+                |   Long-term graph:   items /       |
+                |     revisions / tags / edges /     |
+                |     artifacts (BM25 + vector       |
+                |     indexes over revisions)        |
+                |                                    |
+                |   Working memory:     session      |
+                |     message buffer (TTL)           |
+                |                                    |
+                |   Event feed:         append-only  |
+                |     consolidation stream for       |
+                |     Dream State                    |
+                |                                    |
+                |   Learning store:     judgments,   |
+                |     retrieval profiles, audit      |
+                |     reports                        |
+                +------------------------------------+
+                                  |
+                +-----------------v------------------+
+                |   Artifact storage (local or S3)   |
+                |   -- pointer-only; no bytes in the |
+                |      graph                         |
+                +------------------------------------+
 ```
 
-**Key rule:** The orchestrator is the only component that talks to the storage backend, artifact storage, or LLM providers. Agents never touch backends directly, and the choice of backend is invisible to application code.
+**Key rule:** The orchestrator is the only component that talks to the
+storage backend, artifact storage, or LLM providers. Agents never touch
+backends directly, and the choice of backend is invisible to
+application code.
+
+### Backend implementations
+
+Both backends satisfy the same protocol set; the differences are
+operational, not semantic.
+
+| Concern | Neo4j + Redis | MongoDB 8.1 + mongot |
+|---------|---------------|----------------------|
+| Long-term graph | Neo4j nodes / relationships | collections (`items`, `revisions`, `tags`, `tag_assignments`, `edges`, `artifacts`, `projects`, `spaces`) |
+| BM25 fulltext | Neo4j fulltext index (`revision_search_text`) | Atlas Search index on `revisions.search_text` (served by `mongot`) |
+| Vector search | Neo4j vector index (`revision_embedding`) | Atlas Vector Search index on `revisions.embedding` (served by `mongot`) |
+| Working memory | Redis lists + TTL | `working_memory` collection with TTL index |
+| Event feed | Redis Streams | `events` collection |
+| Hybrid fusion | UNION ALL Cypher, Python CombMAX | `$unionWith` aggregation, Python CombMAX |
 
 ### Component Responsibilities
 
@@ -123,7 +159,7 @@ Large language models are stateless. Every conversation starts from scratch. Mem
 |-----------|------|
 | **Neo4j** (backend A) | Long-term memory graph. Stores items, revisions, tags, edges, artifacts. Provides fulltext (BM25) and vector indexes for retrieval. |
 | **Redis** (backend A) | Working-memory session buffer (bounded, TTL-expiring message lists) and consolidation event feed (Redis Streams) consumed by Dream State. |
-| **MongoDB + mongot** (backend B) | One database hosts every collection: `projects`, `spaces`, `items`, `revisions`, `tags`, `tag_assignments`, `artifacts`, `edges`, `audit_reports`, `working_memory` (TTL index), and `events`. `mongot` hosts the `revision_search_text` (Atlas Search) and `revision_embedding` (Atlas Vector Search) indexes. Hybrid recall uses the MongoDB 8.1 `$rankFusion` aggregation stage. |
+| **MongoDB + mongot** (backend B) | One database hosts every collection: `projects`, `spaces`, `items`, `revisions`, `tags`, `tag_assignments`, `artifacts`, `edges`, `audit_reports`, `working_memory` (TTL index), `events`, and the learning-subsystem collections `judgments`, `retrieval_profiles`, `retrieval_profiles_shadow`, `calibration_reports`. `mongot` hosts the `revision_search_text` (Atlas Search) and `revision_embedding` (Atlas Vector Search) indexes. Hybrid recall unions both branches with `$unionWith` and fuses them with CombMAX in Python. |
 | **LLM Adapters** | Abstracted behind `LLMClient` and `EmbeddingClient` protocols. Default implementation uses [litellm](https://github.com/BerriAI/litellm) so any provider (OpenAI, Anthropic, local models) works. Used for enrichment extraction and Dream State assessment. |
 | **Artifact Storage** | External file storage (local filesystem or cloud). The graph stores only a pointer (`location` URI), never raw bytes. |
 
@@ -298,71 +334,70 @@ Agent query
 +------------------------------------------------------+
 ```
 
-### Neo4j Hybrid Pipeline (`memex.retrieval.hybrid.HybridSearch`)
+### Dual-Branch Search
+
+Both backends run the same two branches over the same per-revision
+BM25 and vector indexes. Each branch returns a ranked candidate set
+and its raw score:
 
 ```
-+-- Dual-Branch Search (single UNION ALL Cypher) ------+
-|                                                       |
-|  Branch 1: BM25 Fulltext                             |
-|    CALL db.index.fulltext.queryNodes(                |
-|      'revision_search_text', $query)                 |
-|    -> yields (revision, bm25_score)                  |
-|                                                       |
-|  Branch 2: Vector Similarity                         |
-|    CALL db.index.vector.queryNodes(                  |
-|      'revision_embedding', $top_k, $embedding)       |
-|    -> yields (revision, cosine_score)                |
-|                                                       |
-|  Both branches filter: WHERE item.deprecated = false |
-+------------------------------------------------------+
-    |
-    v
-+-- Max-Fusion Scoring --------------------------------+
-|  s_lex = BM25 score                                  |
-|  s_vec = beta * cosine_similarity  (beta = 0.85)     |
-|  Type weight w(m):                                   |
-|    item match   = 1.0                                |
-|    revision match = 0.9                              |
-|    artifact match = 0.8                              |
-|  S(q, m) = w(m) * max(s_lex, s_vec)                  |
-+------------------------------------------------------+
+Branch 1: BM25 fulltext   -> (revision, raw_bm25)
+Branch 2: Vector cosine   -> (revision, raw_cosine)
+    (deprecated items filtered out)
 ```
 
-This follows the paper's max-fusion rule verbatim.
+The two branches are unioned at the backend level -- a single
+UNION ALL Cypher call on Neo4j, a `$unionWith` aggregation on
+MongoDB -- so both halves arrive in one round trip.
 
-### MongoDB Hybrid Pipeline (`memex.retrieval.mongo_hybrid.MongoHybridSearch`)
+### CombMAX Fusion with Okapi Saturation
 
-On MongoDB 8.1, Memex uses the server-side `$rankFusion` aggregation stage, which runs both branches as named sub-pipelines and fuses them via Reciprocal Rank Fusion (RRF):
+Raw BM25 is unbounded on `[0, inf)` and raw cosine lives on `[0, 1]`,
+so a naive `max(s_lex, s_vec)` lets a single inflated BM25 score hijack
+the fusion (Bruch et al. 2023). Memex avoids that by pushing both
+branches through the same Okapi-style saturation before comparing
+them:
 
 ```
-aggregate([
-  {
-    "$rankFusion": {
-      "input": {
-        "pipelines": {
-          "vectorPipeline":  [ { "$vectorSearch": { ... } } ],
-          "fullTextPipeline":[ { "$search":       { ... } },
-                               { "$limit": lim }            ]
-        }
-      },
-      "combination": {
-        "weights": {
-          "vectorPipeline":   beta,  // 0.85 by default
-          "fullTextPipeline": 1.0
-        }
-      },
-      "scoreDetails": true
-    }
-  },
-  { "$addFields": { "_score": { "$meta": "score" },
-                    "_score_details": { "$meta": "scoreDetails" } } },
-  // post-fusion $lookup on items + $match for deprecated filter
-])
+saturate(s, k) = s / (s + k)      # monotonic, [0, 1)
+                                  #   s = 0  -> 0
+                                  #   s = k  -> 0.5  (confidence midpoint)
+                                  #   s -> inf -> asymptotic to 1
+
+s_lex = saturate(raw_bm25,   k_lex)
+s_vec = saturate(raw_cosine, k_vec)
+
+S(q, m) = w(m) * max(s_lex, s_vec)
 ```
 
-RRF score per document is `sum(weight / (60 + rank_i))` across contributing pipelines. Memex then applies the same type weight `w(m)` post-fusion, so the final score is `w(m) * RRF(q, m)`. Single-branch requests (query only or embedding only) skip `$rankFusion` entirely and run the corresponding pipeline directly, because `$rankFusion` requires multiple input pipelines.
+`k_lex` and `k_vec` answer the same question per branch: "raw score at
+which this branch is 50% confident the candidate is relevant." That
+makes the max-operand scales symmetric, so CombMAX picks the
+genuinely-stronger signal instead of the better-calibrated one. The
+`SearchRequest` defaults are `k_lex = 1.0` and `k_vec = 0.5`; per-project
+tuning replaces them (see [Retrieval Calibration](#retrieval-calibration)).
 
-Space-scoped recall pushes the `$match { space_id: { $in: [...] } }` stage *inside* each sub-pipeline so every per-branch rank is computed against the scoped candidate set, relying on the denormalized `revisions.space_id` field.
+Type weight `w(m)` is source-specific:
+
+| Match source | `w(m)` default |
+|--------------|----------------|
+| Item         | 1.0            |
+| Revision     | 0.9            |
+| Artifact     | 0.8            |
+
+### Backend-Specific Notes
+
+On MongoDB, the vector branch's raw score is
+`(1 + cos(theta)) / 2` (MongoDB's reported `searchScore` for cosine);
+Memex inverts that back to raw cosine *before* saturation so both
+backends feed `saturate` the same quantity. Space-scoped recall on
+MongoDB pushes the `$match { space_id: { $in: [...] } }` stage *inside*
+each sub-pipeline so per-branch rank is computed against the scoped
+candidate set (relying on the denormalized `revisions.space_id` field).
+
+Single-branch requests (query-only or embedding-only) skip the union
+and run the relevant branch directly, so a lexical-only recall is one
+index lookup, not two.
 
 ### Deduplication and Limiting (both backends)
 
@@ -399,6 +434,105 @@ The server returns structured result payloads (scores, metadata, search mode) so
 - **`client`**: Pass results through with metadata for agent-side reranking.
 - **`dedicated`**: Server sorts by score.
 - **`auto`**: Picks the best strategy based on context.
+
+---
+
+## Retrieval Calibration
+
+The CombMAX fusion above is parameterized by two saturation midpoints
+(`k_lex`, `k_vec`) and seven type weights. Good defaults work on day
+one, but optimal values depend on the corpus -- an IDF distribution
+over 100 engineering memories is very different from one over
+10 million chat logs. The `memex.learning` subsystem tunes those
+parameters per-project from real query/label data. It lives beside
+the request path rather than on it: production recall is unchanged
+until a freshly-calibrated profile is written and picked up.
+
+### The loop
+
+```
++-- 1. Capture -------------------------------------+
+|  LearningClient.capture_query(q, project_id=...)  |
+|    -> runs recall once with the active profile    |
+|    -> persists a QueryJudgment snapshot:          |
+|         (query, candidates[], raw branch scores,  |
+|          profile_generation, capture_limit)       |
++---------------------------------------------------+
+    |
+    v
++-- 2. Label ---------------------------------------+
+|  LearningClient.label(judgment, {rev_id: content})|
+|    -> Labeler strategy attaches relevance scores  |
+|       Default: LLM-as-judge (LLMJudgeLabeler)     |
+|       grades each candidate 0.0-1.0 against the   |
+|       query. Outputs pointwise_labels.            |
+|       Alternative: user-behavior pairwise labels, |
+|       or SyntheticGenerator for cold-start.       |
++---------------------------------------------------+
+    |
+    v
++-- 3. Tune ----------------------------------------+
+|  LearningClient.tune(project_id)                  |
+|    CalibrationPipeline orchestrates:              |
+|      a. Load recent labeled judgments             |
+|      b. Deterministic train/val split             |
+|         (newest -> val, so acceptance tracks      |
+|          current behavior)                        |
+|      c. GridSweepTuner over (k_lex, k_vec)        |
+|         Each grid point is replayed from the      |
+|         captured raw branch scores -- no fresh    |
+|         retrieval, no LLM calls.                  |
+|      d. MRREvaluator scores each candidate on the |
+|         val split. Best candidate must clear      |
+|         min_improvement to be applied.            |
+|      e. Profile application: generation++,        |
+|         active_since=now, previous=baseline.      |
+|         One-level rollback supported.             |
+|      f. Persist CalibrationAuditReport.           |
++---------------------------------------------------+
+```
+
+`capture_query` is the only step that touches the live retrieval
+indexes. Grid search replays the stored candidates in memory, so
+adding grid points is cheap and cost scales as
+`judgments * candidates * grid_size`.
+
+### Scoring for replay
+
+Each captured `CandidateRecord` stores both the saturated branch score
+under the active profile *and* the raw branch score, so the replay
+evaluator can re-saturate under any candidate `(k_lex, k_vec)` without
+re-running retrieval:
+
+```
+for each candidate in stored judgment:
+    s_lex = saturate(raw_bm25,   candidate_profile.k_lex)
+    s_vec = saturate(raw_cosine, candidate_profile.k_vec)
+    score = candidate_profile.type_weights[source] * max(s_lex, s_vec)
+MRR@10 = mean over judgments of 1/(1 + rank_of_first_relevant)
+```
+
+Relevance threshold for pointwise labels is `>= 0.5`.
+
+### LLM routing
+
+Both `LLMJudgeLabeler` and `SyntheticGenerator` read
+`MemexSettings.llm` when `Memex.build_learning_client()` auto-wires
+them, so a local OpenAI-compatible server (LM Studio, mlx-omni-server,
+vLLM) picks up the judge calls when `MEMEX_LLM_API_BASE` is set.
+Embeddings reuse the existing `EmbeddingSettings` configuration --
+`capture_query` inherits the Memex instance's embedding client so no
+separate wiring is needed for the vector branch.
+
+### Safety rails
+
+| Guard | Purpose |
+|-------|---------|
+| `min_judgments` (default 20) | Refuse to tune until enough signal exists; pipeline short-circuits to `INSUFFICIENT_DATA`. |
+| `min_improvement` (default 0.02) | Candidate must beat baseline by this MRR delta on the val split; otherwise `NO_IMPROVEMENT`. |
+| `dry_run` | Run the full pipeline without applying; useful for auditing a corpus before enabling tuning. |
+| Shadow profiles | `promote_shadow` / `rollback` let operators stage a profile for manual promotion, or roll back one generation if the new profile regresses live quality. |
+| Audit reports | Every run persists a `CalibrationAuditReport` documenting grid trace, deltas, and decision. |
 
 ---
 
@@ -646,7 +780,7 @@ src/memex/
         bm25.py              # BM25 fulltext search with query sanitization
         vector.py            # Vector similarity search
         hybrid.py            # Neo4j hybrid fusion: S(q,m) = w(m) * max(s_lex, s_vec)
-        mongo_hybrid.py      # MongoDB $rankFusion hybrid: RRF + type weights
+        mongo_hybrid.py      # MongoDB $unionWith hybrid: CombMAX + saturation + type weights
         multi_query.py       # Multi-query reformulation (3-4 LLM-generated variants)
 
     llm/                     # LLM integration
@@ -666,6 +800,17 @@ src/memex/
         privacy.py           # PII redaction + credential rejection
         lookup.py            # Convenience path-based item lookup
 
+    learning/                # Retrieval calibration (capture -> label -> tune)
+        client.py            # LearningClient facade
+        calibration_pipeline.py  # Train/val split, tune, apply-or-defer, audit
+        grid_sweep_tuner.py  # Exhaustive (k_lex, k_vec) grid sweep
+        mrr_evaluator.py     # Replay-based MRR@10 metric
+        metrics.py           # Evaluator protocol
+        tuners.py            # Tuner protocol + CalibrationResult
+        judgments.py         # QueryJudgment + CandidateRecord models
+        labelers.py          # LLMJudgeLabeler + SyntheticGenerator
+        profiles.py          # RetrievalProfile (k_lex, k_vec, type_weights)
+
     mcp/                     # MCP server
         __init__.py          # Public exports
         tools.py             # 23 MCP tools, MemexToolService, create_mcp_server()
@@ -674,6 +819,12 @@ src/memex/
         harness.py
         locomo.py
         locomo_plus.py
+
+examples/
+    sample_usage.py          # Neo4j facade + direct-API walkthrough
+    mongo_usage.py           # Full MongoDB end-to-end demo (index, ingest, recall, revise)
+    learning_usage.py        # Capture -> label -> tune against the local LLM judge
+    demo_data.py             # Shared engineering corpus + eval queries + setup/reset helpers
 ```
 
 ---
@@ -736,9 +887,12 @@ All settings are read from environment variables with the `MEMEX_` prefix. Defau
 | `MEMEX_REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
 | `MEMEX_MONGO_URI` | `mongodb://localhost:27017` | MongoDB connection URI |
 | `MEMEX_MONGO_DATABASE` | `memex` | MongoDB database name |
-| `MEMEX_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model |
+| `MEMEX_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model (litellm-prefixed for local backends, e.g. `openai/bge-m3-mlx-4bit`) |
 | `MEMEX_EMBEDDING_DIMENSIONS` | `1536` | Embedding vector size |
-| `MEMEX_EMBEDDING_BETA` | `0.85` | Vector-branch weight in hybrid recall |
+| `MEMEX_EMBEDDING_API_BASE` | _unset_ | Base URL for OpenAI-compatible embedding server (LM Studio, vLLM, mlx-omni-server) |
+| `MEMEX_LLM_MODEL` | `gpt-4o-mini` | Chat model used by learning labelers (judge + synthetic generator) |
+| `MEMEX_LLM_API_BASE` | _unset_ | Base URL for OpenAI-compatible chat server |
+| `MEMEX_LLM_TEMPERATURE` | `0.1` | Learning-LLM sampling temperature |
 | `MEMEX_ENRICHMENT_MODEL` | `gpt-4o-mini` | LLM for enrichment extraction |
 | `MEMEX_DREAM_BATCH_SIZE` | `20` | Revisions per Dream State batch |
 | `MEMEX_DREAM_MAX_DEPRECATION_RATIO` | `0.5` | Circuit breaker threshold |
@@ -757,7 +911,34 @@ MEMEX_BACKEND=mongo uv run python examples/mongo_usage.py
 
 ---
 
-## Example: Using the Python Library
+## Examples
+
+Every script under `examples/` is runnable directly with `uv run`. They
+all pull corpus and helper fixtures from the shared `demo_data` module
+so changes to the seed data propagate consistently.
+
+| Script | Purpose | Backend |
+|--------|---------|---------|
+| `examples/sample_usage.py` | Facade vs. direct-API walkthrough: ingest, edges, recall, revise. | Neo4j + Redis |
+| `examples/mongo_usage.py` | End-to-end MongoDB demo: provision indexes, reset, seed 96-item corpus, hybrid recall, revise. | MongoDB + mongot |
+| `examples/learning_usage.py` | Offline calibration demo: reset, seed, capture + LLM-label 8 eval queries across 2 cycles, run one tune. | MongoDB + mongot |
+| `examples/demo_data.py` | Shared fixtures: `ENGINEERING_CORPUS` (96 items), `ENGINEERING_EVAL_QUERIES` (8 hand-labeled), `ingest_corpus` / `reset_demo_data` / `setup_mongo` / `wait_for_mongot_catchup` helpers. | (library) |
+
+Run them with an env file so `MEMEX_BACKEND`, embedding settings, and
+the LLM routing in `.env` are picked up in one place:
+
+```bash
+# Neo4j reference flow
+uv run --env-file .env python examples/sample_usage.py
+
+# MongoDB end-to-end
+uv run --env-file .env python examples/mongo_usage.py
+
+# Retrieval-calibration loop (requires local LLM server for the judge)
+uv run --env-file .env python examples/learning_usage.py
+```
+
+### Example: Using the Python Library
 
 The facade picks up `MEMEX_BACKEND` from the environment, so the same code runs against either backend.
 

@@ -8,8 +8,9 @@ TTL expiry is handled by a MongoDB TTL index on ``expires_at``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from memex.stores.redis_store import MessageRole, WorkingMemoryMessage
 
@@ -37,7 +38,7 @@ class MongoWorkingMemory:
 
     def __init__(
         self,
-        collection: AsyncCollection,
+        collection: AsyncCollection[Mapping[str, Any]],
         *,
         session_ttl_seconds: int = 3600,
         max_messages: int = 50,

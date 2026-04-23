@@ -36,7 +36,7 @@ from memex.stores.protocols import MemoryStore
 logger = logging.getLogger(__name__)
 
 
-class DreamAuditReport(BaseModel, frozen=True):
+class DreamAuditReport(BaseModel):
     """Persisted audit trail of a single Dream State pipeline run.
 
     Args:

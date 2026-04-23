@@ -32,6 +32,10 @@ class NodeLabel(StrEnum):
     ARTIFACT = "Artifact"
     TAG_ASSIGNMENT = "TagAssignment"
     DREAM_AUDIT_REPORT = "DreamAuditReport"
+    CALIBRATION_AUDIT_REPORT = "CalibrationAuditReport"
+    RETRIEVAL_PROFILE = "RetrievalProfile"
+    SHADOW_RETRIEVAL_PROFILE = "ShadowRetrievalProfile"
+    QUERY_JUDGMENT = "QueryJudgment"
 
 
 class RelType(StrEnum):
@@ -86,6 +90,10 @@ _NAME_INDEXES: tuple[str, ...] = (
     "FOR (n:Revision) ON (n.item_id, n.revision_number)",
     "CREATE INDEX space_identity IF NOT EXISTS "
     "FOR (n:Space) ON (n.name, n.project_id, n._parent_key)",
+    "CREATE INDEX query_judgment_project_created IF NOT EXISTS "
+    "FOR (n:QueryJudgment) ON (n.project_id, n.created_at)",
+    "CREATE INDEX query_judgment_project_labeled IF NOT EXISTS "
+    "FOR (n:QueryJudgment) ON (n.project_id, n.labeled_at)",
 )
 
 _FULLTEXT_INDEX = (

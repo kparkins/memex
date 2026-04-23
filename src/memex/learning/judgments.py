@@ -80,7 +80,7 @@ class CandidateRecord(BaseModel, frozen=True):
     search_mode: SearchMode
 
 
-class QueryJudgment(BaseModel, frozen=True):
+class QueryJudgment(BaseModel):
     """One retrieval event plus optional labels attached later.
 
     A fresh judgment captures only the retrieval state (pending;

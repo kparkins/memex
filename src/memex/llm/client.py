@@ -30,6 +30,7 @@ class LLMClient(Protocol):
         *,
         model: str,
         temperature: float = 0.3,
+        api_base: str | None = None,
     ) -> str:
         """Send messages to an LLM and return the response text.
 
@@ -37,6 +38,9 @@ class LLMClient(Protocol):
             messages: Chat-style message list.
             model: Model identifier.
             temperature: Sampling temperature.
+            api_base: Optional base URL override. Used to route through
+                OpenAI-compatible local servers (LM Studio,
+                mlx-omni-server, vLLM, etc.).
 
         Returns:
             Response content string.
@@ -91,6 +95,7 @@ class LiteLLMClient:
         *,
         model: str,
         temperature: float = 0.3,
+        api_base: str | None = None,
     ) -> str:
         """Call litellm.acompletion and return the content string.
 
@@ -98,6 +103,8 @@ class LiteLLMClient:
             messages: Chat-style message list.
             model: Model identifier.
             temperature: Sampling temperature.
+            api_base: Optional base URL override forwarded to litellm
+                (for OpenAI-compatible local servers).
 
         Returns:
             Response content string.
@@ -105,12 +112,15 @@ class LiteLLMClient:
         Raises:
             RuntimeError: If the litellm call fails.
         """
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if api_base is not None:
+            kwargs["api_base"] = api_base
         try:
-            response = await litellm.acompletion(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-            )
+            response = await litellm.acompletion(**kwargs)
             content: str = response.choices[0].message.content.strip()
             return content
         except Exception as exc:

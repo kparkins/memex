@@ -9,6 +9,7 @@ caller only invokes these helpers after a successful Neo4j commit.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from memex.domain.edges import Edge
 from memex.domain.models import Revision
@@ -18,11 +19,14 @@ from memex.stores.redis_store import (
     ConsolidationEventType,
 )
 
+if TYPE_CHECKING:
+    from memex.stores.mongo_event_feed import MongoEventFeed
+
 logger = logging.getLogger(__name__)
 
 
 async def publish_revision_created(
-    feed: ConsolidationEventFeed,
+    feed: ConsolidationEventFeed | MongoEventFeed,
     project_id: str,
     revision: Revision,
 ) -> ConsolidationEvent:
@@ -44,7 +48,7 @@ async def publish_revision_created(
 
 
 async def publish_edge_created(
-    feed: ConsolidationEventFeed,
+    feed: ConsolidationEventFeed | MongoEventFeed,
     project_id: str,
     edge: Edge,
 ) -> ConsolidationEvent:
@@ -71,7 +75,7 @@ async def publish_edge_created(
 
 
 async def publish_revision_deprecated(
-    feed: ConsolidationEventFeed,
+    feed: ConsolidationEventFeed | MongoEventFeed,
     project_id: str,
     item_id: str,
 ) -> ConsolidationEvent:
@@ -93,7 +97,7 @@ async def publish_revision_deprecated(
 
 
 async def publish_after_ingest(
-    feed: ConsolidationEventFeed,
+    feed: ConsolidationEventFeed | MongoEventFeed,
     project_id: str,
     revision: Revision,
     edges: list[Edge],

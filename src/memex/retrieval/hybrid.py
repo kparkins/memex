@@ -281,15 +281,27 @@ class HybridSearch:
                         "match_source": MatchSource.REVISION,
                         "lexical_score": 0.0,
                         "vector_score": 0.0,
+                        "raw_lexical_score": None,
+                        "raw_vector_score": None,
                     }
 
                 entry = candidates[rev_id]
                 if source == "lexical":
+                    if (
+                        entry["raw_lexical_score"] is None
+                        or raw_score > entry["raw_lexical_score"]
+                    ):
+                        entry["raw_lexical_score"] = raw_score
                     entry["lexical_score"] = max(
                         entry["lexical_score"],
                         saturate_score(raw_score, k_lex),
                     )
                 else:
+                    if (
+                        entry["raw_vector_score"] is None
+                        or raw_score > entry["raw_vector_score"]
+                    ):
+                        entry["raw_vector_score"] = raw_score
                     entry["vector_score"] = max(
                         entry["vector_score"],
                         saturate_score(raw_score, k_vec),
@@ -332,6 +344,8 @@ class HybridSearch:
                     score=fused,
                     lexical_score=entry["lexical_score"],
                     vector_score=entry["vector_score"],
+                    raw_lexical_score=entry["raw_lexical_score"],
+                    raw_vector_score=entry["raw_vector_score"],
                     match_source=source,
                     search_mode=search_mode,
                 )

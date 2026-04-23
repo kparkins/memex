@@ -1845,6 +1845,8 @@ class Neo4jStore:
         Returns:
             Parsed DreamAuditReport, or None if not found.
         """
+        from memex.orchestration.dream_pipeline import DreamAuditReport
+
         cypher = (
             f"MATCH (r:{NodeLabel.DREAM_AUDIT_REPORT} "
             "{id: $id}) RETURN r.data AS data"
@@ -1871,6 +1873,8 @@ class Neo4jStore:
         Returns:
             Parsed DreamAuditReport list, newest first.
         """
+        from memex.orchestration.dream_pipeline import DreamAuditReport
+
         cypher = (
             f"MATCH (r:{NodeLabel.DREAM_AUDIT_REPORT} "
             "{project_id: $pid}) "
@@ -1964,7 +1968,7 @@ class Neo4jStore:
 
         cypher = (
             f"MERGE (p:{NodeLabel.SHADOW_RETRIEVAL_PROFILE} "
-            "{{project_id: $pid}}) "
+            "{project_id: $pid}) "
             "SET p.generation = $gen, p.data = $data"
         )
         async with self._driver.session(database=self._database) as session:
@@ -1990,7 +1994,7 @@ class Neo4jStore:
         """
         cypher = (
             f"MATCH (p:{NodeLabel.SHADOW_RETRIEVAL_PROFILE} "
-            "{{project_id: $pid}}) "
+            "{project_id: $pid}) "
             "RETURN p.data AS data"
         )
         async with self._driver.session(database=self._database) as session:
@@ -2010,7 +2014,7 @@ class Neo4jStore:
         """
         cypher = (
             f"MATCH (p:{NodeLabel.SHADOW_RETRIEVAL_PROFILE} "
-            "{{project_id: $pid}}) "
+            "{project_id: $pid}) "
             "DETACH DELETE p"
         )
         async with self._driver.session(database=self._database) as session:
@@ -2086,6 +2090,8 @@ class Neo4jStore:
         Returns:
             Parsed CalibrationAuditReport, or None if not found.
         """
+        from memex.learning.calibration_pipeline import CalibrationAuditReport
+
         cypher = (
             f"MATCH (r:{NodeLabel.CALIBRATION_AUDIT_REPORT} "
             "{id: $id}) RETURN r.data AS data"
@@ -2112,6 +2118,8 @@ class Neo4jStore:
         Returns:
             Parsed CalibrationAuditReport list, newest first.
         """
+        from memex.learning.calibration_pipeline import CalibrationAuditReport
+
         cypher = (
             f"MATCH (r:{NodeLabel.CALIBRATION_AUDIT_REPORT} "
             "{project_id: $pid}) "

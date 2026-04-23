@@ -184,7 +184,7 @@ def _validate_traversal_depth(depth: int) -> None:
 # -- Index setup --------------------------------------------------------------
 
 
-async def ensure_indexes(db: AsyncDatabase) -> None:
+async def ensure_indexes(db: AsyncDatabase[Mapping[str, Any]]) -> None:
     """Create necessary B-tree indexes for all Memex collections.
 
     Search indexes (Atlas Search / mongot) are provisioned separately
@@ -301,7 +301,7 @@ async def ensure_indexes(db: AsyncDatabase) -> None:
 # -- Migration: backfill revision.space_id -----------------------------------
 
 
-async def backfill_revision_space_id(db: AsyncDatabase) -> int:
+async def backfill_revision_space_id(db: AsyncDatabase[Mapping[str, Any]]) -> int:
     """Denormalize ``item.space_id`` onto existing revision documents.
 
     Idempotent one-shot migration for the ``me-revision-space-denorm``
@@ -405,7 +405,7 @@ async def wait_for_doc_indexed(
         just-written revision).
     """
     deadline = time.monotonic() + timeout_s
-    pipeline = [
+    pipeline: list[Mapping[str, Any]] = [
         {
             "$search": {
                 "index": index_name,
@@ -561,11 +561,11 @@ class MongoStore:
 
     def __init__(
         self,
-        client: AsyncMongoClient,
+        client: AsyncMongoClient[Mapping[str, Any]],
         database: str = "memex",
     ) -> None:
         self._client = client
-        self._db: AsyncDatabase = client[database]
+        self._db: AsyncDatabase[Mapping[str, Any]] = client[database]
 
     # -- Project --------------------------------------------------------------
 
@@ -1786,7 +1786,6 @@ class MongoStore:
         doc = await self._db.retrieval_profiles.find_one({"_id": project_id})
         if doc is None:
             return None
-        doc.pop("_id", None)
         return RetrievalProfile.model_validate(doc)
 
     # -- Shadow profiles ------------------------------------------------------
@@ -1831,7 +1830,6 @@ class MongoStore:
         )
         if doc is None:
             return None
-        doc.pop("_id", None)
         return RetrievalProfile.model_validate(doc)
 
     async def clear_shadow_profile(self, project_id: str) -> None:
@@ -1989,10 +1987,10 @@ class MongoStore:
         """
         query: dict[str, object] = {
             "project_id": project_id,
-            "labeled_at": {"$exists": True},
+            "labeled_at": {"$type": "date"},
         }
         if since is not None:
-            query["labeled_at"] = {"$gte": since}
+            query["labeled_at"] = {"$type": "date", "$gte": since}
         cursor = (
             self._db.judgments.find(query, {"query_embedding": 0})
             .sort("labeled_at", DESCENDING)

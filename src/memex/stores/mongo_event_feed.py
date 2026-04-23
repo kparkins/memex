@@ -7,8 +7,9 @@ monotonic cursor, mirroring the role of Redis Stream entry IDs.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from bson import ObjectId
 
@@ -35,7 +36,7 @@ class MongoEventFeed:
         collection: pymongo async collection for event documents.
     """
 
-    def __init__(self, collection: AsyncCollection) -> None:
+    def __init__(self, collection: AsyncCollection[Mapping[str, Any]]) -> None:
         self._collection = collection
 
     async def publish(
@@ -172,7 +173,7 @@ class MongoDreamStateCursor:
         collection: pymongo async collection for cursor documents.
     """
 
-    def __init__(self, collection: AsyncCollection) -> None:
+    def __init__(self, collection: AsyncCollection[Mapping[str, Any]]) -> None:
         self._collection = collection
 
     async def save(self, project_id: str, cursor_id: str) -> None:
@@ -203,7 +204,8 @@ class MongoDreamStateCursor:
         doc = await self._collection.find_one({"_id": project_id})
         if doc is None:
             return _CURSOR_INITIAL
-        return doc.get("cursor_id", _CURSOR_INITIAL)
+        cursor_id = doc.get("cursor_id", _CURSOR_INITIAL)
+        return str(cursor_id)
 
     async def clear(self, project_id: str) -> None:
         """Reset cursor to the beginning of the feed.

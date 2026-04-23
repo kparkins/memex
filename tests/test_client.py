@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from memex.client import Memex
-from memex.config import MemexSettings
+from memex.config import EmbeddingSettings, MemexSettings
 from memex.domain.edges import Edge, EdgeType, TagAssignment
 from memex.domain.models import Item, ItemKind, Project, Revision, Space
+from memex.learning.profiles import RetrievalProfile
 from memex.orchestration.ingest import IngestParams, ReviseParams
 from memex.retrieval.models import (
     HybridResult,
     MatchSource,
+    ScopedRecallResult,
     SearchMode,
     SearchRequest,
-    ScopedRecallResult,
 )
 from memex.stores.protocols import MemoryStore
 
@@ -36,6 +38,11 @@ def _mock_store() -> AsyncMock:
     store.get_item.return_value = None
     store.find_space.return_value = None
     store.get_item_by_name.return_value = None
+    store.get_retrieval_profile.return_value = None
+    store.get_shadow_profile.return_value = None
+    store.save_shadow_profile.return_value = None
+    store.clear_shadow_profile.return_value = None
+    store.rollback_retrieval_profile.return_value = None
     return store
 
 
@@ -88,6 +95,8 @@ def _make_hybrid_result(
         item_kind=item_kind,
         lexical_score=0.8,
         vector_score=0.7,
+        raw_lexical_score=4.0,
+        raw_vector_score=0.9,
         match_source=MatchSource.REVISION,
         search_mode=SearchMode.HYBRID,
     )
@@ -349,7 +358,7 @@ class TestMemexRecallScoped:
         a SUPPORTS edge are both returned when edge traversal is
         enabled, and the edge metadata is included.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         kb_space = Space(id="sp-kb", project_id=PROJECT_ID, name="kb")
         nutr_space = Space(
@@ -369,7 +378,7 @@ class TestMemexRecallScoped:
             source_revision_id="rev-kb-1",
             target_revision_id="rev-nutr-1",
             edge_type=EdgeType.SUPPORTS,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
 
         store = _mock_store()
@@ -724,7 +733,7 @@ class TestMemexFromSettings:
     @pytest.mark.asyncio
     async def test_from_settings_creates_instance(self) -> None:
         """from_settings should return a Memex with owned connections."""
-        settings = MemexSettings()
+        settings = MemexSettings(backend="neo4j")
 
         with (
             patch("neo4j.AsyncGraphDatabase") as mock_neo4j,
@@ -741,3 +750,177 @@ class TestMemexFromSettings:
             mock_redis.from_url.assert_called_once()
 
             await m.close()
+
+
+class TestRecallProfile:
+    """Verify Memex.recall and recall_scoped apply RetrievalProfile calibration."""
+
+    @pytest.mark.asyncio
+    async def test_recall_without_project_id_omits_profile(self) -> None:
+        """recall() with no project_id never calls get_retrieval_profile."""
+        store = _mock_store()
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        await m.recall("q")
+
+        store.get_retrieval_profile.assert_not_called()
+        req = search.search.call_args[0][0]
+        assert isinstance(req, SearchRequest)
+        assert req.lexical_saturation_k == 1.0
+        assert req.vector_saturation_k == 0.5
+
+    @pytest.mark.asyncio
+    async def test_recall_with_project_id_but_no_profile_uses_defaults(
+        self,
+    ) -> None:
+        """recall() with project_id but no stored profile uses SearchRequest defaults.
+        """
+        store = _mock_store()
+        store.get_retrieval_profile.return_value = None
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        await m.recall("q", project_id=PROJECT_ID)
+
+        store.get_retrieval_profile.assert_awaited_once_with(PROJECT_ID)
+        req = search.search.call_args[0][0]
+        assert req.lexical_saturation_k == 1.0
+        assert req.vector_saturation_k == 0.5
+
+    @pytest.mark.asyncio
+    async def test_recall_with_profile_applies_calibration(self) -> None:
+        """recall() forwards k_lex, k_vec, and type_weights from a stored profile."""
+        profile = RetrievalProfile(
+            project_id=PROJECT_ID,
+            k_lex=0.7,
+            k_vec=0.3,
+            type_weights={
+                MatchSource.ITEM: 1.2,
+                MatchSource.REVISION: 0.8,
+                MatchSource.ARTIFACT: 0.6,
+            },
+        )
+        store = _mock_store()
+        store.get_retrieval_profile.return_value = profile
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        await m.recall("q", project_id=PROJECT_ID)
+
+        req = search.search.call_args[0][0]
+        assert req.lexical_saturation_k == 0.7
+        assert req.vector_saturation_k == 0.3
+        assert req.type_weights == profile.type_weights
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_applies_profile(self) -> None:
+        """recall_scoped() applies profile calibration and populates space_ids."""
+        profile = RetrievalProfile(
+            project_id=PROJECT_ID,
+            k_lex=0.7,
+            k_vec=0.3,
+            type_weights={
+                MatchSource.ITEM: 1.2,
+                MatchSource.REVISION: 0.8,
+                MatchSource.ARTIFACT: 0.6,
+            },
+        )
+        store = _mock_store()
+        store.get_retrieval_profile.return_value = profile
+        store.find_space.return_value = Space(
+            id="sp-1", project_id=PROJECT_ID, name=SPACE_NAME
+        )
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        await m.recall_scoped("q", project_id=PROJECT_ID, space_names=[SPACE_NAME])
+
+        req = search.search.call_args[0][0]
+        assert req.lexical_saturation_k == 0.7
+        assert req.vector_saturation_k == 0.3
+        assert req.type_weights == profile.type_weights
+        assert req.space_ids == ("sp-1",)
+
+    @pytest.mark.asyncio
+    async def test_recall_scoped_with_no_profile_uses_defaults(self) -> None:
+        """recall_scoped() with no stored profile uses SearchRequest defaults."""
+        store = _mock_store()
+        store.get_retrieval_profile.return_value = None
+        store.find_space.return_value = Space(
+            id="sp-1", project_id=PROJECT_ID, name=SPACE_NAME
+        )
+        search = _mock_search()
+        m = _make_memex(store=store, search=search)
+
+        await m.recall_scoped("q", project_id=PROJECT_ID, space_names=[SPACE_NAME])
+
+        req = search.search.call_args[0][0]
+        assert req.lexical_saturation_k == 1.0
+        assert req.vector_saturation_k == 0.5
+
+
+class TestBuildLearningClient:
+    """Verify ``Memex.build_learning_client`` wires a usable facade."""
+
+    def test_returns_learning_client_with_default_pipeline(self) -> None:
+        """Default build: pipeline is auto-constructed from store + search."""
+        m = _make_memex()
+        lc = m.build_learning_client()
+        from memex.learning.client import LearningClient
+        assert isinstance(lc, LearningClient)
+        # Pipeline is present, so tune() won't raise RuntimeError
+        assert lc._pipeline is not None
+
+    def test_custom_pipeline_override_used_verbatim(self) -> None:
+        """When a pipeline is passed, tuner/evaluator params are ignored."""
+        from unittest.mock import MagicMock
+        m = _make_memex()
+        sentinel_pipeline = MagicMock()
+        lc = m.build_learning_client(calibration_pipeline=sentinel_pipeline)
+        assert lc._pipeline is sentinel_pipeline
+
+    def test_custom_labeler_and_generator_threaded_through(self) -> None:
+        """Labeler + generator overrides reach the LearningClient."""
+        from unittest.mock import MagicMock
+        m = _make_memex()
+        labeler = MagicMock()
+        gen = MagicMock()
+        lc = m.build_learning_client(
+            labeler=labeler, synthetic_generator=gen
+        )
+        assert lc._labeler is labeler
+        assert lc._synth is gen
+
+
+class TestBuildLearningClientOfflineReplay:
+    """Verify ``build_learning_client`` favors offline replay calibration."""
+
+    def test_default_evaluator_is_replay_based(self) -> None:
+        """The default pipeline uses MRREvaluator without binding search."""
+        m = _make_memex()
+        lc = m.build_learning_client()
+
+        assert lc._pipeline is not None
+        assert lc._search is m._search
+
+    def test_capture_dependencies_threaded_through(self) -> None:
+        """The client keeps search and embedding dependencies for capture_query."""
+        from unittest.mock import MagicMock
+
+        store = _mock_store()
+        search = _mock_search()
+        embedding_client = MagicMock()
+        embedding_settings = EmbeddingSettings()
+        m = Memex(
+            store=store,
+            search=search,
+            embedding_client=embedding_client,
+            embedding_settings=embedding_settings,
+        )
+
+        lc = m.build_learning_client()
+
+        assert lc._search is search
+        assert lc._embedding_client is embedding_client
+        assert lc._embedding_settings is embedding_settings

@@ -17,12 +17,19 @@ Typical usage::
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
-from memex.config import EmbeddingSettings, MemexSettings
+from memex.config import EmbeddingSettings, LLMSettings, MemexSettings
 from memex.domain.edges import Edge
 from memex.domain.models import Item, Project, Space
+from memex.learning.calibration_pipeline import CalibrationPipeline
+from memex.learning.client import LearningClient
+from memex.learning.grid_sweep_tuner import GridSweepTuner
+from memex.learning.labelers import Labeler, LLMJudgeLabeler, SyntheticGenerator
+from memex.learning.metrics import Evaluator
+from memex.learning.mrr_evaluator import MRREvaluator
+from memex.learning.tuners import Tuner
 from memex.llm.client import EmbeddingClient, LiteLLMEmbeddingClient
 from memex.orchestration.ingest import (
     IngestParams,
@@ -46,6 +53,9 @@ if TYPE_CHECKING:
     from pymongo import AsyncMongoClient
     from redis.asyncio import Redis
 
+    from memex.stores.mongo_event_feed import MongoEventFeed
+    from memex.stores.mongo_working_memory import MongoWorkingMemory
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,17 +78,23 @@ class Memex:
         store: MemoryStore,
         search: SearchStrategy,
         *,
-        working_memory: RedisWorkingMemory | None = None,
-        event_feed: ConsolidationEventFeed | None = None,
+        working_memory: RedisWorkingMemory | MongoWorkingMemory | None = None,
+        event_feed: ConsolidationEventFeed | MongoEventFeed | None = None,
         embedding_client: EmbeddingClient | None = None,
         embedding_settings: EmbeddingSettings | None = None,
+        llm_settings: LLMSettings | None = None,
     ) -> None:
         self._store = store
         self._search = search
-        self._working_memory = working_memory
-        self._event_feed = event_feed
+        self._working_memory: (
+            RedisWorkingMemory | MongoWorkingMemory | None
+        ) = working_memory
+        self._event_feed: (
+            ConsolidationEventFeed | MongoEventFeed | None
+        ) = event_feed
         self._embedding_client = embedding_client
         self._embedding_settings = embedding_settings
+        self._llm_settings = llm_settings
         self._ingest_service = IngestService(
             store,
             search,
@@ -89,6 +105,7 @@ class Memex:
         )
         self._driver: AsyncDriver | None = None
         self._redis: Redis | None = None
+        self._mongo_client: AsyncMongoClient[Mapping[str, Any]] | None = None
 
     # -- Class-method constructors ------------------------------------------
 
@@ -150,6 +167,7 @@ class Memex:
             event_feed=ef,
             embedding_client=LiteLLMEmbeddingClient(),
             embedding_settings=settings.embedding,
+            llm_settings=settings.llm,
         )
         instance._driver = driver
         instance._redis = redis_client
@@ -174,7 +192,9 @@ class Memex:
         from memex.stores.mongo_store import MongoStore
         from memex.stores.mongo_working_memory import MongoWorkingMemory
 
-        mongo_client = AsyncMongoClient(settings.mongo.uri)
+        mongo_client: AsyncMongoClient[Mapping[str, Any]] = AsyncMongoClient(
+            settings.mongo.uri
+        )
         db = mongo_client[settings.mongo.database]
 
         store = MongoStore(mongo_client, database=settings.mongo.database)
@@ -197,14 +217,15 @@ class Memex:
             event_feed=ef,
             embedding_client=LiteLLMEmbeddingClient(),
             embedding_settings=settings.embedding,
+            llm_settings=settings.llm,
         )
-        instance._mongo_client = mongo_client  # type: ignore[attr-defined]
+        instance._mongo_client = mongo_client
         return instance
 
     @classmethod
     def from_client(
         cls,
-        client: AsyncMongoClient,
+        client: AsyncMongoClient[Mapping[str, Any]],
         database: str = "memex",
         settings: MemexSettings | None = None,
     ) -> Memex:
@@ -246,6 +267,7 @@ class Memex:
             event_feed=ef,
             embedding_client=LiteLLMEmbeddingClient(),
             embedding_settings=cfg.embedding,
+            llm_settings=cfg.llm,
         )
 
     @classmethod
@@ -283,26 +305,50 @@ class Memex:
         limit: int = 10,
         memory_limit: int = 3,
         query_embedding: list[float] | None = None,
+        project_id: str | None = None,
     ) -> Sequence[SearchResult]:
         """Hybrid recall over the memory graph.
+
+        When ``project_id`` is provided and a
+        :class:`~memex.learning.profiles.RetrievalProfile` exists for
+        that project, its ``k_lex``, ``k_vec``, and ``type_weights``
+        are forwarded to the :class:`~memex.retrieval.models.SearchRequest`
+        to calibrate CombMAX fusion. When no profile is stored the
+        ``SearchRequest`` defaults are used unchanged.
 
         Args:
             query: Natural-language search string.
             limit: Maximum per-branch candidates.
             memory_limit: Maximum unique items in results.
             query_embedding: Optional pre-computed embedding.
+            project_id: Project whose retrieval profile to apply.
+                When ``None``, ``SearchRequest`` defaults are used.
 
         Returns:
             Search results ordered by descending relevance.
         """
         if query_embedding is None:
             query_embedding = await self._embed_query(query)
+
+        profile = None
+        if project_id is not None:
+            profile = await self._store.get_retrieval_profile(project_id)
+
+        profile_kwargs: dict[str, Any] = {}
+        if profile is not None:
+            profile_kwargs = {
+                "lexical_saturation_k": profile.k_lex,
+                "vector_saturation_k": profile.k_vec,
+                "type_weights": dict(profile.type_weights),
+            }
+
         return await self._search.search(
             SearchRequest(
                 query=query,
                 limit=limit,
                 memory_limit=memory_limit,
                 query_embedding=query_embedding,
+                **profile_kwargs,
             )
         )
 
@@ -369,6 +415,11 @@ class Memex:
         Args:
             query: Natural-language search string.
             project_id: Project whose spaces ``space_names`` refer to.
+                Also used to load a stored
+                :class:`~memex.learning.profiles.RetrievalProfile`; when
+                one exists its ``k_lex``, ``k_vec``, and ``type_weights``
+                calibrate CombMAX fusion.  When no profile is stored the
+                ``SearchRequest`` defaults are used unchanged.
             space_names: Whitelist of top-level space names within the
                 project. ``None`` disables scoping.
             limit: Maximum per-branch candidates.
@@ -397,12 +448,22 @@ class Memex:
                 )
             space_ids = tuple(resolved)
 
+        profile = await self._store.get_retrieval_profile(project_id)
+        profile_kwargs: dict[str, Any] = {}
+        if profile is not None:
+            profile_kwargs = {
+                "lexical_saturation_k": profile.k_lex,
+                "vector_saturation_k": profile.k_vec,
+                "type_weights": dict(profile.type_weights),
+            }
+
         results = await self._search.search(
             SearchRequest(
                 query=query,
                 limit=limit,
                 memory_limit=memory_limit,
                 space_ids=space_ids,
+                **profile_kwargs,
             )
         )
 
@@ -531,6 +592,82 @@ class Memex:
             self._store, project_id, space_name, item_name, item_kind
         )
 
+    def build_learning_client(
+        self,
+        *,
+        labeler: Labeler | None = None,
+        synthetic_generator: SyntheticGenerator | None = None,
+        tuner: Tuner | None = None,
+        evaluator: Evaluator | None = None,
+        calibration_pipeline: CalibrationPipeline | None = None,
+    ) -> LearningClient:
+        """Build a :class:`LearningClient` wired to this Memex.
+
+        Produces a ready-to-use learning facade sharing the same
+        ``store`` and ``search`` that this Memex uses. All components
+        accept overrides so test suites and advanced callers can swap
+        in alternative strategies; defaults produce a functional
+        offline-tune setup:
+
+        * ``evaluator`` defaults to replay-based :class:`MRREvaluator`.
+        * ``tuner`` defaults to :class:`GridSweepTuner` over the
+          resolved evaluator.
+        * ``calibration_pipeline`` defaults to
+          :class:`CalibrationPipeline` with library defaults.
+        * ``labeler`` / ``synthetic_generator`` default to their
+          own no-arg LLM-backed implementations (see
+          :class:`LLMJudgeLabeler` and :class:`SyntheticGenerator`).
+
+        Args:
+            labeler: Strategy for attaching pointwise labels to a
+                judgment.
+            synthetic_generator: Strategy for cold-start query
+                synthesis.
+            tuner: Parameter search strategy.
+            evaluator: Metric used by both the tuner and the pipeline
+                for val-split gating.
+            calibration_pipeline: Fully-constructed pipeline; when
+                provided, ``tuner`` / ``evaluator`` are ignored.
+
+        Returns:
+            A :class:`LearningClient` ready for ``record_retrieval``,
+            ``label``, ``synthesize_bootstrap``, ``tune``,
+            ``promote_shadow``, ``rollback``, and ``capture_query`` calls.
+        """
+        pipeline = calibration_pipeline
+        if pipeline is None:
+            resolved_evaluator = evaluator or MRREvaluator()
+            resolved_tuner = tuner or GridSweepTuner(resolved_evaluator)
+            pipeline = CalibrationPipeline(
+                self._store,
+                resolved_tuner,
+                resolved_evaluator,
+            )
+        llm_cfg = self._llm_settings
+        resolved_labeler = labeler
+        if resolved_labeler is None and llm_cfg is not None:
+            resolved_labeler = LLMJudgeLabeler(
+                model=llm_cfg.model,
+                temperature=llm_cfg.temperature,
+                api_base=llm_cfg.api_base,
+            )
+        resolved_synth = synthetic_generator
+        if resolved_synth is None and llm_cfg is not None:
+            resolved_synth = SyntheticGenerator(
+                model=llm_cfg.model,
+                temperature=llm_cfg.temperature,
+                api_base=llm_cfg.api_base,
+            )
+        return LearningClient(
+            self._store,
+            labeler=resolved_labeler,
+            synthetic_generator=resolved_synth,
+            calibration_pipeline=pipeline,
+            search=self._search,
+            embedding_client=self._embedding_client,
+            embedding_settings=self._embedding_settings,
+        )
+
     async def close(self) -> None:
         """Release owned driver and Redis/MongoDB connections.
 
@@ -543,10 +680,10 @@ class Memex:
         if self._driver is not None:
             await self._driver.close()
             self._driver = None
-        mongo_client = getattr(self, "_mongo_client", None)
+        mongo_client = self._mongo_client
         if mongo_client is not None:
             await mongo_client.close()
-            self._mongo_client = None  # type: ignore[attr-defined]
+            self._mongo_client = None
 
     # -- Private helpers ------------------------------------------------------
 

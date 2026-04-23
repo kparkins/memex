@@ -21,7 +21,7 @@ protocol as the Neo4j hybrid strategy.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pymongo.asynchronous.collection import AsyncCollection
@@ -88,7 +88,7 @@ def _raw_cosine_from_mongo_score(score: float) -> float:
     return _MONGO_COSINE_SCORE_SCALE * score - _MONGO_COSINE_SCORE_SHIFT
 
 
-def _build_revision(doc: dict[str, Any]) -> Revision:
+def _build_revision(doc: Mapping[str, Any]) -> Revision:
     """Extract a Revision from a MongoDB aggregation result document.
 
     Strips internal pipeline fields before Pydantic validation.
@@ -209,8 +209,8 @@ class MongoHybridSearch:
 
     def __init__(
         self,
-        revisions_collection: AsyncCollection,
-        items_collection: AsyncCollection,
+        revisions_collection: AsyncCollection[Mapping[str, Any]],
+        items_collection: AsyncCollection[Mapping[str, Any]],
         *,
         type_weights: dict[MatchSource, float] | None = None,
     ) -> None:
@@ -481,7 +481,7 @@ class MongoHybridSearch:
 
     @staticmethod
     def _fuse_and_limit(
-        docs: list[dict[str, Any]],
+        docs: Sequence[Mapping[str, Any]],
         request: SearchRequest,
         weights: dict[MatchSource, float],
         search_mode: SearchMode,
@@ -537,14 +537,26 @@ class MongoHybridSearch:
                     "item": doc["_item"],
                     "lexical_score": 0.0,
                     "vector_score": 0.0,
+                    "raw_lexical_score": None,
+                    "raw_vector_score": None,
                 }
                 candidates[rev_id] = entry
 
             if source == _LEXICAL_SOURCE:
+                if (
+                    entry["raw_lexical_score"] is None
+                    or raw_score > entry["raw_lexical_score"]
+                ):
+                    entry["raw_lexical_score"] = raw_score
                 saturated = saturate_score(raw_score, k_lex)
                 entry["lexical_score"] = max(entry["lexical_score"], saturated)
             elif source == _VECTOR_SOURCE:
                 raw_cosine = _raw_cosine_from_mongo_score(raw_score)
+                if (
+                    entry["raw_vector_score"] is None
+                    or raw_cosine > entry["raw_vector_score"]
+                ):
+                    entry["raw_vector_score"] = raw_cosine
                 saturated = saturate_score(raw_cosine, k_vec)
                 entry["vector_score"] = max(entry["vector_score"], saturated)
 
@@ -562,6 +574,8 @@ class MongoHybridSearch:
                     score=fused,
                     lexical_score=entry["lexical_score"],
                     vector_score=entry["vector_score"],
+                    raw_lexical_score=entry["raw_lexical_score"],
+                    raw_vector_score=entry["raw_vector_score"],
                     match_source=match_source,
                     search_mode=search_mode,
                 )

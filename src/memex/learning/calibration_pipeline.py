@@ -56,7 +56,7 @@ class CalibrationStatus(StrEnum):
     ROLLED_BACK = "rolled_back"
 
 
-class CalibrationAuditReport(BaseModel, frozen=True):
+class CalibrationAuditReport(BaseModel):
     """Persisted record of one CalibrationPipeline run.
 
     Args:

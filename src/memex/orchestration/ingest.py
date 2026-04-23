@@ -16,6 +16,10 @@ import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from memex.stores.mongo_event_feed import MongoEventFeed
+    from memex.stores.mongo_working_memory import MongoWorkingMemory
+
 from pydantic import BaseModel, Field
 
 from memex.config import EmbeddingSettings, PrivacySettings, RetrievalSettings
@@ -237,15 +241,19 @@ class IngestService:
         store: MemoryStore,
         search: SearchStrategy,
         *,
-        working_memory: RedisWorkingMemory | None = None,
-        event_feed: ConsolidationEventFeed | None = None,
+        working_memory: RedisWorkingMemory | MongoWorkingMemory | None = None,
+        event_feed: ConsolidationEventFeed | MongoEventFeed | None = None,
         embedding_client: EmbeddingClient | None = None,
         embedding_settings: EmbeddingSettings | None = None,
     ) -> None:
         self._store = store
         self._search = search
-        self._working_memory = working_memory
-        self._event_feed = event_feed
+        self._working_memory: (
+            RedisWorkingMemory | MongoWorkingMemory | None
+        ) = working_memory
+        self._event_feed: (
+            ConsolidationEventFeed | MongoEventFeed | None
+        ) = event_feed
         self._embedding_client = embedding_client
         self._embedding_settings = embedding_settings
 

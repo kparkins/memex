@@ -188,11 +188,19 @@ class HybridResult(SearchResult, frozen=True):
         vector_score: Saturated cosine similarity in ``[0, 1)``
             (0.0 if not matched by vector). Both branch scores share
             the same scale via Okapi saturation.
+        raw_lexical_score: Best raw BM25 score observed for this
+            revision before saturation; ``None`` when the lexical
+            branch did not match or the backend did not expose it.
+        raw_vector_score: Best raw cosine score observed for this
+            revision before saturation; ``None`` when the vector
+            branch did not match or the backend did not expose it.
         match_source: Source of the match for type weight selection.
         search_mode: Which search branches were active.
     """
 
     lexical_score: float
     vector_score: float
+    raw_lexical_score: float | None = None
+    raw_vector_score: float | None = None
     match_source: MatchSource
     search_mode: SearchMode
